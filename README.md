@@ -26,7 +26,8 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 * **Win32 GUI and COM**: window classes and procedures, controls, dialogs, resources, GDI, and COM
   objects used in both directions (calling system objects through their vtables, and system DLLs
   calling objects the program implements). The program's manifest applies: visual styles (common
-  controls v6) and DPI awareness.
+  controls v6), DPI awareness, the UTF-8 code page, long paths, the segment heap and supported
+  OS versions.
 * **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
   `thread_local` objects with constructors and destructors, and guest atomics that are really
   atomic across threads.
@@ -69,6 +70,7 @@ juice [options] program.exe [arguments...]
   --no-opt         disable IR optimizations
   --block-size=N   maximum guest instructions per translated block (default 64)
   --scan           don't run; list instructions in the program JUICE cannot translate
+  --no-host        don't start a host process for the program's manifest settings
 ```
 
 `--scan` statically decodes a program's code sections. It shows how close the program is to
@@ -136,6 +138,14 @@ and API built-ins do.
   common controls v6 and visual styles, to its imports, the controls it creates and DLLs it
   loads later. The declared DPI awareness (`dpiAwareness`, `dpiAware`, `gdiScaling`) is applied
   with `SetProcessDpiAwarenessContext`.
+* **Process-creation settings.** Windows applies some manifest settings only when it creates a
+  process: `activeCodePage` (UTF-8), `longPathAware`, `heapType` (segment heap), the
+  `supportedOS`/`maxversiontested` compatibility entries (for example, what `GetVersionEx`
+  reports) and a few rarer ones. For a program that declares any of these, `juice` re-runs
+  itself in a copy of `juice.exe` whose own manifest carries them, then waits for it and returns
+  its exit code. The two processes share the console and standard handles. Copies are cached per
+  manifest in `%LOCALAPPDATA%\juice\hosts` and replaced when `juice.exe` is rebuilt. This adds
+  about 10 ms per run. `--no-host` turns it off.
 * **Native code pointers.** When the guest jumps to executable code of a native module that it
   never imported, such as a method in the vtable of a COM object created by a system DLL, the
   engine records that address as host code and calls it through the same bridge, returning to
@@ -167,7 +177,7 @@ and API built-ins do.
   random data-processing instructions; and a stress test that runs one engine on several threads
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
-  threads, GUI, COM, application manifest, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
+  threads, GUI, COM, application manifests, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
   and `/MD`.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
@@ -185,9 +195,8 @@ These are next, roughly in the plan's order:
 4. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
    (`.pdata`/`.xdata`). This also enables C++ exceptions.
 5. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
-   structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. Manifest settings that
-   Windows reads only when it creates the process are not applied: `activeCodePage` (UTF-8),
-   `longPathAware`, `heapType` and the `supportedOS` compatibility entries.
+   structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. A manifest's
+   `requestedExecutionLevel` is not honored: programs always run as the invoking user.
 6. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.

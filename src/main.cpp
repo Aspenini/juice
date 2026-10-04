@@ -12,6 +12,7 @@
 
 #include "core/arm64/decode/instruction.hpp"
 #include "windows/guest_process.hpp"
+#include "windows/manifest.hpp"
 #include "windows/pe/pe_file.hpp"
 
 namespace {
@@ -78,6 +79,8 @@ void usage() {
       "  --no-opt         disable IR optimizations\n"
       "  --block-size=N   maximum guest instructions per translated block (default 64)\n"
       "  --scan           don't run; list instructions in the program JUICE cannot translate\n"
+      "  --no-host        don't start a host process for the program's manifest settings\n"
+      "                   (code page, long paths, heap type, supported OS versions)\n"
       "  --help           show this help\n",
       stdout);
 }
@@ -87,6 +90,7 @@ void usage() {
 int wmain(int argc, wchar_t** argv) {
   juice::win::ProcessOptions options;
   bool scan_only = false;
+  bool use_host = !juice::win::consume_host_marker();  // not again inside a host process
   int i = 1;
   for (; i < argc; ++i) {
     std::wstring arg = argv[i];
@@ -103,6 +107,7 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg == L"--interp") options.engine.interpret = true;
     else if (arg == L"--no-opt") options.engine.optimize = false;
     else if (arg == L"--scan") scan_only = true;
+    else if (arg == L"--no-host") use_host = false;
     else if (arg.starts_with(L"--block-size=")) {
       long n = std::wcstol(arg.c_str() + 13, nullptr, 10);
       if (n < 1 || n > 4096) {
@@ -124,6 +129,19 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   if (scan_only) return scan(argv[i]);
+
+  // Manifest settings that only apply to a new process: run in a host process
+  // whose manifest carries them (this process only waits for it).
+  if (use_host) {
+    if (std::string manifest = juice::win::host_manifest_for(argv[i]); !manifest.empty()) {
+      auto code = juice::win::run_in_host(manifest, options.trace_imports ? stderr : nullptr);
+      if (code) return *code;
+      std::fprintf(stderr,
+                   "juice: warning: %s; the program's code page, long path, heap and OS compatibility settings "
+                   "are not applied\n",
+                   code.error().c_str());
+    }
+  }
 
   std::vector<std::wstring> guest_args(argv + i + 1, argv + argc);
   juice::win::GuestProcess process(options);

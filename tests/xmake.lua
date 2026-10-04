@@ -36,7 +36,7 @@ target("juice-guest-tests")
 
     -- Freestanding programs: no C runtime, entry point mainCRTStartup.
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
-               "exitcode", "retcode", "threads", "gui", "com", "manifest")
+               "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings")
     -- C runtime programs, built /MT and /MD.
     set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp")
 
@@ -106,7 +106,7 @@ target("juice-guest-tests")
             retcode = {expect_exit = 7, expect_output = "returning 7\n"},
         }
         -- Programs with an application manifest (programs/<name>.manifest), embedded by the linker.
-        local manifests = {manifest = true}
+        local manifests = {manifest = true, settings = true}
         for _, name in ipairs(target:values("guest.freestanding")) do
             local src = path.join(scriptdir, "programs", name .. ".c")
             local deps = {header}
