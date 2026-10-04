@@ -76,4 +76,13 @@ const char* machine_name(uint16_t machine);
 std::expected<PeFile, std::string> parse_pe(std::vector<uint8_t> data);
 std::expected<PeFile, std::string> read_pe_file(const std::filesystem::path& path);
 
+// Reads only the file header: the machine and characteristics of the PE file
+// at `path`. Returns false if it is not a PE file.
+struct PeHeaderInfo {
+  uint16_t machine = 0;
+  uint16_t characteristics = 0;
+  bool is_dll() const { return (characteristics & kFileDll) != 0; }
+};
+bool peek_pe_header(const std::filesystem::path& path, PeHeaderInfo& info);
+
 }  // namespace juice::pe

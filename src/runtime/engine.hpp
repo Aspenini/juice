@@ -62,6 +62,7 @@ struct EngineOptions {
   bool dump_ir = false;         // log the IR of each translated block
   bool profile = false;         // count dispatches and block executions
   uint32_t max_block_insns = 64;
+  uint32_t tls_vector_offset = 0;  // see arm64::LiftOptions
   std::FILE* log = stderr;
 };
 

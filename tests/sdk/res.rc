@@ -1,0 +1,9 @@
+#include <windows.h>
+STRINGTABLE { 1, "Hello from a string resource" }
+100 MENU { POPUP "&File" { MENUITEM "E&xit", 200 } }
+300 RCDATA { "JUICE-RCDATA" }
+400 DIALOGEX 0, 0, 120, 40
+STYLE DS_MODALFRAME | WS_CAPTION | WS_SYSMENU
+CAPTION "Resource dialog"
+FONT 9, "Segoe UI"
+{ PUSHBUTTON "OK", IDOK, 35, 10, 50, 14 }

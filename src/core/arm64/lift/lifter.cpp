@@ -16,7 +16,7 @@ constexpr uint64_t low_mask(unsigned width) { return width >= 64 ? ~0ull : ((1ul
 
 class Lifter {
  public:
-  explicit Lifter(ir::Builder& b) : b_(b) {}
+  explicit Lifter(ir::Builder& b, const LiftOptions& options = {}) : b_(b), tls_vector_offset_(options.tls_vector_offset) {}
 
   bool lift(const Instruction& i);
 
@@ -68,6 +68,7 @@ class Lifter {
   }
 
   ir::Builder& b_;
+  uint32_t tls_vector_offset_;
 };
 
 V Lifter::shifted(V v, ShiftType type, unsigned amount, uint8_t size) {
@@ -160,6 +161,11 @@ void Lifter::lift_bitfield(const Instruction& i) {
 }
 
 void Lifter::lift_load_store(const Instruction& i) {
+  if (tls_vector_offset_ && i.op == Op::Ldr && !i.vector && i.mem_size == 8 && i.mode == AddrMode::Offset &&
+      i.rn == 18 && i.imm == tls_vector_offset_) {
+    set_x(i.rd, b_.get(slot::TlsVector));
+    return;
+  }
   V wb;
   V addr = address(i, wb);
   if (i.op == Op::Ldr) {
@@ -1074,7 +1080,7 @@ ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& opt
   ir::Block block;
   block.guest_pc = pc;
   ir::Builder builder(block);
-  Lifter lifter(builder);
+  Lifter lifter(builder, options);
 
   uint64_t cur = pc;
   for (uint32_t n = 0;; ++n) {

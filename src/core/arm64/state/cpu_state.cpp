@@ -40,6 +40,8 @@ const char* slot_name(uint16_t s) {
     n[slot::ExclValueHi] = "excl_value_hi";
     n[slot::ExclNew] = "excl_new";
     n[slot::ExclNewHi] = "excl_new_hi";
+    n[slot::TlsVector] = "tls_vector";
+    n[slot::Reserved] = "reserved";
     return n;
   }();
   return s < slot::Count ? names[s].c_str() : "?";

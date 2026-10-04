@@ -89,6 +89,21 @@ std::expected<PeFile, std::string> parse_pe(std::vector<uint8_t> data) {
   return pe;
 }
 
+bool peek_pe_header(const std::filesystem::path& path, PeHeaderInfo& info) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  uint8_t header[0x400] = {};
+  in.read(reinterpret_cast<char*>(header), sizeof(header));
+  const auto got = static_cast<size_t>(in.gcount());
+  if (got < 0x40 || header[0] != 'M' || header[1] != 'Z') return false;
+  uint32_t pe = 0;
+  std::memcpy(&pe, header + 0x3c, 4);
+  if (pe > got - 24 || std::memcmp(header + pe, "PE\0\0", 4) != 0) return false;
+  std::memcpy(&info.machine, header + pe + 4, 2);
+  std::memcpy(&info.characteristics, header + pe + 22, 2);
+  return true;
+}
+
 std::expected<PeFile, std::string> read_pe_file(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) return std::unexpected(std::format("cannot open '{}'", path.string()));

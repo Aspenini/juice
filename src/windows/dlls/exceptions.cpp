@@ -168,8 +168,8 @@ uint64_t C_specific_handler_(GuestProcess& p, CpuState& s) {
 // C++ exceptions in programs using the dynamic C runtime: vcruntime140.dll is
 // x64 code that can't handle ARM64 frames.
 [[noreturn]] void dynamic_cxx_unsupported(GuestProcess& p) {
-  p.fatal("C++ exceptions in programs built with the dynamic C runtime (/MD) are not supported yet; "
-          "build with /MT",
+  p.fatal("C++ exceptions need the ARM64 C++ runtime (vcruntime140.dll): put it next to the program or use "
+          "--dll-path (the x64 one can't handle ARM64 frames)",
           0xE06D7363);
 }
 uint64_t CxxThrowException_(GuestProcess& p, CpuState&) { dynamic_cxx_unsupported(p); }
@@ -195,6 +195,8 @@ constexpr BuiltinExport kExceptions[] = {
 constexpr BuiltinExport kVcruntime[] = {
     {"__C_specific_handler", C_specific_handler_},
     {"_CxxThrowException", CxxThrowException_},
+    {"__CxxFrameHandler", CxxFrameHandler_},
+    {"__CxxFrameHandler2", CxxFrameHandler_},
     {"__CxxFrameHandler3", CxxFrameHandler_},
     {"__CxxFrameHandler4", CxxFrameHandler_},
 };

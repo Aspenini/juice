@@ -126,6 +126,7 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg == L"--no-host" || arg == L"--in-host") use_host = false;  // --in-host: started by run_in_host()
     else if (arg.starts_with(L"--dll-path=")) options.dll_paths.push_back(arg.substr(11));
     else if (arg == L"--no-vs-runtime") vs_runtime = false;
+    else if (arg.starts_with(L"--argv0=")) options.argv0 = arg.substr(8);  // set when a guest starts a guest
     else if (arg.starts_with(L"--block-size=")) {
       long n = std::wcstol(arg.c_str() + 13, nullptr, 10);
       if (n < 1 || n > 4096) {

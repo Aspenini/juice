@@ -93,7 +93,7 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
 
   uint32_t max_insns = options_.max_block_insns;
   for (;;) {
-    ir::Block block = arm64::lift_block(pc, reader, {max_insns});
+    ir::Block block = arm64::lift_block(pc, reader, {max_insns, options_.tls_vector_offset});
     const size_t before = block.insts.size();
     if (options_.optimize) ir::optimize(block);
     const size_t after = count_live(block);

@@ -23,11 +23,8 @@ namespace juice::win {
 
 namespace {
 
-constexpr size_t kTebThreadLocalStoragePointer = 0x58;
-// Guest implicit-TLS slots in each thread's TEB->ThreadLocalStoragePointer
-// vector start past any index the host modules can plausibly use.
-constexpr size_t kGuestTlsSlot = 64;
-constexpr size_t kMaxTlsModules = 32;
+constexpr uint32_t kMaxTlsModules = 64;
+constexpr uint32_t kNoTlsSlot = ~0u;
 
 std::wstring lower(std::wstring_view s) {
   std::wstring out(s);
@@ -52,6 +49,31 @@ std::wstring module_file_name(std::wstring_view name) {
 }
 
 bool is_path(std::wstring_view name) { return name.find_first_of(L"\\/:") != std::wstring_view::npos; }
+
+// msvcrt.dll, the C runtime of Windows itself (used by many of its tools), is
+// always the native x64 one. Its exception handling, RTTI and setjmp/longjmp
+// are architecture specific: guest code needs ARM64 versions, which the ARM64
+// vcruntime140.dll provides under the same names (the data structures are the
+// compiler's, the same for both runtimes).
+const char* vcruntime_equivalent(std::string_view dll, std::string_view name) {
+  std::string d(dll);
+  for (char& c : d) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (d != "msvcrt.dll" && d != "msvcrt") return nullptr;
+  static constexpr const char* kSameName[] = {
+      "__CxxFrameHandler", "__CxxFrameHandler2", "__CxxFrameHandler3", "__C_specific_handler",
+      "_CxxThrowException", "__CxxDetectRethrow", "__CxxExceptionFilter", "__CxxQueryExceptionSize",
+      "__CxxRegisterExceptionObject", "__CxxUnregisterExceptionObject", "__DestructExceptionObject",
+      "__uncaught_exception", "__RTCastToVoid", "__RTDynamicCast", "__RTtypeid", "__AdjustPointer",
+      "__BuildCatchObject", "__BuildCatchObjectHelper", "__TypeMatch", "_CreateFrameInfo", "_FindAndUnlinkFrame",
+      "_IsExceptionObjectToBeDestroyed", "__FrameUnwindFilter", "_local_unwind", "longjmp", "_set_se_translator",
+      "set_unexpected", "unexpected", "_is_exception_typeof",
+  };
+  for (const char* n : kSameName)
+    if (name == n) return n;
+  if (name == "_setjmp" || name == "setjmp") return "__intrinsic_setjmp";
+  if (name == "_setjmpex") return "__intrinsic_setjmpex";
+  return nullptr;
+}
 
 // API sets and other OS-provided names are never guest modules.
 bool is_system_name(std::wstring_view file) { return file.starts_with(L"api-ms-") || file.starts_with(L"ext-ms-"); }
@@ -113,23 +135,9 @@ std::optional<std::wstring> GuestProcess::find_guest_dll(std::wstring_view name)
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec)) continue;
     // Only ARM64 DLLs: anything else is left to the native loader.
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) continue;
-    uint8_t header[0x400] = {};
-    DWORD got = 0;
-    ReadFile(f, header, sizeof(header), &got, nullptr);
-    CloseHandle(f);
-    uint32_t pe = 0;
-    if (got < 0x40 || header[0] != 'M' || header[1] != 'Z') continue;
-    std::memcpy(&pe, header + 0x3c, 4);
-    if (pe + 24 > got || std::memcmp(header + pe, "PE\0\0", 4) != 0) continue;
-    uint16_t machine = 0, characteristics = 0;
-    std::memcpy(&machine, header + pe + 4, 2);
-    std::memcpy(&characteristics, header + pe + 22, 2);
-    if (machine == pe::kMachineArm64 && (characteristics & IMAGE_FILE_DLL)) {
+    pe::PeHeaderInfo header;
+    if (pe::peek_pe_header(path, header) && header.machine == pe::kMachineArm64 && header.is_dll())
       return std::filesystem::absolute(path, ec).wstring();
-    }
   }
   return std::nullopt;
 }
@@ -171,6 +179,15 @@ void GuestProcess::bind_module_imports(GuestModule& module) {
 }
 
 std::optional<uint64_t> GuestProcess::bind_guest_import(const pe::Import& imp, GuestModule* importer) {
+  if (const char* target = imp.by_ordinal ? nullptr : vcruntime_equivalent(imp.dll, imp.name)) {
+    if (GuestModule* vcruntime = load_guest_dll(L"vcruntime140.dll")) {
+      if (importer && std::find(importer->dependencies.begin(), importer->dependencies.end(), vcruntime) ==
+                          importer->dependencies.end()) {
+        importer->dependencies.push_back(vcruntime);
+      }
+      if (uint64_t value = guest_export(*vcruntime, target)) return value;
+    }
+  }
   GuestModule* dll = load_guest_dll(widen(imp.dll));
   if (!dll) return std::nullopt;
   if (importer && dll != importer &&
@@ -306,62 +323,45 @@ void GuestProcess::detach_modules() {
 
 // --- implicit TLS --------------------------------------------------------------------
 //
-// Implicit TLS lives in TEB->ThreadLocalStoragePointer[_tls_index]. The native
-// loader does not know about guest modules, so each guest module with TLS gets
-// a slot past ntdll's entries, in a copy of each thread's vector.
-//
-// ntdll's TLS vector is a process-heap block whose first 16 bytes are a header
-// (the entry count, then a link); ThreadLocalStoragePointer points just past
-// it. At thread exit ntdll reads the count, frees that many entries and frees
-// the block from the header, so the copy keeps that layout and header: ntdll
-// goes on managing its own entries and never sees the guest's. Limitation: if
-// a native DLL with implicit TLS is loaded later, ntdll rebuilds the vectors
-// and the guest slots are lost.
+// Compiled code finds its thread-local data through TEB->ThreadLocalStoragePointer
+// [_tls_index]; executables often assume index 0 without reading _tls_index.
+// The translator hands guest code a vector of JUICE's own instead of the TEB's
+// (CpuState::tls_vector), so the program always has slot 0 and its DLLs the
+// following ones, without touching ntdll's vector (which belongs to the host
+// modules, juice.exe included, and which ntdll rebuilds when native DLLs with
+// TLS load).
 
 void GuestProcess::assign_tls_slot(GuestModule& module) {
-  if (tls_modules_ == kMaxTlsModules) {
+  if (module.is_exe) {
+    module.tls_slot = 0;
+  } else if (tls_modules_ + 1 < kMaxTlsModules) {
+    module.tls_slot = ++tls_modules_;
+  } else {
     std::fprintf(stderr, "[juice] warning: too many guest modules with thread-local data (%ls)\n", module.name.c_str());
+    module.tls_slot = kNoTlsSlot;
     return;
   }
-  module.tls_slot = static_cast<uint32_t>(kGuestTlsSlot + tls_modules_++);
   if (module.image.contains(module.image.tls->index_address))
     *reinterpret_cast<uint32_t*>(module.image.tls->index_address) = module.tls_slot;
 }
 
 void GuestProcess::ensure_tls_vector(GuestThread& t) {
   if (t.tls_vector) return;
-  HANDLE heap = GetProcessHeap();
-  auto** teb_array = reinterpret_cast<void***>(t.teb + kTebThreadLocalStoragePointer);
-  uint64_t header[2] = {0, 0};
-  size_t count = 0;
-  if (void** old = *teb_array) {
-    std::memcpy(header, reinterpret_cast<const uint64_t*>(old) - 2, sizeof(header));
-    count = static_cast<uint32_t>(header[0]);
-  }
-  if (count >= kGuestTlsSlot) {
-    std::fprintf(stderr, "[juice] warning: %zu native TLS modules; guest thread-local data is unavailable\n", count);
-    return;
-  }
-  auto* block = static_cast<uint64_t*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(header) + (kGuestTlsSlot + kMaxTlsModules) * 8));
-  if (!block) throw std::bad_alloc();
-  std::memcpy(block, header, sizeof(header));
-  auto** array = reinterpret_cast<void**>(block + 2);
-  if (count) std::memcpy(array, *teb_array, count * sizeof(void*));
-  t.tls_vector = array;
-  *teb_array = array;  // the original vector stays allocated: ntdll may still reference it
+  t.tls_vector = new void*[kMaxTlsModules]();
+  t.state.tls_vector = reinterpret_cast<uint64_t>(t.tls_vector);
 }
 
 void GuestProcess::allocate_tls(GuestThread& t, const GuestModule& module) {
-  if (!module.image.tls || !module.tls_slot) return;
   ensure_tls_vector(t);
-  if (!t.tls_vector) return;
+  if (!module.image.tls || module.tls_slot == kNoTlsSlot) return;
   const pe::TlsInfo& tls = *module.image.tls;
   const size_t template_size = tls.raw_end > tls.raw_start ? tls.raw_end - tls.raw_start : 0;
-  auto* data = static_cast<uint8_t*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, std::max<size_t>(template_size + tls.zero_fill, 16)));
+  auto* data = static_cast<uint8_t*>(
+      HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, std::max<size_t>(template_size + tls.zero_fill, 16)));
   if (!data) throw std::bad_alloc();
   if (template_size && module.image.contains(tls.raw_start))
     std::memcpy(data, reinterpret_cast<const void*>(tls.raw_start), template_size);
-  t.tls_blocks.push_back(data);
+  t.tls_blocks.emplace_back(module.tls_slot, data);
   t.tls_vector[module.tls_slot] = data;
 }
 
@@ -369,6 +369,7 @@ void GuestProcess::setup_tls_for_thread() {
   GuestThread* t = t_current();
   if (!t) return;
   std::lock_guard lock(loader_mutex_);
+  ensure_tls_vector(*t);
   const size_t n = module_count_.load(std::memory_order_acquire);
   for (size_t i = 0; i < n; ++i) allocate_tls(*t, *modules_[i].load(std::memory_order_acquire));
 }

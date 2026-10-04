@@ -256,3 +256,121 @@ target("juice-guest-tests")
         end
         return true
     end)
+
+-- ---------------------------------------------------------------------------
+-- Windows SDK tool tests
+--
+-- The Windows SDK ships ARM64 builds of its tools next to the x64 ones. Each
+-- test runs a tool both ways on the inputs in sdk/ - the ARM64 build under
+-- juice, the x64 build natively - in the same directory (so that printed
+-- paths match) and compares the exit code, the console output and every file
+-- the tool writes. Run with `xmake test "juice-sdk-tests/*"`.
+-- ---------------------------------------------------------------------------
+target("juice-sdk-tests")
+    set_kind("phony")
+    set_default(false)
+    add_deps("juice")
+
+    on_load(function (target)
+        local kits = path.join(os.getenv("ProgramFiles(x86)") or "", "Windows Kits", "10")
+        local bin
+        for _, rc in ipairs(os.files(path.join(kits, "bin", "*", "arm64", "rc.exe"))) do
+            local dir = path.directory(path.directory(rc))
+            if os.isfile(path.join(dir, "x64", "rc.exe")) and (not bin or dir > bin) then bin = dir end
+        end
+        if not bin then
+            print("juice: Windows SDK ARM64 tools not found, SDK tool tests disabled")
+            return
+        end
+        local version = path.filename(bin)
+        local include = path.join(kits, "Include", version)
+        local envs = {INCLUDE = path.join(include, "um") .. ";" .. path.join(include, "shared")}
+        local inputs = path.join(target:scriptdir(), "sdk")
+        local winmd = os.files(path.join(kits, "References", version, "Windows.Foundation.FoundationContract", "*",
+                                         "Windows.Foundation.FoundationContract.winmd"))[1]
+
+        local tests = {
+            rc = {"rc", {"/nologo", "/fo", "res.res", "res.rc"}},
+            mc = {"mc", {"msgs.mc"}},
+            mt = {"mt", {"-nologo", "-manifest", "a.manifest", "b.manifest", "-out:merged.manifest"}},
+            dxc_ps = {"dxc", {"-T", "ps_6_0", "-E", "ps_main", "-Fo", "ps.dxil", "shader.hlsl"}},
+            dxc_vs = {"dxc", {"-T", "vs_6_0", "-E", "vs_main", "-Fo", "vs.dxil", "-Fc", "vs.asm", "shader.hlsl"}},
+            dxc_cs = {"dxc", {"-T", "cs_6_5", "-E", "cs_main", "-O3", "-Fo", "cs.dxil", "-Fc", "cs.asm", "cs.hlsl"}},
+            fxc = {"fxc", {"/nologo", "/T", "ps_5_0", "/E", "ps_main", "/Fo", "ps.dxbc", "/Fc", "ps.asm", "shader.hlsl"}},
+            makepri = {"makepri", {"createconfig", "/cf", "priconfig.xml", "/dq", "en-US", "/o"}},
+            signtool = {"signtool", {"verify", "/pa", "/v", path.join(bin, "x64", "rc.exe")}},
+            uuidgen_help = {"uuidgen", {"/?"}},
+        }
+        if winmd then
+            tests.winmdidl = {"winmdidl", {"/nologo", "/outdir:.", winmd}}
+        end
+        -- midl preprocesses with cl.exe (x64, native) and starts midlc.exe
+        -- (ARM64 under juice: a guest starting a guest).
+        local cl = os.files(path.join(os.getenv("ProgramFiles") or "", "Microsoft Visual Studio", "*", "*", "VC",
+                                      "Tools", "MSVC", "*", "bin", "Hostx64", "x64", "cl.exe"))[1]
+        if cl then
+            tests.midl = {"midl", {"/nologo", "/env", "x64", "iface.idl"},
+                          {PATH = path.directory(cl) .. ";" .. (os.getenv("PATH") or "")}}
+        end
+        for name, t in pairs(tests) do
+            local test_envs = {}
+            for k, v in pairs(envs) do test_envs[k] = v end
+            for k, v in pairs(t[3] or {}) do test_envs[k] = v end
+            target:add("tests", name, {tool = t[1], args = t[2], envs = test_envs,
+                                       bin = bin, inputs = inputs})
+        end
+    end)
+
+    on_test(function (target, opt)
+        local juice = path.absolute(target:dep("juice"):targetfile())
+        local work = path.join(target:autogendir(), "sdk", opt.name)
+        local inputs = {}
+        for _, f in ipairs(os.files(path.join(opt.inputs, "*"))) do inputs[path.filename(f)] = true end
+
+        -- Run once in a fresh copy of the inputs; return the exit code, the
+        -- console output and the files written.
+        local function run(program, argv)
+            os.tryrm(work)
+            os.mkdir(work)
+            os.cp(path.join(opt.inputs, "*"), work)
+            local out, err = path.join(work, "..", opt.name .. ".out"), path.join(work, "..", opt.name .. ".err")
+            local code = os.execv(program, argv, {try = true, timeout = 300000, curdir = work, envs = opt.envs,
+                                                  stdout = out, stderr = err})
+            local console = (io.readfile(out) or "") .. "\n--- stderr ---\n" .. (io.readfile(err) or "")
+            local files = {}
+            for _, f in ipairs(os.files(path.join(work, "**"))) do
+                local rel = path.relative(f, work)
+                if not inputs[rel] then files[rel] = io.readfile(f, {encoding = "binary"}) end
+            end
+            return code, console, files
+        end
+
+        local ref_code, ref_console, ref_files = run(path.join(opt.bin, "x64", opt.tool .. ".exe"), opt.args)
+        local code, console, files = run(juice, table.join({path.join(opt.bin, "arm64", opt.tool .. ".exe")}, opt.args))
+        opt.stdout = console
+        if code ~= ref_code then
+            opt.errors = string.format("exit code mismatch: juice=%s x64=%s", tostring(code), tostring(ref_code))
+            return false
+        end
+        if console ~= ref_console then
+            opt.errors = "console output mismatch\n--- juice ---\n" .. console .. "\n--- x64 ---\n" .. ref_console
+            return false
+        end
+        for name, data in pairs(ref_files) do
+            if files[name] == nil then
+                opt.errors = "missing output file " .. name
+                return false
+            end
+            if files[name] ~= data then
+                opt.errors = "output file differs: " .. name
+                return false
+            end
+        end
+        for name, _ in pairs(files) do
+            if ref_files[name] == nil then
+                opt.errors = "unexpected output file " .. name
+                return false
+            end
+        end
+        return true
+    end)

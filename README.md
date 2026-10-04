@@ -38,6 +38,10 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 * **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
   `RaiseException`, vectored handlers) and C++ exceptions, with the static and dynamic CRT.
   C++ exceptions with the dynamic CRT need the ARM64 C++ runtime DLLs.
+* **Real programs**: the ARM64 tools of the Windows SDK, run on real inputs, produce the same
+  output and files as their x64 builds. These include `rc`, `mc`, `midl`, `mt`, `signtool`,
+  `makepri`, `winmdidl`, `fxc`, and `dxc`, a large LLVM-based compiler. ARM64 programs can start
+  other ARM64 programs.
 * Every test program is checked against a natively compiled x86-64 build of the same source.
   Each one runs under the optimizing JIT, the unoptimized JIT and the reference IR interpreter.
 
@@ -183,17 +187,35 @@ and API built-ins do.
   raises an execute fault. A vectored exception handler turns it into a translated guest call
   (x64 → ARM64 arguments) and resumes the native caller with the result.
 * **Threads.** Every host thread that runs guest code gets its own guest context: CPU state,
-  guest stack, TEB in X18 and a slot in the thread's implicit-TLS vector. Guest TLS callbacks
+  guest stack, TEB in X18 and its own implicit-TLS vector. Guest TLS callbacks
   get `DLL_THREAD_ATTACH`/`DETACH`. `CreateThread` starts a host thread that runs the guest
   routine. Threads created natively (the thread pool, the native UCRT's `_beginthreadex`) get a
   context the first time they call into guest code. Contexts are freed only once their host
   thread has terminated, because guest code can still run during thread exit.
-* **Built-ins.** These replace APIs that must know about the guest: `GetModuleHandle*`,
-  `GetModuleFileName*`, `GetProcAddress` (which thunks native exports on the fly),
-  `GetCommandLine*`, `GetSystemInfo` (reports ARM64), `IsProcessorFeaturePresent`,
-  `RtlCaptureContext` (fills an ARM64 `CONTEXT`) and the process-exit functions. The process
-  command line is rewritten in place, so native code such as the UCRT's `argv` parsing sees the
-  guest's command line.
+* **Implicit TLS.** Compiled code finds its thread-local data through the TEB's
+  `ThreadLocalStoragePointer`, and executables often assume slot 0 without reading
+  `_tls_index`. The translator turns that load (`ldr Xt, [x18, #0x58]`) into a read of a
+  per-thread vector of JUICE's own. The program gets slot 0 there and its DLLs the following
+  ones, and ntdll's vector (which belongs to the native modules, `juice.exe` included) is never
+  touched.
+* **Child processes.** When a guest starts an ARM64 program, `CreateProcess` starts `juice.exe`
+  on it with the same JUICE settings. The child keeps `argv[0]` as the parent wrote it, and the
+  parent gets the juice process, whose exit code is the program's.
+* **Loader details.** The loader also sets up the `/GS` security cookie in the image's load
+  configuration (Windows' own binaries fail fast if it has its default value).
+* **Built-ins.** These replace APIs that must know about the guest:
+  * module functions: `GetModuleHandle*`, `GetModuleFileName*`, `GetProcAddress` (which
+    thunks native exports on the fly) and `LoadLibrary*`;
+  * process information: `GetCommandLine*`, `GetSystemInfo` (reports ARM64),
+    `IsProcessorFeaturePresent`, `RtlCaptureContext` (fills an ARM64 `CONTEXT`), `CreateProcess*`
+    and the process-exit functions;
+  * the resource functions whose NULL module means "the executable": `LoadString`,
+    `FindResource`, `FormatMessage`, and so on.
+
+  The process command line is rewritten in place, so native code such as the UCRT's `argv`
+  parsing sees the guest's command line. Programs that use the system `msvcrt.dll` get their
+  exception handling, RTTI and `setjmp`/`longjmp` from the ARM64 `vcruntime140.dll`, because
+  `msvcrt`'s are x64 code.
 * **Exceptions.** JUICE has its own ARM64 versions of ntdll's dispatcher and unwinder. They
   walk guest frames using the image's `.pdata`/`.xdata` unwind information, in both packed and
   full form. They call the program's language handlers the way ntdll does, which covers
@@ -222,6 +244,9 @@ and API built-ins do.
   its own). `/MD` programs run with both the ARM64 and the native C++ runtime DLLs.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
+* `tests/sdk`: inputs for the Windows SDK tools. If the SDK's ARM64 tools are installed, each
+  tool runs as ARM64 under JUICE and as x64 natively, in the same directory. The exit code,
+  console output and every file written must match.
 
 ## Limitations and roadmap
 
@@ -245,6 +270,5 @@ These are next, roughly in the plan's order:
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.
 
-Threading caveats: if a native DLL with implicit TLS is loaded after start-up, ntdll rebuilds the
-TLS vectors and drops the guest modules' slots. `SuspendThread`/`GetThreadContext` on a guest thread see
-the host's x64 context, not the guest's ARM64 one.
+Threading caveat: `SuspendThread`/`GetThreadContext` on a guest thread see the host's x64
+context, not the guest's ARM64 one.

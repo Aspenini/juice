@@ -151,6 +151,31 @@ void parse_exports(LoadedImage& image, const PeFile& file) {
   }
 }
 
+// The /GS security cookie (IMAGE_LOAD_CONFIG_DIRECTORY64::SecurityCookie) is
+// randomized by the loader before any code of the image runs; binaries built
+// as part of Windows fail fast (FAST_FAIL_GS_COOKIE_INIT) if it still holds
+// the default value.
+void init_security_cookie(LoadedImage& image, const PeFile& file) {
+  const DataDirectory& dir = file.dirs[kDirLoadConfig];
+  if (dir.size == 0) return;
+  ImageReader r(image);
+  uint32_t size = 0;
+  uint64_t cookie_va = 0, cookie_rva = 0, cookie = 0;
+  constexpr uint32_t kSecurityCookieOffset = 0x58;
+  if (!r.read(dir.rva, size) || size < kSecurityCookieOffset + 8 || !r.read(dir.rva + kSecurityCookieOffset, cookie_va) ||
+      !cookie_va || !r.va_to_rva(cookie_va, cookie_rva) || !r.read(cookie_rva, cookie))
+    return;
+  constexpr uint64_t kDefaultCookie = 0x00002B992DDFA232ull;
+  if (cookie != kDefaultCookie) return;
+  LARGE_INTEGER counter{};
+  QueryPerformanceCounter(&counter);
+  uint64_t value = static_cast<uint64_t>(counter.QuadPart) ^ (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+                   (static_cast<uint64_t>(GetCurrentThreadId()) << 16) ^ cookie_va ^ GetTickCount64();
+  value &= 0x0000FFFFFFFFFFFFull;  // as the native loader does: the top 16 bits stay zero
+  if (value == kDefaultCookie || value == 0) value = kDefaultCookie + 1;
+  std::memcpy(image.base + cookie_rva, &value, sizeof(value));
+}
+
 void parse_tls(LoadedImage& image, const PeFile& file) {
   const DataDirectory& dir = file.dirs[kDirTls];
   if (dir.size == 0) return;
@@ -219,6 +244,7 @@ std::expected<LoadedImage, std::string> map_image(const PeFile& file) {
   if (auto r = parse_imports(image, file); !r) return fail(r.error());
   parse_exports(image, file);
   parse_tls(image, file);
+  init_security_cookie(image, file);
   if (const DataDirectory& ex = file.dirs[kDirException]; ex.rva && ex.size && ex.rva + uint64_t{ex.size} <= image.size)
     image.exception_directory = ex;
   image.entry = file.entry_rva ? image.address() + file.entry_rva : 0;

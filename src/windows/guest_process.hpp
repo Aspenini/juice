@@ -42,7 +42,7 @@ struct GuestModule {
   std::wstring name;  // file name, lower case
   bool is_exe = false;
   bool thread_calls = true;  // DLL_THREAD_ATTACH/DETACH to DllMain (DisableThreadLibraryCalls)
-  uint32_t tls_slot = 0;     // index in the threads' implicit-TLS vectors (if image.tls)
+  uint32_t tls_slot = 0;     // index in the guest's implicit-TLS vectors (if image.tls)
   std::vector<GuestModule*> dependencies;  // guest DLLs it imports
   State state = State::Loaded;
 
@@ -55,8 +55,9 @@ struct GuestThread {
   uint8_t* stack_base = nullptr;
   size_t stack_size = 0;
   uint8_t* teb = nullptr;
-  void** tls_vector = nullptr;   // the thread's implicit-TLS vector, once guest modules use TLS
-  std::vector<void*> tls_blocks;  // implicit TLS blocks of guest modules
+  void** tls_vector = nullptr;   // the guest's implicit-TLS vector (CpuState::tls_vector)
+  // Implicit TLS blocks of guest modules: (slot, block).
+  std::vector<std::pair<uint32_t, void*>> tls_blocks;
   HANDLE host_thread = nullptr;  // signaled once the host thread has fully terminated
   bool main = false;
   bool detached = false;         // DLL_THREAD_DETACH notifications have run
@@ -79,6 +80,9 @@ struct ProcessOptions {
   bool stats = false;          // print engine statistics at exit
   // Directories searched for ARM64 DLLs after the program's own directory.
   std::vector<std::wstring> dll_paths;
+  // argv[0] of the program as its parent wrote it (when a guest started it), if
+  // different from the path JUICE was given.
+  std::wstring argv0;
 };
 
 class GuestProcess final : public runtime::Environment, public NativeCallbackTarget {

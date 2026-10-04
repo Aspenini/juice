@@ -49,6 +49,11 @@ struct CpuState {
   uint64_t excl_value_hi;
   uint64_t excl_new;     // scratch for the 128-bit compare-and-swap of STXP
   uint64_t excl_new_hi;
+
+  // Thread-local storage vector the environment gives guest code instead of
+  // the one in memory (see LiftOptions::tls_vector_offset).
+  uint64_t tls_vector;
+  uint64_t reserved;  // keeps the size a multiple of 16 (VReg alignment)
 };
 
 // Slot numbers (byte offset / 8) used by the lifter for GetReg/SetReg.
@@ -69,7 +74,9 @@ inline constexpr uint16_t ExclValue = 104;    // excl_value, excl_value_hi, excl
 inline constexpr uint16_t ExclValueHi = 105;
 inline constexpr uint16_t ExclNew = 106;
 inline constexpr uint16_t ExclNewHi = 107;
-inline constexpr uint16_t Count = 108;
+inline constexpr uint16_t TlsVector = 108;
+inline constexpr uint16_t Reserved = 109;
+inline constexpr uint16_t Count = 110;
 }  // namespace slot
 
 static_assert(offsetof(CpuState, sp) == 8 * slot::SP);
@@ -78,6 +85,7 @@ static_assert(offsetof(CpuState, nzcv) == 8 * slot::NZCV);
 static_assert(offsetof(CpuState, v) == 8 * slot::VLo(0));
 static_assert(offsetof(CpuState, fpcr) == 8 * slot::FPCR);
 static_assert(offsetof(CpuState, tpidr_el0) == 8 * slot::TPIDR_EL0);
+static_assert(offsetof(CpuState, tls_vector) == 8 * slot::TlsVector);
 static_assert(offsetof(CpuState, exit_reason) == 8 * slot::Exit);
 static_assert(offsetof(CpuState, exit_info) == 8 * slot::Exit + 4);
 static_assert(offsetof(CpuState, block_pc) == 8 * slot::BlockPc);

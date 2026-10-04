@@ -134,7 +134,7 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
 
   // argv[0] is the program as the user named it (like a native launch), which
   // also keeps the guest command line no longer than juice's own.
-  command_line_w_ = quote_argument(exe.wstring());
+  command_line_w_ = quote_argument(options_.argv0.empty() ? exe.wstring() : options_.argv0);
   for (const std::wstring& a : args) command_line_w_ += L" " + quote_argument(a);
   int n = WideCharToMultiByte(CP_ACP, 0, command_line_w_.c_str(), -1, nullptr, 0, nullptr, nullptr);
   command_line_a_.assign(n > 0 ? n - 1 : 0, '\0');
@@ -144,6 +144,7 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
   default_stack_size_ = std::clamp<uint64_t>(file->stack_reserve, 1 << 20, 256 << 20);
   thread_fls_slot_ = FlsAlloc(&GuestProcess::release_thread);
 
+  options_.engine.tls_vector_offset = 0x58;  // TEB->ThreadLocalStoragePointer: guest TLS gets a vector of its own
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
   install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), this});
   return {};
@@ -235,7 +236,8 @@ void GuestProcess::reclaim_threads() {
     if (t->host_thread && WaitForSingleObject(t->host_thread, 0) != WAIT_OBJECT_0) return false;
     if (t->host_thread) CloseHandle(t->host_thread);
     VirtualFree(t->stack_base, 0, MEM_RELEASE);
-    for (void* block : t->tls_blocks) HeapFree(GetProcessHeap(), 0, block);
+    for (const auto& [slot, block] : t->tls_blocks) HeapFree(GetProcessHeap(), 0, block);
+    delete[] t->tls_vector;
     delete t;
     return true;
   });

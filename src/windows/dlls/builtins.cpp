@@ -22,7 +22,12 @@ bool is_kernel32_family(std::string_view dll) {
 }
 
 // The Visual C++ runtime: vcruntime140.dll and vcruntime140_1.dll.
-bool is_vcruntime_family(std::string_view dll) { return lower(dll).starts_with("vcruntime140"); }
+// Also msvcrt.dll for its exception handling exports, when no ARM64
+// vcruntime140.dll stands in for them (see guest_modules.cpp).
+bool is_vcruntime_family(std::string_view dll) {
+  const std::string d = lower(dll);
+  return d.starts_with("vcruntime140") || d == "msvcrt.dll" || d == "msvcrt";
+}
 
 BuiltinFn find_in(std::span<const BuiltinExport> exports, std::string_view name) {
   for (const BuiltinExport& e : exports)
@@ -35,9 +40,12 @@ BuiltinFn find_in(std::span<const BuiltinExport> exports, std::string_view name)
 BuiltinFn find_builtin(std::string_view dll, std::string_view name) {
   if (is_kernel32_family(dll)) {
     if (BuiltinFn fn = find_in(exception_builtins(), name)) return fn;
+    if (BuiltinFn fn = find_in(process_builtins(), name)) return fn;
+    if (BuiltinFn fn = find_in(resource_builtins(), name)) return fn;
     return find_in(kernel32_builtins(), name);
   }
   if (is_vcruntime_family(dll)) return find_in(vcruntime_builtins(), name);
+  if (lower(dll) == "user32.dll" || lower(dll) == "user32") return find_in(user32_builtins(), name);
   return nullptr;
 }
 
