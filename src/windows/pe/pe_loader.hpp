@@ -45,6 +45,7 @@ struct LoadedImage {
   std::unordered_map<std::string, uint64_t> exports_by_name;
   std::unordered_map<uint32_t, uint64_t> exports_by_ordinal;
   std::optional<TlsInfo> tls;
+  DataDirectory exception_directory;  // .pdata: RUNTIME_FUNCTION entries sorted by address
 
   uint64_t address() const { return reinterpret_cast<uint64_t>(base); }
   bool contains(uint64_t addr) const { return addr >= address() && addr - address() < size; }

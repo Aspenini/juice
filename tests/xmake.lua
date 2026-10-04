@@ -38,7 +38,7 @@ target("juice-guest-tests")
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
                "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings")
     -- C runtime programs, built /MT and /MD.
-    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp")
+    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_seh.c", "crt_eh.cpp")
 
     on_load(function (target)
         import("lib.detect.find_program")
@@ -126,14 +126,18 @@ target("juice-guest-tests")
 
         -- C runtime programs, /MT and /MD.
         if vctools then
-            local crt_cflags = {"/nologo", "/O2", "/W3", "/EHs-c-", "/D_HAS_EXCEPTIONS=0", "/clang:-ffp-contract=off",
-                                "/clang:-fno-vectorize", "/clang:-fno-slp-vectorize", "/vctoolsdir" .. vctools}
+            local crt_cflags = {"/nologo", "/O2", "/W3", "/clang:-ffp-contract=off", "/clang:-fno-vectorize",
+                                "/clang:-fno-slp-vectorize", "/vctoolsdir" .. vctools}
+            local no_exceptions = {"/EHs-c-", "/D_HAS_EXCEPTIONS=0"}
             local crt_special = {crt_c = {args = {"one", "two words"}}}
+            -- C++ exceptions: /MT only, since vcruntime140.dll's C++ frame handler is x64 code.
+            local cxx_exceptions = {crt_eh = true}
             for _, file in ipairs(target:values("guest.crt")) do
                 local name = path.basename(file)
                 local src = path.join(scriptdir, "programs", file)
-                for _, rt in ipairs({"MT", "MD"}) do
-                    add_job(name, rt, src, {}, crt_cflags, {})
+                local flags = table.join(crt_cflags, cxx_exceptions[name] and {"/EHsc"} or no_exceptions)
+                for _, rt in ipairs(cxx_exceptions[name] and {"MT"} or {"MT", "MD"}) do
+                    add_job(name, rt, src, {}, flags, {})
                     for _, mode in ipairs({"jit", "interp"}) do
                         add_guest_test(name, rt, mode, crt_special[name] or {})
                     end

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cwctype>
 #include <format>
+#include <optional>
 
 #include "core/arm64/decode/instruction.hpp"
 #include "windows/dlls/builtins.hpp"
@@ -330,16 +331,42 @@ uint64_t GuestProcess::call_guest(uint64_t fn, std::initializer_list<uint64_t> a
   return call_guest(fn, full).x0;
 }
 
-NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& args) {
-  arm64::CpuState& state = attach_thread().state;
+NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& args, const GuestCall& how) {
+  GuestThread& t = attach_thread();
+  arm64::CpuState& state = t.state;
   // The callee runs on the guest stack below the caller's frame. Restoring the
   // whole state afterwards gives the caller exactly what the ABI promises.
   const arm64::CpuState saved = state;
   for (int i = 0; i < 8; ++i) state.x[i] = args.gpr[i];
   for (int i = 0; i < 4; ++i) state.v[i] = {args.fpr[i], 0};
+  if (how.sp) state.sp = how.sp;
+  if (how.nonvolatile) std::memcpy(&state.x[19], how.nonvolatile, 10 * sizeof(uint64_t));
   state.x[30] = thunks_.return_sentinel();
   state.pc = fn;
-  engine_->run(state, thunks_.return_sentinel());
+
+  t.levels.push_back({state.sp, how.native_frames, how.link});
+  struct LevelScope {
+    GuestThread& t;
+    ~LevelScope() { t.levels.pop_back(); }
+  } scope{t};
+  // Exception handling continues guest execution in the call level that owns
+  // the target frame (a Resume thrown by unwind/restore_context); outer
+  // levels rethrow it on.
+  std::optional<Resume> pending;
+  for (;;) {
+    try {
+      if (pending) {
+        Resume r = *pending;
+        pending.reset();
+        resume(r);
+      }
+      engine_->run(state, thunks_.return_sentinel());
+      break;
+    } catch (Resume& r) {
+      if (!(r.context.sp < t.levels.back().entry_sp)) throw;
+      pending.emplace(r);
+    }
+  }
   const Result result{state.x[0], state.v[0].lo};
   state = saved;
   return result;
@@ -440,6 +467,11 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
     if (r.has_x1) s.x[1] = r.x1;
   } else {
     result = thunk->builtin(*this, s);
+    if (t_thread && t_thread->state_replaced) {
+      // The builtin continues somewhere else (exception handling), not at the caller.
+      t_thread->state_replaced = false;
+      return runtime::Action::Continue;
+    }
   }
   s.x[0] = result;
   s.pc = lr;

@@ -212,6 +212,8 @@ std::expected<LoadedImage, std::string> map_image(const PeFile& file) {
   if (auto r = parse_imports(image, file); !r) return fail(r.error());
   parse_exports(image, file);
   parse_tls(image, file);
+  if (const DataDirectory& ex = file.dirs[kDirException]; ex.rva && ex.size && ex.rva + uint64_t{ex.size} <= image.size)
+    image.exception_directory = ex;
   image.entry = file.entry_rva ? image.address() + file.entry_rva : 0;
   return image;
 }

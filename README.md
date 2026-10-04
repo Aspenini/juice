@@ -31,6 +31,9 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 * **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
   `thread_local` objects with constructors and destructors, and guest atomics that are really
   atomic across threads.
+* **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
+  `RaiseException`, vectored handlers) with the static and dynamic CRT, and C++ exceptions with
+  the static CRT (`/MT`).
 * Every test program is checked against a natively compiled x86-64 build of the same source.
   Each one runs under the optimizing JIT, the unoptimized JIT and the reference IR interpreter.
 
@@ -169,6 +172,17 @@ and API built-ins do.
   `RtlCaptureContext` (fills an ARM64 `CONTEXT`) and the process-exit functions. The process
   command line is rewritten in place, so native code such as the UCRT's `argv` parsing sees the
   guest's command line.
+* **Exceptions.** JUICE has its own ARM64 versions of ntdll's dispatcher and unwinder. They
+  walk guest frames using the image's `.pdata`/`.xdata` unwind information, in both packed and
+  full form. They call the program's language handlers the way ntdll does, which covers
+  `__C_specific_handler` and the C++ runtime's `__CxxFrameHandler4`. They also run termination
+  handlers during unwinding and perform the unwind consolidation that executes C++ catch blocks.
+  `RaiseException`, `RtlUnwindEx`, `RtlLookupFunctionEntry`, `RtlVirtualUnwind`,
+  `RtlRestoreContext`, vectored handlers and the unhandled-exception filter are built-ins. So is
+  `vcruntime140`'s `__C_specific_handler`. The exception record and context live on the guest
+  stack, as they would natively. To continue at a handler, the dispatcher also unwinds JUICE's
+  own nested runs of guest code, using a C++ exception that the run owning the target frame
+  catches.
 * **Diagnostics.** Guest crashes, unsupported instructions, `__fastfail` and unimplemented
   APIs are reported with the guest register state. Crashes inside JUICE itself print a host
   stack trace as `module+offset` (for `llvm-symbolizer --obj=juice.exe`).
@@ -181,8 +195,8 @@ and API built-ins do.
   random data-processing instructions; and a stress test that runs one engine on several threads
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
-  threads, GUI, COM, application manifests, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
-  and `/MD`.
+  threads, GUI, COM, application manifests, exit codes) built at `-O2` and `-Od`, plus C and C++
+  C-runtime programs built `/MT` and `/MD` (threads, SEH, C++ exceptions).
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
 
@@ -196,8 +210,12 @@ These are next, roughly in the plan's order:
 2. **More Win32 APIs.** Signatures for more mixed int/FP functions and by-value structures, and
    structures larger than 16 bytes returned by value through X8.
 3. **DLL loading.** Load ARM64 DLLs as guest modules (`LoadLibrary`, imports between guest DLLs).
-4. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
-   (`.pdata`/`.xdata`). This also enables C++ exceptions.
+4. **Windows exceptions.** Software exceptions work. Still missing:
+   * Hardware faults in guest code (such as an access violation inside `__try`) are reported
+     instead of being delivered to the program.
+   * Exceptions can't propagate through native code, for example from a window procedure out
+     through `DispatchMessage`.
+   * C++ exceptions with the dynamic CRT need an ARM64 `vcruntime140` frame handler.
 5. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
    structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. `uiAccess` in a
    manifest is not honored.

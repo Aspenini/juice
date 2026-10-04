@@ -27,6 +27,9 @@ bool is_ucrt_family(std::string_view dll) {
   return d.starts_with("ucrtbase") || d.starts_with("api-ms-win-crt-");
 }
 
+// The Visual C++ runtime: vcruntime140.dll and vcruntime140_1.dll.
+bool is_vcruntime_family(std::string_view dll) { return lower(dll).starts_with("vcruntime140"); }
+
 BuiltinFn find_in(std::span<const BuiltinExport> exports, std::string_view name) {
   for (const BuiltinExport& e : exports)
     if (e.name == name) return e.fn;
@@ -36,7 +39,11 @@ BuiltinFn find_in(std::span<const BuiltinExport> exports, std::string_view name)
 }  // namespace
 
 BuiltinFn find_builtin(std::string_view dll, std::string_view name) {
-  if (is_kernel32_family(dll)) return find_in(kernel32_builtins(), name);
+  if (is_kernel32_family(dll)) {
+    if (BuiltinFn fn = find_in(exception_builtins(), name)) return fn;
+    return find_in(kernel32_builtins(), name);
+  }
+  if (is_vcruntime_family(dll)) return find_in(vcruntime_builtins(), name);
   if (is_ucrt_family(dll)) return find_in(ucrt_builtins(), name);
   return nullptr;
 }

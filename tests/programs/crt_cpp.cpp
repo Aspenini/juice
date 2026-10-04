@@ -1,6 +1,6 @@
 // A C++ program using the standard library: global constructors and
 // destructors, virtual calls, containers, algorithms, lambdas and strings.
-// (C++ exceptions are not supported by JUICE yet; built with them disabled.)
+// (Built with C++ exceptions disabled; crt_eh.cpp covers exceptions.)
 #include <algorithm>
 #include <cstdio>
 #include <functional>

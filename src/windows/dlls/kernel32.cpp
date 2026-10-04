@@ -137,13 +137,6 @@ uint64_t FreeLibraryAndExitThread_(GuestProcess& p, CpuState& s) {
   p.exit_thread(static_cast<uint32_t>(s.x[1]));
 }
 
-uint64_t SetUnhandledExceptionFilter_(GuestProcess&, CpuState& s) {
-  static uint64_t current = 0;
-  uint64_t previous = current;
-  current = s.x[0];  // recorded for future guest exception support; never called natively
-  return previous;
-}
-
 // --- system information ------------------------------------------------------------------
 
 void patch_system_info(SYSTEM_INFO* info) {
@@ -211,7 +204,6 @@ constexpr BuiltinExport kKernel32[] = {
     {"ExitThread", ExitThread_},
     {"FreeLibrary", FreeLibrary_},
     {"FreeLibraryAndExitThread", FreeLibraryAndExitThread_},
-    {"SetUnhandledExceptionFilter", SetUnhandledExceptionFilter_},
     {"GetSystemInfo", GetSystemInfo_},
     {"GetNativeSystemInfo", GetNativeSystemInfo_},
     {"IsProcessorFeaturePresent", IsProcessorFeaturePresent_},
