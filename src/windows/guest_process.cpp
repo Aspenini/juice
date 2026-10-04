@@ -378,9 +378,33 @@ bool GuestProcess::read_code(uint64_t addr, uint32_t& word) {
   return true;
 }
 
+bool GuestProcess::is_host_code(uint64_t pc) {
+  // Executable code of a loaded native module: the guest got a native function
+  // pointer that never went through an import or GetProcAddress, typically a
+  // method in the vtable of a COM object created by a system DLL.
+  if (image_.contains(pc)) return false;
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(reinterpret_cast<const void*>(pc), &mbi, sizeof(mbi))) return false;
+  constexpr DWORD kExecute = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+  return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE && (mbi.Protect & kExecute);
+}
+
+Thunk* GuestProcess::native_code_thunk(uint64_t pc) {
+  HMODULE module = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     reinterpret_cast<LPCWSTR>(pc), &module);
+  char path[MAX_PATH] = "native";
+  if (module) GetModuleFileNameA(module, path, MAX_PATH);
+  std::string dll = path;
+  if (size_t slash = dll.find_last_of("\\/"); slash != std::string::npos) dll = dll.substr(slash + 1);
+  const std::string name = std::format("0x{:x}", pc - reinterpret_cast<uint64_t>(module));
+  return thunks_.find(thunks_.add_native(reinterpret_cast<void*>(pc), std::move(dll), name));
+}
+
 runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   const uint64_t pc = s.pc;
-  Thunk* thunk = thunks_.find(pc);
+  const bool in_thunks = pc >= thunks_.begin() && pc < thunks_.end();
+  Thunk* thunk = in_thunks ? thunks_.find(pc) : native_code_thunk(pc);
   if (!thunk) fatal(std::format("guest jumped into the API thunk region at 0x{:x}", pc), kStatusAccessViolation);
   std::atomic_ref<uint64_t>(thunk->calls).fetch_add(1, std::memory_order_relaxed);
   const uint64_t lr = s.x[30];

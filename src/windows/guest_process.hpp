@@ -56,6 +56,7 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   bool read_code(uint64_t addr, uint32_t& word) override;
   std::pair<uint64_t, uint64_t> host_range() const override { return {thunks_.begin(), thunks_.end()}; }
   runtime::Action on_host_address(arm64::CpuState& state) override;
+  bool is_host_code(uint64_t pc) override;
   runtime::Action on_exit(arm64::CpuState& state) override;
 
   // --- NativeCallbackTarget ----------------------------------------------------------
@@ -108,6 +109,8 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   static void WINAPI release_thread(void* thread);  // FLS destructor
   void reclaim_threads();  // free contexts of host threads that have terminated
   void dump_state(std::FILE* out) const;
+  // Thunk for native code the guest reached directly (is_host_code), named module+offset.
+  Thunk* native_code_thunk(uint64_t pc);
 
   ProcessOptions options_;
   ThunkTable thunks_;

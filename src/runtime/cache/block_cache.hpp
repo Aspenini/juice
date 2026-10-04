@@ -24,6 +24,7 @@ struct TranslatedBlock {
   size_t code_size = 0;
   std::unique_ptr<ir::Block> ir;    // retained for the interpreter backend
   uint64_t executions = 0;          // only counted when profiling (updated atomically)
+  bool host = false;                // host code reached by the guest: no translation, see Environment::is_host_code
 };
 
 class BlockCache {

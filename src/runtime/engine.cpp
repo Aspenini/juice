@@ -80,6 +80,15 @@ TranslatedBlock* Engine::lookup(uint64_t pc) {
 }
 
 TranslatedBlock* Engine::translate_locked(uint64_t pc) {
+  if (env_.is_host_code(pc)) {
+    // Remember the answer like a translation, so later visits take the fast path.
+    auto tb = std::make_unique<TranslatedBlock>();
+    tb->guest_pc = pc;
+    tb->guest_end = pc + 4;
+    tb->host = true;
+    return cache_.insert(std::move(tb));
+  }
+
   arm64::CodeReader reader = [this](uint64_t addr, uint32_t& word) { return env_.read_code(addr, word); };
 
   uint32_t max_insns = options_.max_block_insns;
@@ -156,6 +165,11 @@ void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
       dispatches_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    if (block->host) {
+      if (env_.on_host_address(s) == Action::Stop) return;
+      continue;
+    }
+
     s.block_pc = pc;
     if (block->code) {
       reinterpret_cast<x64::BlockFn>(block->code)(&s, scratch);
@@ -193,7 +207,7 @@ void Engine::print_stats(std::FILE* out, size_t hot_blocks) const {
   {
     std::shared_lock lock(mutex_);
     for (const auto& [pc, b] : cache_.blocks())
-      blocks.emplace_back(std::atomic_ref<uint64_t>(const_cast<uint64_t&>(b->executions)).load(), b.get());
+      if (!b->host) blocks.emplace_back(std::atomic_ref<uint64_t>(const_cast<uint64_t&>(b->executions)).load(), b.get());
   }
   std::sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   if (blocks.size() > hot_blocks) blocks.resize(hot_blocks);

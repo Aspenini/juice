@@ -42,6 +42,15 @@ class Environment {
   virtual std::pair<uint64_t, uint64_t> host_range() const = 0;
   virtual Action on_host_address(arm64::CpuState& state) = 0;
 
+  // Is `pc`, outside host_range(), host code rather than guest code (e.g. a
+  // native function the guest reached through a pointer such as a COM vtable
+  // entry)? Asked once per address, before translating it; when true, entering
+  // `pc` calls on_host_address() as well.
+  virtual bool is_host_code(uint64_t pc) {
+    (void)pc;
+    return false;
+  }
+
   // A block exited with state.exit_reason != None (SVC, BRK, UDF, ...).
   virtual Action on_exit(arm64::CpuState& state) = 0;
 };

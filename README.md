@@ -23,6 +23,9 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
   exists as an x64 DLL.
 * **Callbacks** from native code into the program (window procedures, `qsort` comparators,
   `InitOnceExecuteOnce`, FLS destructors, CRT `_initterm`/`atexit` tables).
+* **Win32 GUI and COM**: window classes and procedures, controls, dialogs, resources, GDI, and COM
+  objects used in both directions (calling system objects through their vtables, and system DLLs
+  calling objects the program implements).
 * **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
   `thread_local` objects with constructors and destructors, and guest atomics that are really
   atomic across threads.
@@ -127,6 +130,10 @@ and API built-ins do.
   functions the generic rules get wrong. These are UCRT functions that mix int and FP arguments
   (`ldexp`, `frexp`, ...), and 16-byte structures passed or returned by value (`_Thrd_join`,
   `lldiv`), which ARM64 puts in two registers and x64 passes by pointer.
+* **Native code pointers.** When the guest jumps to executable code of a native module that it
+  never imported, such as a method in the vtable of a COM object created by a system DLL, the
+  engine records that address as host code and calls it through the same bridge, returning to
+  the guest's link register.
 * **Callbacks.** Guest code is mapped non-executable, so a native call into a guest function
   raises an execute fault. A vectored exception handler turns it into a translated guest call
   (x64 → ARM64 arguments) and resumes the native caller with the result.
@@ -154,7 +161,7 @@ and API built-ins do.
   random data-processing instructions; and a stress test that runs one engine on several threads
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
-  threads, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
+  threads, GUI, COM, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
   and `/MD`.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
@@ -171,8 +178,9 @@ These are next, roughly in the plan's order:
 3. **DLL loading.** Load ARM64 DLLs as guest modules (`LoadLibrary`, imports between guest DLLs).
 4. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
    (`.pdata`/`.xdata`). This also enables C++ exceptions.
-5. **GUI applications.** Window procedure callbacks already work; GUI programs need broader API
-   coverage.
+5. **GUI applications.** Plain Win32 GUI programs and COM work. The guest's manifest is not
+   applied yet (visual styles, DPI awareness), and APIs with by-value structures or mixed int/FP
+   arguments (GDI+, Direct2D) need signatures.
 6. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.
