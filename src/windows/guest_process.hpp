@@ -18,6 +18,7 @@
 #include "core/arm64/state/cpu_state.hpp"
 #include "runtime/engine.hpp"
 #include "windows/exceptions/fault_handler.hpp"
+#include "windows/manifest.hpp"
 #include "windows/pe/pe_loader.hpp"
 #include "windows/thunk/thunk_table.hpp"
 
@@ -115,6 +116,7 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   ProcessOptions options_;
   ThunkTable thunks_;
   pe::LoadedImage image_{};
+  ManifestState manifest_;
   std::unique_ptr<runtime::Engine> engine_;
 
   uint64_t default_stack_size_ = 1 << 20;

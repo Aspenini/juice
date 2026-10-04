@@ -82,6 +82,7 @@ if is_plat("windows") then
                   "src/windows/imports/*.cpp",
                   "src/windows/exceptions/*.cpp",
                   "src/windows/dlls/*.cpp",
+                  "src/windows/manifest.cpp",
                   "src/windows/guest_process.cpp")
         add_headerfiles("src/windows/**.hpp")
 

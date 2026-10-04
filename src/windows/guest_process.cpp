@@ -91,6 +91,10 @@ GuestProcess::GuestProcess(ProcessOptions options) : options_(std::move(options)
 GuestProcess::~GuestProcess() {
   engine_.reset();
   pe::unmap_image(image_);
+  if (manifest_.context != INVALID_HANDLE_VALUE && !manifest_.process_default) {
+    DeactivateActCtx(0, manifest_.cookie);
+    ReleaseActCtx(manifest_.context);
+  }
   if (g_process == this) g_process = nullptr;
 }
 
@@ -112,6 +116,11 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
   if (!image) return std::unexpected(image.error());
   image_ = std::move(*image);
   if (!image_.entry) return std::unexpected("image has no entry point");
+
+  // Before binding imports: the manifest can redirect them (common controls v6).
+  auto manifest = apply_manifest(exe_path_, image_.address(), options_.trace_imports ? stderr : nullptr);
+  if (!manifest) return std::unexpected(manifest.error());
+  manifest_ = *manifest;
 
   ImportStats imports = resolve_imports(image_, thunks_, options_.trace_imports ? stderr : nullptr);
   if (options_.trace_imports) {
@@ -185,6 +194,7 @@ GuestThread& GuestProcess::attach_thread(uint64_t stack_size) {
   GuestThread* t = allocate_thread(stack_size);
   DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host_thread, SYNCHRONIZE, FALSE, 0);
   t_thread = t;
+  activate_manifest_on_thread(manifest_);
   setup_tls_for_thread();
   if (thread_fls_slot_ != FLS_OUT_OF_INDEXES) FlsSetValue(thread_fls_slot_, t);
   threads_started_.fetch_add(1, std::memory_order_relaxed);

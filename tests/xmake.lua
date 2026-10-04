@@ -36,7 +36,7 @@ target("juice-guest-tests")
 
     -- Freestanding programs: no C runtime, entry point mainCRTStartup.
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
-               "exitcode", "retcode", "threads", "gui", "com")
+               "exitcode", "retcode", "threads", "gui", "com", "manifest")
     -- C runtime programs, built /MT and /MD.
     set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp")
 
@@ -98,17 +98,26 @@ target("juice-guest-tests")
         local cflags = {"/nologo", "/GS-", "/Zl", "/W3", "/clang:-fno-vectorize", "/clang:-fno-slp-vectorize"}
         local ldflags = {"/link", "/entry:mainCRTStartup", "/nodefaultlib", "/subsystem:console",
                          "kernel32.lib", "user32.lib", "advapi32.lib", "gdi32.lib",
-                         "ole32.lib", "shlwapi.lib", "uuid.lib"}
+                         "ole32.lib", "shlwapi.lib", "uuid.lib", "comctl32.lib"}
         local special = {
             winapi = {args = {"alpha", "two words"}},
             -- Returning from the entry point: compared with a fixed expectation,
             -- since natively that only ends the main thread.
             retcode = {expect_exit = 7, expect_output = "returning 7\n"},
         }
+        -- Programs with an application manifest (programs/<name>.manifest), embedded by the linker.
+        local manifests = {manifest = true}
         for _, name in ipairs(target:values("guest.freestanding")) do
             local src = path.join(scriptdir, "programs", name .. ".c")
+            local deps = {header}
+            local link = ldflags
+            if manifests[name] then
+                local file = path.join(scriptdir, "programs", name .. ".manifest")
+                table.insert(deps, file)
+                link = table.join(ldflags, {"/manifest:embed", "/manifestuac:no", "/manifestinput:" .. file})
+            end
             for _, opt in ipairs({"O2", "Od"}) do
-                add_job(name, opt, src, {header}, cflags, ldflags)
+                add_job(name, opt, src, deps, cflags, link)
                 for _, mode in ipairs({"jit", "interp", "noopt"}) do
                     add_guest_test(name, opt, mode, special[name] or {})
                 end
