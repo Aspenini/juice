@@ -90,7 +90,7 @@ void usage() {
 int wmain(int argc, wchar_t** argv) {
   juice::win::ProcessOptions options;
   bool scan_only = false;
-  bool use_host = !juice::win::consume_host_marker();  // not again inside a host process
+  bool use_host = true;
   int i = 1;
   for (; i < argc; ++i) {
     std::wstring arg = argv[i];
@@ -107,7 +107,7 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg == L"--interp") options.engine.interpret = true;
     else if (arg == L"--no-opt") options.engine.optimize = false;
     else if (arg == L"--scan") scan_only = true;
-    else if (arg == L"--no-host") use_host = false;
+    else if (arg == L"--no-host" || arg == L"--in-host") use_host = false;  // --in-host: started by run_in_host()
     else if (arg.starts_with(L"--block-size=")) {
       long n = std::wcstol(arg.c_str() + 13, nullptr, 10);
       if (n < 1 || n > 4096) {

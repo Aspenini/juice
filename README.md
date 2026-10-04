@@ -141,11 +141,15 @@ and API built-ins do.
 * **Process-creation settings.** Windows applies some manifest settings only when it creates a
   process: `activeCodePage` (UTF-8), `longPathAware`, `heapType` (segment heap), the
   `supportedOS`/`maxversiontested` compatibility entries (for example, what `GetVersionEx`
-  reports) and a few rarer ones. For a program that declares any of these, `juice` re-runs
+  reports), `requestedExecutionLevel` and a few rarer ones. For a program that declares any of
+  these, `juice` re-runs
   itself in a copy of `juice.exe` whose own manifest carries them, then waits for it and returns
   its exit code. The two processes share the console and standard handles. Copies are cached per
   manifest in `%LOCALAPPDATA%\juice\hosts` and replaced when `juice.exe` is rebuilt. This adds
-  about 10 ms per run. `--no-host` turns it off.
+  about 10 ms per run. `--no-host` turns it off. A program that asks for administrator rights
+  (`requireAdministrator`, or `highestAvailable` for an administrator) gets the UAC prompt.
+  It then runs in a new console window, since an elevated process can't share an unelevated
+  console. `juice` still waits for it and returns its exit code.
 * **Native code pointers.** When the guest jumps to executable code of a native module that it
   never imported, such as a method in the vtable of a COM object created by a system DLL, the
   engine records that address as host code and calls it through the same bridge, returning to
@@ -195,8 +199,8 @@ These are next, roughly in the plan's order:
 4. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
    (`.pdata`/`.xdata`). This also enables C++ exceptions.
 5. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
-   structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. A manifest's
-   `requestedExecutionLevel` is not honored: programs always run as the invoking user.
+   structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. `uiAccess` in a
+   manifest is not honored.
 6. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.

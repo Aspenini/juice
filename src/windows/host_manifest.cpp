@@ -2,6 +2,7 @@
 // process-creation settings; see manifest.hpp.
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include <cstdint>
 #include <cstring>
@@ -12,11 +13,12 @@
 
 #include "windows/manifest.hpp"
 
+#pragma comment(lib, "shell32.lib")
+
 namespace juice::win {
 
 namespace {
 
-constexpr wchar_t kHostMarker[] = L"JUICE_MANIFEST_HOST";
 
 struct Setting {
   const char* ns;
@@ -181,8 +183,62 @@ std::expected<std::wstring, std::string> host_executable(const std::string& mani
 
 BOOL WINAPI ignore_console_control(DWORD) { return TRUE; }  // the host process handles Ctrl+C
 
+// The requested execution level, if it asks for more than the invoker's rights.
+const char* elevated_run_level(HANDLE context) {
+  ACTIVATION_CONTEXT_RUN_LEVEL_INFORMATION info{};
+  SIZE_T written = 0;
+  if (!QueryActCtxW(0, context, nullptr, RunlevelInformationInActivationContext, &info, sizeof(info), &written))
+    return nullptr;
+  if (info.RunLevel == ACTCTX_RUN_LEVEL_HIGHEST_AVAILABLE) return "highestAvailable";
+  if (info.RunLevel == ACTCTX_RUN_LEVEL_REQUIRE_ADMIN) return "requireAdministrator";
+  return nullptr;
+}
+
+// juice's own arguments: the command line without the program name.
+std::wstring arguments_of(const wchar_t* command_line) {
+  const wchar_t* p = command_line;
+  if (*p == L'"') {
+    for (++p; *p && *p != L'"'; ++p) {
+    }
+    if (*p) ++p;
+  } else {
+    while (*p && *p != L' ' && *p != L'\t') ++p;
+  }
+  while (*p == L' ' || *p == L'\t') ++p;
+  return p;
+}
+
 void make_inheritable(HANDLE h) {
   if (h && h != INVALID_HANDLE_VALUE) SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+}
+
+// The program asks for administrator rights: start the host through UAC
+// like the shell would. An elevated process can't share this console, so it
+// gets a window of its own; its exit code is still returned.
+std::expected<int, std::string> run_elevated(const std::wstring& exe, const std::wstring& arguments, int show) {
+  std::fprintf(stderr, "juice: the program requires elevation; it runs in a new administrator window\n");
+  std::fflush(stderr);
+  std::wstring directory(MAX_PATH, L'\0');
+  directory.resize(GetCurrentDirectoryW(static_cast<DWORD>(directory.size()), directory.data()));
+  SHELLEXECUTEINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+  info.lpVerb = L"runas";
+  info.lpFile = exe.c_str();
+  info.lpParameters = arguments.c_str();
+  info.lpDirectory = directory.c_str();
+  info.nShow = show;
+  if (!ShellExecuteExW(&info) || !info.hProcess) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_CANCELLED) return std::unexpected("elevation was declined");
+    return std::unexpected(std::format("cannot start the elevated host process (error {})", error));
+  }
+  SetConsoleCtrlHandler(ignore_console_control, TRUE);
+  WaitForSingleObject(info.hProcess, INFINITE);
+  DWORD code = 1;
+  GetExitCodeProcess(info.hProcess, &code);
+  CloseHandle(info.hProcess);
+  return static_cast<int>(code);
 }
 
 }  // namespace
@@ -205,15 +261,18 @@ std::string host_manifest_for(const std::wstring& exe_path) {
     settings += std::format("      <{0} xmlns=\"{1}\">{2}</{0}>\n", s.name, s.ns, xml_escape(value));
   }
   const std::string compatibility = compatibility_entries(context);
+  const char* run_level = elevated_run_level(context);
   ReleaseActCtx(context);
-  if (!needs_new_process && compatibility.empty()) return {};
+  if (!needs_new_process && compatibility.empty() && !run_level) return {};
 
   std::string manifest =
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
       "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n"
       "  <trustInfo xmlns=\"urn:schemas-microsoft-com:asm.v3\">\n"
       "    <security><requestedPrivileges>\n"
-      "      <requestedExecutionLevel level=\"asInvoker\" uiAccess=\"false\"/>\n"
+      "      <requestedExecutionLevel level=\"" +
+      std::string(run_level ? run_level : "asInvoker") +
+      "\" uiAccess=\"false\"/>\n"
       "    </requestedPrivileges></security>\n"
       "  </trustInfo>\n";
   if (!compatibility.empty()) {
@@ -231,7 +290,10 @@ std::string host_manifest_for(const std::wstring& exe_path) {
 std::expected<int, std::string> run_in_host(const std::string& manifest, std::FILE* log) {
   auto exe = host_executable(manifest);
   if (!exe) return std::unexpected(exe.error());
-  if (log) std::fprintf(log, "[juice] manifest: running in host process %ls\n", exe->c_str());
+  if (log) {
+    std::fprintf(log, "[juice] manifest: running in host process %ls with manifest:\n%s", exe->c_str(),
+                 manifest.c_str());
+  }
 
   STARTUPINFOW si{};
   GetStartupInfoW(&si);
@@ -255,14 +317,18 @@ std::expected<int, std::string> run_in_host(const std::string& manifest, std::FI
     SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
   }
 
-  SetEnvironmentVariableW(kHostMarker, L"1");
-  std::wstring command_line = GetCommandLineW();
+  // `--in-host` keeps the host from starting a host of its own.
+  const std::wstring arguments = L"--in-host " + arguments_of(GetCommandLineW());
+  std::wstring command_line = L"\"" + *exe + L"\" " + arguments;
   PROCESS_INFORMATION pi{};
   const BOOL created = CreateProcessW(exe->c_str(), command_line.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED,
                                       nullptr, nullptr, &si, &pi);
-  const DWORD error = GetLastError();
-  SetEnvironmentVariableW(kHostMarker, nullptr);
+  if (!created && GetLastError() == ERROR_ELEVATION_REQUIRED) {
+    if (job) CloseHandle(job);
+    return run_elevated(*exe, arguments, si.dwFlags & STARTF_USESHOWWINDOW ? si.wShowWindow : SW_SHOWNORMAL);
+  }
   if (!created) {
+    const DWORD error = GetLastError();
     if (job) CloseHandle(job);
     return std::unexpected(std::format("cannot start the host process (error {})", error));
   }
@@ -278,11 +344,5 @@ std::expected<int, std::string> run_in_host(const std::string& manifest, std::FI
   return static_cast<int>(code);
 }
 
-bool consume_host_marker() {
-  wchar_t value[4] = {};
-  if (!GetEnvironmentVariableW(kHostMarker, value, 4)) return false;
-  SetEnvironmentVariableW(kHostMarker, nullptr);
-  return true;
-}
 
 }  // namespace juice::win
