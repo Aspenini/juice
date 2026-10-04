@@ -23,6 +23,9 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
   exists as an x64 DLL.
 * **Callbacks** from native code into the program (window procedures, `qsort` comparators,
   `InitOnceExecuteOnce`, FLS destructors, CRT `_initterm`/`atexit` tables).
+* **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
+  `thread_local` objects with constructors and destructors, and guest atomics that are really
+  atomic across threads.
 * Every test program is checked against a natively compiled x86-64 build of the same source.
   Each one runs under the optimizing JIT, the unoptimized JIT and the reference IR interpreter.
 
@@ -102,8 +105,15 @@ and API built-ins do.
   vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter share one
   definition of their semantics. That code includes ARM NaN propagation, the default NaN and
   saturating conversions.
-* **Block cache.** Each block is translated once and cached by guest PC, with a direct-mapped
-  front table.
+* **Atomics.** LSE atomics (`CAS`, `SWP`, `LDADD`, ...) become single atomic host operations.
+  Exclusives are emulated by value: `LDXR`/`LDXP` record the loaded value, and `STXR`/`STXP` store
+  with a compare-and-swap against it (`CMPXCHG16B` for 128-bit pairs), failing if memory changed.
+  Like other translators, this accepts an A-B-A change as unchanged. `STLR` is a locked store, and
+  full `DMB`/`DSB` barriers become `MFENCE`. x86-64's stronger ordering covers the other variants.
+* **Block cache.** Each block is translated once and shared by all threads. Each thread looks
+  blocks up through its own direct-mapped table, so dispatch takes no lock; the shared map is
+  locked only on a miss. Blocks and code are never freed while the process runs, so no thread
+  can execute code that another thread discarded.
 
 ### Windows layer
 
@@ -113,11 +123,19 @@ and API built-ins do.
   dispatcher reaches one, it calls the native function. A generated x64 trampoline converts the
   ARM64 calling convention to x64, passing X0–X7, D0–D3 and stack arguments. It returns both RAX
   and XMM0, so integer and FP results both work. Variadic functions work too, because Windows
-  ARM64 passes variadic floats in integer registers. A small signature table covers UCRT
-  functions that mix int and FP arguments (`ldexp`, `frexp`, ...).
+  ARM64 passes variadic floats in integer registers. A small signature table covers the
+  functions the generic rules get wrong. These are UCRT functions that mix int and FP arguments
+  (`ldexp`, `frexp`, ...), and 16-byte structures passed or returned by value (`_Thrd_join`,
+  `lldiv`), which ARM64 puts in two registers and x64 passes by pointer.
 * **Callbacks.** Guest code is mapped non-executable, so a native call into a guest function
   raises an execute fault. A vectored exception handler turns it into a translated guest call
   (x64 → ARM64 arguments) and resumes the native caller with the result.
+* **Threads.** Every host thread that runs guest code gets its own guest context: CPU state,
+  guest stack, TEB in X18 and a slot in the thread's implicit-TLS vector. Guest TLS callbacks
+  get `DLL_THREAD_ATTACH`/`DETACH`. `CreateThread` starts a host thread that runs the guest
+  routine. Threads created natively (the thread pool, the native UCRT's `_beginthreadex`) get a
+  context the first time they call into guest code. Contexts are freed only once their host
+  thread has terminated, because guest code can still run during thread exit.
 * **Built-ins.** These replace APIs that must know about the guest: `GetModuleHandle*`,
   `GetModuleFileName*`, `GetProcAddress` (which thunks native exports on the fly),
   `GetCommandLine*`, `GetSystemInfo` (reports ARM64), `IsProcessorFeaturePresent`,
@@ -125,16 +143,19 @@ and API built-ins do.
   command line is rewritten in place, so native code such as the UCRT's `argv` parsing sees the
   guest's command line.
 * **Diagnostics.** Guest crashes, unsupported instructions, `__fastfail` and unimplemented
-  APIs are reported with the guest register state.
+  APIs are reported with the guest register state. Crashes inside JUICE itself print a host
+  stack trace as `module+offset` (for `llvm-symbolizer --obj=juice.exe`).
 
 ## Tests
 
 * `tests/unit`: decoder tests against LLVM-assembled encodings; IR semantics and optimizer tests;
-  JIT-vs-interpreter checks of every opcode; end-to-end ARM64 snippets with known results; and a
+  JIT-vs-interpreter checks of every opcode; end-to-end ARM64 snippets with known results; a
   randomized check that the optimized JIT, unoptimized JIT and interpreter agree on thousands of
-  random data-processing instructions.
+  random data-processing instructions; and a stress test that runs one engine on several threads
+  at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
-  exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT` and `/MD`.
+  threads, exit codes) built at `-O2` and `-Od`, plus C and C++ C-runtime programs built `/MT`
+  and `/MD`.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
 
@@ -143,16 +164,19 @@ and API built-ins do.
 These are next, roughly in the plan's order:
 
 1. **More ARM64 instructions.** The remaining Advanced SIMD (vector FP, TBL, saturating and
-   widening arithmetic), CRC32, crypto, and LSE128/MOPS. Use `--scan` to see what a program needs.
-2. **More Win32 APIs.** Signatures for more mixed int/FP functions, and structures returned by
-   value through X8.
+   widening arithmetic), CRC32, crypto, `CASP`, and LSE128/MOPS. Use `--scan` to see what a
+   program needs.
+2. **More Win32 APIs.** Signatures for more mixed int/FP functions and by-value structures, and
+   structures larger than 16 bytes returned by value through X8.
 3. **DLL loading.** Load ARM64 DLLs as guest modules (`LoadLibrary`, imports between guest DLLs).
-4. **Threads.** A CPU state and stack per guest thread, `CreateThread` and callbacks on other
-   threads, a thread-safe translation cache, and real atomics for exclusives.
-5. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
+4. **Windows exceptions.** Deliver faults to the guest as SEH exceptions and unwind ARM64 frames
    (`.pdata`/`.xdata`). This also enables C++ exceptions.
-6. **GUI applications.** Window procedure callbacks already work; GUI programs need broader API
+5. **GUI applications.** Window procedure callbacks already work; GUI programs need broader API
    coverage.
-7. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
-   instead of spilling every value, inline SSE for vector/FP ops, flag fusion for `cmp + b.cond`,
-   and W^X code memory.
+6. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
+   instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
+   for `cmp + b.cond`, and W^X code memory.
+
+Threading caveats: if a native DLL with implicit TLS is loaded after start-up, ntdll rebuilds the
+TLS vectors and drops the guest's slot. `SuspendThread`/`GetThreadContext` on a guest thread see
+the host's x64 context, not the guest's ARM64 one.

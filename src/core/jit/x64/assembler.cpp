@@ -170,6 +170,14 @@ void Assembler::cmov(Cond cc, Reg dst, Reg src, bool w) {
   op_rr({0x0F, static_cast<uint8_t>(0x40 + static_cast<unsigned>(cc))}, dst, src, w);
 }
 
+void Assembler::lea(Reg dst, Mem src) { op_rm({0x8D}, dst, src, true); }
+
+void Assembler::mfence() {
+  byte(0x0F);
+  byte(0xAE);
+  byte(0xF0);
+}
+
 void Assembler::movsd_load(unsigned xmm, Mem src) {
   byte(0xF2);
   op_rm({0x0F, 0x10}, xmm, src, false);

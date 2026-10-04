@@ -41,6 +41,14 @@ struct CpuState {
   uint32_t exit_reason;  // ExitReason
   uint32_t exit_info;
   uint64_t block_pc;     // first guest pc of the block currently executing
+
+  // Exclusive monitor. LDXR/LDXP record the value they loaded; STXR/STXP
+  // succeed by atomically comparing memory against it and swapping in the new
+  // value (lock cmpxchg), so they are atomic with respect to other threads.
+  uint64_t excl_value;
+  uint64_t excl_value_hi;
+  uint64_t excl_new;     // scratch for the 128-bit compare-and-swap of STXP
+  uint64_t excl_new_hi;
 };
 
 // Slot numbers (byte offset / 8) used by the lifter for GetReg/SetReg.
@@ -57,7 +65,11 @@ inline constexpr uint16_t TPIDR_EL0 = 100;
 inline constexpr uint16_t TPIDRRO_EL0 = 101;
 inline constexpr uint16_t Exit = 102;  // exit_reason (low half) / exit_info (high half)
 inline constexpr uint16_t BlockPc = 103;
-inline constexpr uint16_t Count = 104;
+inline constexpr uint16_t ExclValue = 104;    // excl_value, excl_value_hi, excl_new, excl_new_hi
+inline constexpr uint16_t ExclValueHi = 105;
+inline constexpr uint16_t ExclNew = 106;
+inline constexpr uint16_t ExclNewHi = 107;
+inline constexpr uint16_t Count = 108;
 }  // namespace slot
 
 static_assert(offsetof(CpuState, sp) == 8 * slot::SP);
@@ -69,6 +81,8 @@ static_assert(offsetof(CpuState, tpidr_el0) == 8 * slot::TPIDR_EL0);
 static_assert(offsetof(CpuState, exit_reason) == 8 * slot::Exit);
 static_assert(offsetof(CpuState, exit_info) == 8 * slot::Exit + 4);
 static_assert(offsetof(CpuState, block_pc) == 8 * slot::BlockPc);
+static_assert(offsetof(CpuState, excl_value) == 8 * slot::ExclValue);
+static_assert(offsetof(CpuState, excl_new_hi) == 8 * slot::ExclNewHi);
 static_assert(sizeof(CpuState) == 8 * slot::Count);
 
 // Name of a state slot, for IR dumps ("x0", "sp", "nzcv", "v3.lo", ...).

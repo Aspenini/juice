@@ -36,9 +36,9 @@ target("juice-guest-tests")
 
     -- Freestanding programs: no C runtime, entry point mainCRTStartup.
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
-               "exitcode", "retcode")
+               "exitcode", "retcode", "threads", "gui")
     -- C runtime programs, built /MT and /MD.
-    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp")
+    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp")
 
     on_load(function (target)
         import("lib.detect.find_program")
@@ -97,7 +97,7 @@ target("juice-guest-tests")
         local header = path.join(scriptdir, "programs", "juice_test.h")
         local cflags = {"/nologo", "/GS-", "/Zl", "/W3", "/clang:-fno-vectorize", "/clang:-fno-slp-vectorize"}
         local ldflags = {"/link", "/entry:mainCRTStartup", "/nodefaultlib", "/subsystem:console",
-                         "kernel32.lib", "user32.lib", "advapi32.lib"}
+                         "kernel32.lib", "user32.lib", "advapi32.lib", "gdi32.lib"}
         local special = {
             winapi = {args = {"alpha", "two words"}},
             -- Returning from the entry point: compared with a fixed expectation,

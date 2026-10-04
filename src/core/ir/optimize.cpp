@@ -219,6 +219,10 @@ class Optimizer {
         case Opcode::StoreFromState:
           for (unsigned s = 0; s < state_slots(in); ++s) overwritten[in.imm + s] = 0;
           break;
+        case Opcode::AtomicCasPair:
+          // Reads guest state through a StateAddr pointer: keep every earlier store.
+          std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
+          break;
         default:
           break;
       }
@@ -231,7 +235,7 @@ class Optimizer {
     for (size_t i = insts_.size(); i-- > 0;) {
       Inst& in = insts_[i];
       if (in.op == Opcode::Nop) continue;
-      bool needed = !has_result(in.op) || live[i];
+      bool needed = !has_result(in.op) || has_side_effects(in.op) || live[i];
       if (!needed) {
         in.op = Opcode::Nop;
         ++stats_.dead_values;

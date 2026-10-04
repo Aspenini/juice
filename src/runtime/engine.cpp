@@ -1,7 +1,9 @@
 #include "runtime/engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <format>
+#include <mutex>
 #include <stdexcept>
 
 #include "core/arm64/decode/instruction.hpp"
@@ -10,6 +12,7 @@
 namespace juice::runtime {
 
 namespace {
+
 thread_local arm64::CpuState* t_current_state = nullptr;
 
 struct CurrentStateScope {
@@ -18,10 +21,28 @@ struct CurrentStateScope {
   arm64::CpuState* saved;
 };
 
+// Per-thread direct-mapped pc -> block table in front of the shared map. It
+// belongs to one engine at a time and is cleared when that engine's
+// generation changes (translations were invalidated).
+struct FastTable {
+  static constexpr size_t kSize = 4096;
+  uint64_t engine = 0;
+  uint64_t generation = 0;
+  std::array<TranslatedBlock*, kSize> entries{};
+};
+thread_local FastTable t_fast;
+
+// IR value slots for translated blocks; one per thread (blocks never run
+// concurrently on one thread, and nested runs happen between blocks).
+thread_local std::vector<uint64_t> t_scratch;
+
+std::atomic<uint64_t> g_next_engine_id{1};
+
 size_t count_live(const ir::Block& b) {
   return static_cast<size_t>(std::count_if(b.insts.begin(), b.insts.end(),
                                            [](const ir::Inst& i) { return i.op != ir::Opcode::Nop; }));
 }
+
 }  // namespace
 
 arm64::CpuState* Engine::current_state() { return t_current_state; }
@@ -31,13 +52,34 @@ Engine::Engine(Environment& env, EngineOptions options)
       options_(options),
       layout_(arm64::state_layout()),
       emitter_(layout_),
-      scratch_(x64::kMaxBlockValues, 0) {
+      id_(g_next_engine_id.fetch_add(1)) {
   auto [lo, hi] = env_.host_range();
   host_lo_ = lo;
   host_size_ = hi > lo ? hi - lo : 0;
 }
 
-TranslatedBlock* Engine::translate(uint64_t pc) {
+TranslatedBlock* Engine::lookup(uint64_t pc) {
+  FastTable& table = t_fast;
+  const uint64_t generation = generation_.load(std::memory_order_acquire);
+  if (table.engine != id_ || table.generation != generation) {
+    table.entries.fill(nullptr);
+    table.engine = id_;
+    table.generation = generation;
+  }
+  TranslatedBlock*& entry = table.entries[(pc >> 2) & (FastTable::kSize - 1)];
+  if (entry && entry->guest_pc == pc) return entry;
+
+  {
+    std::shared_lock lock(mutex_);
+    if (TranslatedBlock* b = cache_.find(pc)) return entry = b;
+  }
+  std::unique_lock lock(mutex_);
+  TranslatedBlock* b = cache_.find(pc);  // another thread may have translated it meanwhile
+  if (!b) b = translate_locked(pc);
+  return entry = b;
+}
+
+TranslatedBlock* Engine::translate_locked(uint64_t pc) {
   arm64::CodeReader reader = [this](uint64_t addr, uint32_t& word) { return env_.read_code(addr, word); };
 
   uint32_t max_insns = options_.max_block_insns;
@@ -75,14 +117,7 @@ TranslatedBlock* Engine::translate(uint64_t pc) {
         continue;
       }
       void* entry = arena_.add(code);
-      if (!entry) {
-        // Out of code space: start over with an empty cache.
-        cache_.clear();
-        arena_.reset();
-        ++stats_.cache_flushes;
-        entry = arena_.add(code);
-        if (!entry) throw std::runtime_error("translated block larger than the code arena");
-      }
+      if (!entry) throw std::runtime_error("out of space for translated code");
       tb->code = entry;
       tb->code_size = code.size();
       stats_.code_bytes += code.size();
@@ -96,8 +131,16 @@ TranslatedBlock* Engine::translate(uint64_t pc) {
   }
 }
 
+void Engine::invalidate(uint64_t begin, uint64_t end) {
+  std::unique_lock lock(mutex_);
+  if (cache_.invalidate(begin, end)) generation_.fetch_add(1, std::memory_order_release);
+}
+
 void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
   CurrentStateScope scope(&s);
+  if (t_scratch.size() < x64::kMaxBlockValues) t_scratch.assign(x64::kMaxBlockValues, 0);
+  uint64_t* const scratch = t_scratch.data();
+
   for (;;) {
     const uint64_t pc = s.pc;
     if (pc == stop_pc) return;
@@ -107,14 +150,15 @@ void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
       continue;
     }
 
-    TranslatedBlock* block = cache_.lookup(pc);
-    if (!block) block = translate(pc);
-    ++block->executions;
-    ++stats_.dispatches;
+    TranslatedBlock* block = lookup(pc);
+    if (options_.profile) {
+      std::atomic_ref<uint64_t>(block->executions).fetch_add(1, std::memory_order_relaxed);
+      dispatches_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     s.block_pc = pc;
     if (block->code) {
-      reinterpret_cast<x64::BlockFn>(block->code)(&s, scratch_.data());
+      reinterpret_cast<x64::BlockFn>(block->code)(&s, scratch);
     } else {
       ir::interpret(*block->ir, reinterpret_cast<uint64_t*>(&s), layout_);
     }
@@ -128,26 +172,34 @@ void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
   }
 }
 
-void Engine::print_stats(std::FILE* out, size_t hot_blocks) const {
-  std::fprintf(out, "[juice] blocks translated: %llu (%llu guest insns)\n",
-               static_cast<unsigned long long>(stats_.blocks_translated),
-               static_cast<unsigned long long>(stats_.guest_insns_translated));
-  std::fprintf(out, "[juice] IR insts: %llu (%llu removed by optimizer)\n",
-               static_cast<unsigned long long>(stats_.ir_insts),
-               static_cast<unsigned long long>(stats_.ir_insts_removed));
-  std::fprintf(out, "[juice] x86-64 code: %llu bytes, dispatches: %llu, cache flushes: %llu\n",
-               static_cast<unsigned long long>(stats_.code_bytes), static_cast<unsigned long long>(stats_.dispatches),
-               static_cast<unsigned long long>(stats_.cache_flushes));
+EngineStats Engine::stats() const {
+  std::shared_lock lock(mutex_);
+  EngineStats s = stats_;
+  s.dispatches = dispatches_.load(std::memory_order_relaxed);
+  return s;
+}
 
-  std::vector<const TranslatedBlock*> blocks;
-  for (const auto& [pc, b] : cache_.blocks()) blocks.push_back(b.get());
-  std::sort(blocks.begin(), blocks.end(),
-            [](const TranslatedBlock* a, const TranslatedBlock* b) { return a->executions > b->executions; });
+void Engine::print_stats(std::FILE* out, size_t hot_blocks) const {
+  const EngineStats s = stats();
+  std::fprintf(out, "[juice] blocks translated: %llu (%llu guest insns)\n",
+               static_cast<unsigned long long>(s.blocks_translated),
+               static_cast<unsigned long long>(s.guest_insns_translated));
+  std::fprintf(out, "[juice] IR insts: %llu (%llu removed by optimizer)\n", static_cast<unsigned long long>(s.ir_insts),
+               static_cast<unsigned long long>(s.ir_insts_removed));
+  std::fprintf(out, "[juice] x86-64 code: %llu bytes, dispatches: %llu\n", static_cast<unsigned long long>(s.code_bytes),
+               static_cast<unsigned long long>(s.dispatches));
+
+  std::vector<std::pair<uint64_t, const TranslatedBlock*>> blocks;
+  {
+    std::shared_lock lock(mutex_);
+    for (const auto& [pc, b] : cache_.blocks())
+      blocks.emplace_back(std::atomic_ref<uint64_t>(const_cast<uint64_t&>(b->executions)).load(), b.get());
+  }
+  std::sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
   if (blocks.size() > hot_blocks) blocks.resize(hot_blocks);
-  for (const TranslatedBlock* b : blocks)
+  for (const auto& [count, b] : blocks)
     std::fprintf(out, "[juice]   hot block 0x%llx: %llu executions, %u insns\n",
-                 static_cast<unsigned long long>(b->guest_pc), static_cast<unsigned long long>(b->executions),
-                 b->guest_insns);
+                 static_cast<unsigned long long>(b->guest_pc), static_cast<unsigned long long>(count), b->guest_insns);
 }
 
 }  // namespace juice::runtime

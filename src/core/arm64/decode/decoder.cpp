@@ -115,7 +115,12 @@ void decode_system(Instruction& i, uint32_t w) {
     if (crn == 2 && op1 == 3 && i.rd == 31) {  // HINT: NOP, YIELD, BTI, PAC*SP, ...
       i.op = Op::Nop;
     } else if (crn == 3 && op1 == 3 && i.rd == 31) {  // barriers
-      i.op = op2 == 2 ? Op::Clrex : Op::Nop;
+      // x86-64 already orders loads and stores except a store followed by a
+      // load, so only DMB/DSB covering both reads and writes need a fence.
+      // ISB/SB and the load-only / store-only variants are free.
+      if (op2 == 2) i.op = Op::Clrex;
+      else if ((op2 == 4 || op2 == 5) && (crm & 3) == 3) i.op = Op::Barrier;
+      else i.op = Op::Nop;
     } else if (crn == 4 && i.rd == 31) {  // MSR (immediate) to PSTATE fields
       i.op = Op::Nop;
     }
@@ -262,6 +267,7 @@ void decode_exclusive(Instruction& i, uint32_t w) {
     i.op = l ? Op::Ldr : Op::Str;  // LDAR / STLR (and LDLAR / STLLR)
     i.mode = AddrMode::Offset;
     i.imm = 0;
+    i.release = !l;
   } else {
     if (i.ra != 31) return;
     i.op = Op::Cas;
@@ -354,6 +360,7 @@ void decode_ldst(Instruction& i, uint32_t w) {
     if (!set_single_reg(i, size, false, bits(w, 23, 22))) { i.op = Op::Invalid; return; }
     i.mode = AddrMode::Offset;
     i.imm = sext(bits(w, 20, 12), 9);
+    i.release = i.op == Op::Str;
     return;
   }
 

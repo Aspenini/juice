@@ -116,12 +116,25 @@ uint64_t GetCommandLineW_(GuestProcess& p, CpuState&) { return reinterpret_cast<
 
 uint64_t ExitProcess_(GuestProcess& p, CpuState& s) { p.exit(static_cast<uint32_t>(s.x[0])); }
 
+// CreateThread(attributes, stack_size, start, parameter, flags, thread_id)
 uint64_t CreateThread_(GuestProcess& p, CpuState& s) {
-  if (p.options().trace_calls)
-    std::fprintf(stderr, "[juice] CreateThread(start=0x%llx): guest threads are not supported yet\n",
-                 static_cast<unsigned long long>(s.x[2]));
-  SetLastError(ERROR_NOT_SUPPORTED);
-  return 0;
+  return reinterpret_cast<uint64_t>(p.create_thread(ptr<SECURITY_ATTRIBUTES>(s.x[0]), s.x[1], s.x[2], s.x[3],
+                                                    static_cast<uint32_t>(s.x[4]), ptr<DWORD>(s.x[5])));
+}
+
+uint64_t ExitThread_(GuestProcess& p, CpuState& s) { p.exit_thread(static_cast<uint32_t>(s.x[0])); }
+
+// The guest image is not a module the native loader knows about (GetModuleHandleEx
+// hands it out, e.g. when the C runtime pins the module of a thread routine), so
+// it must never reach the native FreeLibrary.
+uint64_t FreeLibrary_(GuestProcess& p, CpuState& s) {
+  if (s.x[0] == p.image().address()) return TRUE;
+  return FreeLibrary(ptr<HINSTANCE__>(s.x[0]));
+}
+
+uint64_t FreeLibraryAndExitThread_(GuestProcess& p, CpuState& s) {
+  if (s.x[0] != p.image().address()) FreeLibrary(ptr<HINSTANCE__>(s.x[0]));
+  p.exit_thread(static_cast<uint32_t>(s.x[1]));
 }
 
 uint64_t SetUnhandledExceptionFilter_(GuestProcess&, CpuState& s) {
@@ -195,6 +208,9 @@ constexpr BuiltinExport kKernel32[] = {
     {"GetCommandLineW", GetCommandLineW_},
     {"ExitProcess", ExitProcess_},
     {"CreateThread", CreateThread_},
+    {"ExitThread", ExitThread_},
+    {"FreeLibrary", FreeLibrary_},
+    {"FreeLibraryAndExitThread", FreeLibraryAndExitThread_},
     {"SetUnhandledExceptionFilter", SetUnhandledExceptionFilter_},
     {"GetSystemInfo", GetSystemInfo_},
     {"GetNativeSystemInfo", GetNativeSystemInfo_},

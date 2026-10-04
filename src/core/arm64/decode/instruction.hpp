@@ -28,6 +28,7 @@ enum class Op : uint16_t {
   Br, Blr, Ret,
   Svc, Brk, Hlt, Udf,
   Nop, Clrex,
+  Barrier,         // DMB / DSB ordering all accesses (the x86-64 store->load fence)
   Mrs, Msr,
 
   // Data processing - register
@@ -165,6 +166,7 @@ struct Instruction {
   bool mem_signed = false;  // sign-extending load
   bool mem_to_64 = true;    // signed load destination is Xt (else Wt)
   bool vector = false;      // SIMD&FP register transfer
+  bool release = false;     // store-release (STLR, STLUR): ordered before later acquires
   AddrMode mode = AddrMode::Offset;
 
   // SIMD

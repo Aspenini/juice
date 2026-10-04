@@ -12,22 +12,30 @@ ThunkTable::ThunkTable(size_t capacity) : capacity_(capacity) {
   // dereferences a thunk address.
   base_ = VirtualAlloc(nullptr, capacity_ * kStride, MEM_RESERVE, PAGE_NOACCESS);
   if (!base_) throw std::bad_alloc();
+  thunks_.reserve(capacity_);
   Thunk sentinel;
   sentinel.kind = Thunk::Kind::ReturnSentinel;
   sentinel.name = "<return to host>";
-  thunks_.push_back(std::move(sentinel));
+  add(std::move(sentinel));
 }
 
 ThunkTable::~ThunkTable() { VirtualFree(base_, 0, MEM_RELEASE); }
 
 uint64_t ThunkTable::add(Thunk thunk) {
+  std::lock_guard lock(mutex_);
+  return add_locked(std::move(thunk));
+}
+
+uint64_t ThunkTable::add_locked(Thunk thunk) {
   if (thunks_.size() >= capacity_) throw std::runtime_error("thunk table full");
-  uint64_t addr = begin() + used_bytes();
+  const uint64_t addr = begin() + thunks_.size() * kStride;
   thunks_.push_back(std::move(thunk));
+  count_.store(thunks_.size(), std::memory_order_release);
   return addr;
 }
 
 uint64_t ThunkTable::add_native(void* fn, std::string dll, std::string name, const char* signature) {
+  std::lock_guard lock(mutex_);
   auto it = by_native_.find(fn);
   if (it != by_native_.end()) return it->second;
   Thunk t;
@@ -36,7 +44,7 @@ uint64_t ThunkTable::add_native(void* fn, std::string dll, std::string name, con
   t.name = std::move(name);
   t.native = fn;
   t.signature = signature;
-  uint64_t addr = add(std::move(t));
+  uint64_t addr = add_locked(std::move(t));
   by_native_[fn] = addr;
   return addr;
 }

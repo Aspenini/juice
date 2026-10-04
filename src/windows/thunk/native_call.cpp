@@ -13,10 +13,14 @@
 // floating point values in integer registers; x64 variadic callees read the
 // integer slots). Functions mixing both kinds get a signature (signatures.cpp).
 //
+// Signatures also cover 16-byte structures, which the two conventions treat
+// differently: ARM64 passes and returns them in two integer registers, x64
+// passes a pointer to a copy and returns them through a hidden pointer.
+//
 // The callee's result is returned in both RAX and XMM0, since the return type
 // is unknown; the guest sees them as X0 and D0.
 //
-// Not handled yet: structures returned by value in X8 (indirect result).
+// Not handled yet: structures larger than 16 bytes returned by value (X8).
 
 #include <windows.h>
 
@@ -83,22 +87,53 @@ NativeResult call_native(void* fn, const arm64::CpuState& s, const char* signatu
   if (!signature) {
     for (int k = 0; k < 16; ++k) ints[k] = k < 8 ? s.x[k] : stack[k - 8];
     for (int k = 0; k < 4; ++k) fps[k] = s.v[k].lo;
-  } else {
-    // Assign guest integer and FP arguments to x64 positions per the signature
-    // ('i' integer/pointer, 'f' floating point; positions past its end are integers).
-    unsigned next_int = 0, next_fp = 0, next_stack = 0;
+  }
+
+  // Copies of 16-byte structures passed by value, and a 16-byte returned structure.
+  uint64_t structs[8][2] = {};
+  uint64_t returned[2] = {};
+  bool struct_return = false;
+
+  if (signature) {
+    // Assign guest integer and FP arguments to x64 positions per the signature;
+    // positions past its end are integers.
+    unsigned next_int = 0, next_fp = 0, next_stack = 0, next_struct = 0, pos = 0;
     auto take_int = [&] { return next_int < 8 ? s.x[next_int++] : stack[next_stack++]; };
     auto take_fp = [&] { return next_fp < 8 ? s.v[next_fp++].lo : stack[next_stack++]; };
-    const size_t n = std::strlen(signature);
-    for (unsigned k = 0; k < 16; ++k) {
-      const bool fp = k < n && signature[k] == 'f';
-      const uint64_t v = fp ? take_fp() : take_int();
-      ints[k] = v;
-      if (k < 4) fps[k] = fp ? v : 0;
+    if (*signature == '>') {  // x64 returns 16-byte structures through a hidden first argument
+      struct_return = true;
+      ints[pos] = reinterpret_cast<uint64_t>(returned);
+      fps[pos++] = 0;
+      ++signature;
+    }
+    for (; pos < 16; ++pos) {
+      const char kind = *signature ? *signature++ : 'i';
+      uint64_t v;
+      if (kind == 'f') {
+        v = take_fp();
+      } else if (kind == 'S') {
+        // ARM64 passes it in two consecutive registers (or entirely on the
+        // stack once fewer than two remain); x64 passes a pointer to a copy.
+        if (next_int == 7) next_int = 8;
+        uint64_t* copy = structs[next_struct++ % 8];
+        copy[0] = take_int();
+        copy[1] = take_int();
+        v = reinterpret_cast<uint64_t>(copy);
+      } else {
+        v = take_int();
+      }
+      ints[pos] = v;
+      if (pos < 4) fps[pos] = kind == 'f' ? v : 0;
     }
   }
+
   NativeResult r{};
   r.rax = trampoline()(fn, ints, fps, &r.xmm0);
+  if (struct_return) {  // ARM64 returns it in X0:X1
+    r.rax = returned[0];
+    r.x1 = returned[1];
+    r.has_x1 = true;
+  }
   return r;
 }
 

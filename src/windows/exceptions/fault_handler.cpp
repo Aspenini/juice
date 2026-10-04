@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
 
 #include "runtime/engine.hpp"
 #include "runtime/memory/exec_memory.hpp"
@@ -86,6 +87,55 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
   return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// "module+0xoffset" for a host code address, for llvm-symbolizer.
+void print_location(const char* prefix, uint64_t address) {
+  HMODULE module = nullptr;
+  char path[MAX_PATH] = "?";
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(address), &module)) {
+    GetModuleFileNameA(module, path, MAX_PATH);
+    const char* name = std::strrchr(path, '\\');
+    std::fprintf(stderr, "%s%s+0x%llx\n", prefix, name ? name + 1 : path,
+                 static_cast<unsigned long long>(address - reinterpret_cast<uint64_t>(module)));
+  } else if (g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(address))) {
+    std::fprintf(stderr, "%stranslated code at 0x%llx\n", prefix, static_cast<unsigned long long>(address));
+  } else {
+    std::fprintf(stderr, "%s0x%llx\n", prefix, static_cast<unsigned long long>(address));
+  }
+}
+
+// A crash in JUICE itself (or in native code it called): report where, with
+// a host stack trace and the guest context of this thread.
+LONG WINAPI unhandled(EXCEPTION_POINTERS* info) {
+  const EXCEPTION_RECORD* rec = info->ExceptionRecord;
+  std::fflush(stdout);
+  std::fprintf(stderr, "[juice] internal error: exception 0x%08lx on thread %lu\n", rec->ExceptionCode,
+               GetCurrentThreadId());
+  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2)
+    std::fprintf(stderr, "[juice]   %s of address 0x%llx\n", access_kind(rec->ExceptionInformation[0]),
+                 static_cast<unsigned long long>(rec->ExceptionInformation[1]));
+
+  CONTEXT ctx = *info->ContextRecord;
+  for (int frame = 0; frame < 24 && ctx.Rip; ++frame) {
+    print_location("[juice]   at ", ctx.Rip);
+    if (g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(ctx.Rip))) break;
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+    if (!function) {  // leaf function
+      ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+      ctx.Rsp += 8;
+      continue;
+    }
+    void* handler_data = nullptr;
+    DWORD64 establisher = 0;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, function, &ctx, &handler_data, &establisher, nullptr);
+  }
+  if (const arm64::CpuState* s = runtime::Engine::current_state()) dump_guest(*s);
+  std::fflush(stderr);
+  TerminateProcess(GetCurrentProcess(), rec->ExceptionCode);
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
 }  // namespace
 
 void install_fault_handler(const FaultRegions& regions) {
@@ -93,6 +143,7 @@ void install_fault_handler(const FaultRegions& regions) {
   g_regions = regions;
   if (!installed) {
     AddVectoredExceptionHandler(1, handler);
+    SetUnhandledExceptionFilter(unhandled);
     installed = true;
   }
 }

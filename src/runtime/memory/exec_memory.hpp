@@ -1,6 +1,9 @@
 #pragma once
 
 // Executable memory arena for translated code.
+//
+// A large address range is reserved up front and committed as it fills, so
+// code never moves and is never discarded while threads may be running it.
 
 #include <cstddef>
 #include <cstdint>
@@ -10,16 +13,14 @@ namespace juice::runtime {
 
 class CodeArena {
  public:
-  explicit CodeArena(size_t capacity = 64 * 1024 * 1024);
+  explicit CodeArena(size_t capacity = size_t{1} << 30);
   ~CodeArena();
   CodeArena(const CodeArena&) = delete;
   CodeArena& operator=(const CodeArena&) = delete;
 
   // Copies `code` into the arena. Returns nullptr when the arena is full.
+  // Not synchronized: callers serialize additions.
   void* add(std::span<const uint8_t> code);
-
-  // Discards all code (callers must drop every pointer they hold).
-  void reset();
 
   bool contains(const void* p) const {
     auto a = reinterpret_cast<uintptr_t>(p);
@@ -31,8 +32,11 @@ class CodeArena {
   const uint8_t* base() const { return base_; }
 
  private:
+  bool commit(size_t end);
+
   uint8_t* base_ = nullptr;
   size_t capacity_ = 0;
+  size_t committed_ = 0;
   size_t used_ = 0;
 };
 

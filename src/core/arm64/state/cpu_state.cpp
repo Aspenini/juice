@@ -36,6 +36,10 @@ const char* slot_name(uint16_t s) {
     n[slot::TPIDRRO_EL0] = "tpidrro_el0";
     n[slot::Exit] = "exit";
     n[slot::BlockPc] = "block_pc";
+    n[slot::ExclValue] = "excl_value";
+    n[slot::ExclValueHi] = "excl_value_hi";
+    n[slot::ExclNew] = "excl_new";
+    n[slot::ExclNewHi] = "excl_new_hi";
     return n;
   }();
   return s < slot::Count ? names[s].c_str() : "?";

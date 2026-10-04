@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 
 #include "core/ir/ir.hpp"
 #include "core/jit/x64/emitter.hpp"
@@ -34,7 +35,7 @@ ir::StateLayout layout() {
 using State = std::array<uint64_t, kSlots>;
 
 runtime::CodeArena& arena() {
-  static runtime::CodeArena a(4 << 20);
+  static runtime::CodeArena a(256 << 20);
   return a;
 }
 
@@ -42,10 +43,7 @@ void run_jit(const ir::Block& block, State& state) {
   static std::vector<uint64_t> scratch(x64::kMaxBlockValues);
   std::vector<uint8_t> code = x64::Emitter(layout()).compile(block);
   void* fn = arena().add(code);
-  if (!fn) {
-    arena().reset();
-    fn = arena().add(code);
-  }
+  if (!fn) throw std::runtime_error("test code arena exhausted");
   reinterpret_cast<x64::BlockFn>(fn)(state.data(), scratch.data());
 }
 

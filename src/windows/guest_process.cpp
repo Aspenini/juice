@@ -25,6 +25,24 @@ constexpr uint32_t kStatusNotSupported = 0xC00000BB;
 constexpr size_t kTebPeb = 0x60;
 constexpr size_t kTebThreadLocalStoragePointer = 0x58;
 
+// Index of the guest image's implicit TLS block in each thread's
+// TEB->ThreadLocalStoragePointer array: past any index the host modules can
+// plausibly use.
+constexpr size_t kGuestTlsSlot = 64;
+
+// The guest context of the calling host thread.
+thread_local GuestThread* t_thread = nullptr;
+
+// The process whose threads release_thread() cleans up (one per juice process).
+GuestProcess* g_process = nullptr;
+
+struct ThreadStart {
+  GuestProcess* process;
+  uint64_t start;
+  uint64_t parameter;
+  uint64_t stack_size;
+};
+
 // Quote one argument so that CommandLineToArgvW reproduces it.
 std::wstring quote_argument(const std::wstring& arg) {
   if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) return arg;
@@ -68,12 +86,12 @@ uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
 
 }  // namespace
 
-GuestProcess::GuestProcess(ProcessOptions options) : options_(std::move(options)) {}
+GuestProcess::GuestProcess(ProcessOptions options) : options_(std::move(options)) { g_process = this; }
 
 GuestProcess::~GuestProcess() {
   engine_.reset();
   pe::unmap_image(image_);
-  if (stack_base_) VirtualFree(stack_base_, 0, MEM_RELEASE);
+  if (g_process == this) g_process = nullptr;
 }
 
 std::expected<void, std::string> GuestProcess::load(const std::filesystem::path& exe,
@@ -110,10 +128,9 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
   if (n > 1) WideCharToMultiByte(CP_ACP, 0, command_line_w_.c_str(), -1, command_line_a_.data(), n, nullptr, nullptr);
   publish_command_line();
 
-  setup_stack(file->stack_reserve);
-  state_.x[18] = reinterpret_cast<uint64_t>(teb());  // Windows ARM64: X18 always points to the TEB
+  default_stack_size_ = std::clamp<uint64_t>(file->stack_reserve, 1 << 20, 256 << 20);
+  thread_fls_slot_ = FlsAlloc(&GuestProcess::release_thread);
 
-  main_thread_id_ = GetCurrentThreadId();
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
   install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), image_.address(),
                          image_.address() + image_.size, this});
@@ -146,55 +163,149 @@ void GuestProcess::publish_command_line() {
   if (buffer == native_w) *length = static_cast<USHORT>(command_line_w_.size() * sizeof(wchar_t));
 }
 
-void GuestProcess::setup_stack(uint64_t reserve) {
-  stack_size_ = std::clamp<uint64_t>(reserve, 1 << 20, 256 << 20);
-  stack_size_ = (stack_size_ + 0xFFFF) & ~size_t{0xFFFF};
-  stack_base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, stack_size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  if (!stack_base_) throw std::bad_alloc();
+// --- threads ---------------------------------------------------------------------
+
+GuestThread* GuestProcess::allocate_thread(uint64_t stack_size) {
+  auto* t = new GuestThread;
+  t->stack_size = std::clamp<uint64_t>(stack_size ? stack_size : default_stack_size_, 64 << 10, 256 << 20);
+  t->stack_size = (t->stack_size + 0xFFFF) & ~size_t{0xFFFF};
+  t->stack_base = static_cast<uint8_t*>(VirtualAlloc(nullptr, t->stack_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  if (!t->stack_base) throw std::bad_alloc();
   DWORD old = 0;
-  VirtualProtect(stack_base_, 0x1000, PAGE_NOACCESS, &old);  // overflow guard
+  VirtualProtect(t->stack_base, 0x1000, PAGE_NOACCESS, &old);  // overflow guard
   // Leave room above the initial SP: host calls read up to 8 stack arguments.
-  state_.sp = (reinterpret_cast<uint64_t>(stack_base_) + stack_size_ - 0x100) & ~uint64_t{15};
+  t->state.sp = (reinterpret_cast<uint64_t>(t->stack_base) + t->stack_size - 0x100) & ~uint64_t{15};
+  t->state.x[18] = reinterpret_cast<uint64_t>(teb());  // Windows ARM64: X18 always points to the TEB
+  return t;
 }
 
-void GuestProcess::setup_tls() {
-  if (!image_.tls) return;
+GuestThread& GuestProcess::attach_thread(uint64_t stack_size) {
+  if (t_thread) return *t_thread;
+  reclaim_threads();
+  GuestThread* t = allocate_thread(stack_size);
+  DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host_thread, SYNCHRONIZE, FALSE, 0);
+  t_thread = t;
+  setup_tls_for_thread();
+  if (thread_fls_slot_ != FLS_OUT_OF_INDEXES) FlsSetValue(thread_fls_slot_, t);
+  threads_started_.fetch_add(1, std::memory_order_relaxed);
+  notify_thread(DLL_THREAD_ATTACH);
+  return *t;
+}
+
+// FLS destructor: runs on a guest thread's host thread as it exits. Other
+// thread-exit notifications (such as the guest C runtime's own FLS
+// destructors, which are guest code) may still run on this thread afterwards,
+// so the context stays attached and is only freed once the host thread has
+// terminated.
+void WINAPI GuestProcess::release_thread(void* p) {
+  if (!g_process || g_process->exiting_.load()) return;
+  auto* t = static_cast<GuestThread*>(p);
+  // Threads created natively (thread pool, the native UCRT's _beginthreadex)
+  // get their guest thread-detach notifications here.
+  if (t == t_thread && !t->main && !t->detached) g_process->notify_thread(DLL_THREAD_DETACH);
+  std::lock_guard lock(g_process->exited_mutex_);
+  g_process->exited_threads_.push_back(t);
+}
+
+void GuestProcess::reclaim_threads() {
+  std::lock_guard lock(exited_mutex_);
+  std::erase_if(exited_threads_, [](GuestThread* t) {
+    if (t->host_thread && WaitForSingleObject(t->host_thread, 0) != WAIT_OBJECT_0) return false;
+    if (t->host_thread) CloseHandle(t->host_thread);
+    VirtualFree(t->stack_base, 0, MEM_RELEASE);
+    if (t->tls_data) HeapFree(GetProcessHeap(), 0, t->tls_data);
+    delete t;
+    return true;
+  });
+}
+
+void GuestProcess::setup_tls_for_thread() {
+  if (!image_.tls || !t_thread) return;
   const pe::TlsInfo& tls = *image_.tls;
   const size_t template_size = tls.raw_end > tls.raw_start ? tls.raw_end - tls.raw_start : 0;
   const size_t total = template_size + tls.zero_fill;
 
   // Implicit TLS lives in TEB->ThreadLocalStoragePointer[_tls_index]. The
   // native loader does not know about the guest image, so give the guest a
-  // slot of its own past any index the host modules can plausibly use, in a
-  // copy of the current thread's array. (The array's length is private to
-  // ntdll, so the copy is bounded by the readable memory behind it.)
-  // Limitation: if a native DLL with implicit TLS is loaded later, ntdll
-  // rebuilds the array and the guest slot is lost.
-  constexpr size_t kGuestSlot = 64;
+  // slot of its own, past ntdll's entries, in a copy of this thread's vector.
+  //
+  // ntdll's TLS vector is a process-heap block whose first 16 bytes are a
+  // header (the entry count, then a link); ThreadLocalStoragePointer points
+  // just past it. At thread exit ntdll reads the count, frees that many
+  // entries and frees the block from the header, so the copy keeps that
+  // layout and header: ntdll goes on managing its own entries and never sees
+  // the guest's. Limitation: if a native DLL with implicit TLS is loaded
+  // later, ntdll rebuilds the vectors and the guest slot is lost.
   HANDLE heap = GetProcessHeap();
   auto** teb_array = reinterpret_cast<void***>(teb() + kTebThreadLocalStoragePointer);
+  uint64_t header[2] = {0, 0};
+  size_t count = 0;
+  if (void** old = *teb_array) {
+    std::memcpy(header, reinterpret_cast<const uint64_t*>(old) - 2, sizeof(header));
+    count = static_cast<uint32_t>(header[0]);
+  }
+  if (count >= kGuestTlsSlot) {
+    std::fprintf(stderr, "[juice] warning: %zu native TLS modules; guest thread-local data is unavailable\n", count);
+    return;
+  }
   auto* data = static_cast<uint8_t*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, std::max<size_t>(total, 16)));
-  auto** array = static_cast<void**>(HeapAlloc(heap, HEAP_ZERO_MEMORY, (kGuestSlot + 1) * sizeof(void*)));
-  if (!data || !array) throw std::bad_alloc();
+  auto* block = static_cast<uint64_t*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(header) + (kGuestTlsSlot + 1) * 8));
+  if (!data || !block) throw std::bad_alloc();
   if (template_size && image_.contains(tls.raw_start))
     std::memcpy(data, reinterpret_cast<const void*>(tls.raw_start), template_size);
-  if (void** old = *teb_array) {
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(old, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
-      uint64_t readable = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize - reinterpret_cast<uint64_t>(old);
-      std::memcpy(array, old, std::min<uint64_t>(readable, kGuestSlot * sizeof(void*)));
-    }
-  }
-  array[kGuestSlot] = data;
-  *teb_array = array;  // the old array stays allocated: ntdll still owns it
-  if (image_.contains(tls.index_address)) *reinterpret_cast<uint32_t*>(tls.index_address) = kGuestSlot;
+  std::memcpy(block, header, sizeof(header));
+  auto** array = reinterpret_cast<void**>(block + 2);
+  if (count) std::memcpy(array, *teb_array, count * sizeof(void*));
+  array[kGuestTlsSlot] = data;
+  *teb_array = array;  // the original vector stays allocated: ntdll may still reference it
+  t_thread->tls_data = data;
+  if (image_.contains(tls.index_address)) *reinterpret_cast<uint32_t*>(tls.index_address) = kGuestTlsSlot;
 }
 
+void GuestProcess::notify_thread(uint32_t reason) {
+  if (reason == DLL_THREAD_DETACH && t_thread) t_thread->detached = true;
+  if (!image_.tls) return;
+  for (uint64_t cb : image_.tls->callbacks) call_guest(cb, {image_.address(), reason, 0});
+}
+
+HANDLE GuestProcess::create_thread(SECURITY_ATTRIBUTES* attributes, uint64_t stack_size, uint64_t start,
+                                   uint64_t parameter, uint32_t flags, DWORD* thread_id) {
+  reclaim_threads();
+  auto* ts = new ThreadStart{this, start, parameter, stack_size};
+  // The host thread only runs the translator; the guest gets a stack of its own.
+  HANDLE h = CreateThread(attributes, 0, &GuestProcess::thread_main, ts, flags & ~STACK_SIZE_PARAM_IS_A_RESERVATION,
+                          thread_id);
+  if (!h) delete ts;
+  return h;
+}
+
+DWORD WINAPI GuestProcess::thread_main(void* p) {
+  const ThreadStart ts = *static_cast<ThreadStart*>(p);
+  delete static_cast<ThreadStart*>(p);
+  GuestProcess& process = *ts.process;
+  process.attach_thread(ts.stack_size);
+  if (process.options_.trace_calls)
+    std::fprintf(stderr, "[juice] thread %lu starts at 0x%llx\n", GetCurrentThreadId(),
+                 static_cast<unsigned long long>(ts.start));
+  const auto code = static_cast<DWORD>(process.call_guest(ts.start, {ts.parameter}));
+  process.notify_thread(DLL_THREAD_DETACH);
+  return code;  // the FLS destructor releases the guest context
+}
+
+void GuestProcess::exit_thread(uint32_t code) {
+  if (t_thread && !t_thread->main) notify_thread(DLL_THREAD_DETACH);
+  std::fflush(stdout);
+  ExitThread(code);
+}
+
+// --- running guest code ------------------------------------------------------------
+
 int GuestProcess::run() {
-  setup_tls();
-  if (image_.tls) {
-    for (uint64_t cb : image_.tls->callbacks) call_guest(cb, {image_.address(), DLL_PROCESS_ATTACH, 0});
-  }
+  GuestThread* main = allocate_thread(0);
+  main->main = true;
+  t_thread = main;
+  setup_tls_for_thread();
+  notify_thread(DLL_PROCESS_ATTACH);
   uint64_t peb = *reinterpret_cast<uint64_t*>(teb() + kTebPeb);
   uint64_t result = call_guest(image_.entry, {peb});
   exit(static_cast<uint32_t>(result));
@@ -210,33 +321,27 @@ uint64_t GuestProcess::call_guest(uint64_t fn, std::initializer_list<uint64_t> a
 }
 
 NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& args) {
+  arm64::CpuState& state = attach_thread().state;
   // The callee runs on the guest stack below the caller's frame. Restoring the
   // whole state afterwards gives the caller exactly what the ABI promises.
-  const arm64::CpuState saved = state_;
-  for (int i = 0; i < 8; ++i) state_.x[i] = args.gpr[i];
-  for (int i = 0; i < 4; ++i) state_.v[i] = {args.fpr[i], 0};
-  state_.x[30] = thunks_.return_sentinel();
-  state_.pc = fn;
-  engine_->run(state_, thunks_.return_sentinel());
-  const Result result{state_.x[0], state_.v[0].lo};
-  state_ = saved;
+  const arm64::CpuState saved = state;
+  for (int i = 0; i < 8; ++i) state.x[i] = args.gpr[i];
+  for (int i = 0; i < 4; ++i) state.v[i] = {args.fpr[i], 0};
+  state.x[30] = thunks_.return_sentinel();
+  state.pc = fn;
+  engine_->run(state, thunks_.return_sentinel());
+  const Result result{state.x[0], state.v[0].lo};
+  state = saved;
   return result;
 }
 
 bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& result) {
-  if (GetCurrentThreadId() != main_thread_id_) {
-    std::fprintf(stderr, "[juice] native code called guest function 0x%llx on another thread; "
-                         "guest threads are not supported yet\n",
-                 static_cast<unsigned long long>(target));
-    return false;
-  }
-
   if (target >= thunks_.begin() && target < thunks_.end()) {
     // A native function was handed the address of an API thunk.
     const Thunk* thunk = thunks_.find(target);
     if (!thunk || (thunk->kind != Thunk::Kind::Native && thunk->kind != Thunk::Kind::Builtin)) return false;
     static const uint64_t no_stack_args[8] = {};
-    arm64::CpuState tmp = state_;
+    arm64::CpuState tmp = t_thread ? t_thread->state : arm64::CpuState{};
     for (int i = 0; i < 8; ++i) tmp.x[i] = args.gpr[i];
     tmp.sp = reinterpret_cast<uint64_t>(no_stack_args);
     for (int i = 0; i < 4; ++i) tmp.v[i] = {args.fpr[i], 0};
@@ -250,10 +355,10 @@ bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& r
   }
 
   if (options_.trace_calls) {
-    std::fprintf(stderr, "[juice] callback 0x%llx(0x%llx, 0x%llx, 0x%llx, 0x%llx) from native code\n",
+    std::fprintf(stderr, "[juice] callback 0x%llx(0x%llx, 0x%llx, 0x%llx, 0x%llx) from native code on thread %lu\n",
                  static_cast<unsigned long long>(target), static_cast<unsigned long long>(args.gpr[0]),
                  static_cast<unsigned long long>(args.gpr[1]), static_cast<unsigned long long>(args.gpr[2]),
-                 static_cast<unsigned long long>(args.gpr[3]));
+                 static_cast<unsigned long long>(args.gpr[3]), GetCurrentThreadId());
   }
   result = call_guest(target, args);
   return true;
@@ -277,23 +382,12 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   const uint64_t pc = s.pc;
   Thunk* thunk = thunks_.find(pc);
   if (!thunk) fatal(std::format("guest jumped into the API thunk region at 0x{:x}", pc), kStatusAccessViolation);
-
-  // Copy what we need: the thunk table may grow (and move) during the call.
-  const Thunk::Kind kind = thunk->kind;
-  void* native = thunk->native;
-  const char* signature = thunk->signature;
-  BuiltinFn builtin = thunk->builtin;
-  ++thunk->calls;
+  std::atomic_ref<uint64_t>(thunk->calls).fetch_add(1, std::memory_order_relaxed);
   const uint64_t lr = s.x[30];
-  const size_t index = (pc - thunks_.begin()) / ThunkTable::kStride;
+  auto describe = [&] { return std::format("{}!{}", thunk->dll, thunk->name); };
 
-  auto describe = [&] {
-    const Thunk& t = thunks_.thunks()[index];
-    return std::format("{}!{}", t.dll, t.name);
-  };
-
-  if (kind == Thunk::Kind::ReturnSentinel) fatal("guest returned to the host unexpectedly", kStatusAccessViolation);
-  if (kind == Thunk::Kind::Missing) {
+  if (thunk->kind == Thunk::Kind::ReturnSentinel) fatal("guest returned to the host unexpectedly", kStatusAccessViolation);
+  if (thunk->kind == Thunk::Kind::Missing) {
     fatal(std::format("unimplemented API {} called from 0x{:x}", describe(), lr), kStatusEntryPointNotFound);
   }
 
@@ -305,12 +399,13 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   }
 
   uint64_t result;
-  if (kind == Thunk::Kind::Native) {
-    const NativeResult r = call_native(native, s, signature);
+  if (thunk->kind == Thunk::Kind::Native) {
+    const NativeResult r = call_native(thunk->native, s, thunk->signature);
     result = r.rax;
     s.v[0] = {r.xmm0, 0};  // the return type is unknown: provide both X0 and D0
+    if (r.has_x1) s.x[1] = r.x1;
   } else {
-    result = builtin(*this, s);
+    result = thunk->builtin(*this, s);
   }
   s.x[0] = result;
   s.pc = lr;
@@ -397,34 +492,40 @@ uint64_t GuestProcess::get_proc_address(uint64_t module, const char* name) {
                                        by_ordinal ? std::format("#{}", ordinal) : std::string(name));
 }
 
+// --- exit and diagnostics -------------------------------------------------------------
+
 void GuestProcess::exit(uint32_t code) {
   before_exit(code);
   ExitProcess(code);
 }
 
 void GuestProcess::before_exit(uint32_t code) {
-  if (exiting_) return;
-  exiting_ = true;
+  if (exiting_.exchange(true)) return;
   std::fflush(stdout);
   if (options_.stats && engine_) {
     engine_->print_stats(stderr);
-    std::vector<const Thunk*> called;
-    for (const Thunk& t : thunks_.thunks())
-      if (t.calls) called.push_back(&t);
-    std::sort(called.begin(), called.end(), [](const Thunk* a, const Thunk* b) { return a->calls > b->calls; });
-    for (const Thunk* t : called)
+    std::vector<std::pair<uint64_t, const Thunk*>> called;
+    for (const Thunk& t : thunks_.thunks()) {
+      const uint64_t calls = std::atomic_ref<uint64_t>(const_cast<uint64_t&>(t.calls)).load();
+      if (calls) called.emplace_back(calls, &t);
+    }
+    std::sort(called.begin(), called.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& [calls, t] : called)
       std::fprintf(stderr, "[juice]   api %s!%s: %llu calls\n", t->dll.c_str(), t->name.c_str(),
-                   static_cast<unsigned long long>(t->calls));
+                   static_cast<unsigned long long>(calls));
+    std::fprintf(stderr, "[juice] guest threads started: %u\n", threads_started_.load());
     std::fprintf(stderr, "[juice] exit code %u (0x%x)\n", code, code);
   }
   std::fflush(stderr);
 }
 
 void GuestProcess::dump_state(std::FILE* out) const {
-  const arm64::CpuState& s = state_;
-  std::fprintf(out, "[juice]   pc 0x%016llx  sp 0x%016llx  nzcv %c%c%c%c\n", static_cast<unsigned long long>(s.pc),
-               static_cast<unsigned long long>(s.sp), (s.nzcv >> 31) & 1 ? 'N' : '-', (s.nzcv >> 30) & 1 ? 'Z' : '-',
-               (s.nzcv >> 29) & 1 ? 'C' : '-', (s.nzcv >> 28) & 1 ? 'V' : '-');
+  if (!t_thread) return;
+  const arm64::CpuState& s = t_thread->state;
+  std::fprintf(out, "[juice]   thread %lu  pc 0x%016llx  sp 0x%016llx  nzcv %c%c%c%c\n", GetCurrentThreadId(),
+               static_cast<unsigned long long>(s.pc), static_cast<unsigned long long>(s.sp),
+               (s.nzcv >> 31) & 1 ? 'N' : '-', (s.nzcv >> 30) & 1 ? 'Z' : '-', (s.nzcv >> 29) & 1 ? 'C' : '-',
+               (s.nzcv >> 28) & 1 ? 'V' : '-');
   for (int i = 0; i < 31; i += 3) {
     std::string line = "[juice]  ";
     for (int k = i; k < std::min(i + 3, 31); ++k) line += std::format(" x{:<2} 0x{:016x}", k, s.x[k]);

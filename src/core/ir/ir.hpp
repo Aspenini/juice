@@ -49,6 +49,14 @@ enum class Opcode : uint8_t {
   FlagsLogic,      // packed NZCV for a logical result a (C = V = 0)
   CondHolds,       // aux = condition code, a = packed flags          -> 0 / 1
 
+  // --- Memory ordering and atomics (side effects; see atomics.cpp) -------------
+  StateAddr,       // imm = slot                                     -> host address of that state slot
+  Fence,           // full memory barrier
+  AtomicRmw,       // a = address, b = operand; size = 1/2/4/8; aux = AtomicOp -> old value (zero-extended)
+  AtomicCas,       // a = address, b = expected, c = desired; size    -> old value (zero-extended)
+  AtomicCasPair,   // a = address, b = pointer to {expected lo, hi, desired lo, hi}
+                   //   (128-bit compare-and-swap)                    -> 0 if swapped, 1 if not
+
   // --- Vector lane operations on 64-bit vector halves --------------------------
   // Low nibble of aux = element size in bytes (1, 2, 4, 8). size is always 8.
   VAdd, VSub, VMul,
@@ -79,6 +87,9 @@ enum class Opcode : uint8_t {
 };
 
 enum class Predicate : uint8_t { Eq, Ne, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge };
+
+// Read-modify-write operation for AtomicRmw.
+enum class AtomicOp : uint8_t { Add, Clr, Eor, Set, SMax, SMin, UMax, UMin, Swap };
 
 // Lane comparison for VCmp.
 enum class VecPred : uint8_t { Eq, Gt, Ge, Hi, Hs, Tst };  // Gt/Ge signed, Hi/Hs unsigned
@@ -191,6 +202,7 @@ class Builder {
 // --- Semantics shared by the optimizer, interpreter and tests ----------------
 
 bool is_pure(Opcode op);           // no side effects, result depends only on args
+bool has_side_effects(Opcode op);  // must be kept even if its result is unused
 bool is_vector_or_fp(Opcode op);   // the SIMD/FP opcodes above
 bool has_result(Opcode op);
 unsigned arg_count(Opcode op);
@@ -205,6 +217,9 @@ bool condition_holds(uint8_t cond, uint64_t flags);
 uint16_t condition_mask(uint8_t cond);
 
 uint64_t flags_add(uint64_t a, uint64_t b, uint64_t carry_in, unsigned size);
+
+// Execute an atomic opcode (AtomicRmw, AtomicCas, AtomicCasPair) on host memory.
+uint64_t execute_atomic(const Inst& inst, uint64_t a, uint64_t b, uint64_t c);
 
 // --- Debugging -----------------------------------------------------------------
 

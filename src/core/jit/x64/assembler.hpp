@@ -78,6 +78,9 @@ class Assembler {
   void setcc(Cond cc, Reg r8);
   void cmov(Cond cc, Reg dst, Reg src, bool w = true);
 
+  void lea(Reg dst, Mem src);
+  void mfence();
+
   // SSE2 scalar double moves; `xmm` is the XMM register number (0-15).
   void movsd_load(unsigned xmm, Mem src);   // movsd xmm, [m]
   void movsd_store(Mem dst, unsigned xmm);  // movsd [m], xmm

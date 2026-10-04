@@ -72,8 +72,29 @@ void Builder::exit(uint32_t reason, uint32_t info, uint64_t pc) {
 
 // --- Opcode properties --------------------------------------------------------------
 
+bool has_side_effects(Opcode op) {
+  switch (op) {
+    case Opcode::SetReg:
+    case Opcode::Store:
+    case Opcode::LoadToState:
+    case Opcode::StoreFromState:
+    case Opcode::Fence:
+    case Opcode::AtomicRmw:
+    case Opcode::AtomicCas:
+    case Opcode::AtomicCasPair:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool is_pure(Opcode op) {
   switch (op) {
+    case Opcode::StateAddr:
+    case Opcode::Fence:
+    case Opcode::AtomicRmw:
+    case Opcode::AtomicCas:
+    case Opcode::AtomicCasPair:
     case Opcode::Nop:
     case Opcode::GetReg:
     case Opcode::SetReg:
@@ -90,6 +111,7 @@ bool is_pure(Opcode op) {
 
 bool has_result(Opcode op) {
   switch (op) {
+    case Opcode::Fence:
     case Opcode::Nop:
     case Opcode::SetReg:
     case Opcode::Store:
@@ -112,6 +134,8 @@ unsigned arg_count(Opcode op) {
     case Opcode::Nop:
     case Opcode::Const:
     case Opcode::GetReg:
+    case Opcode::StateAddr:
+    case Opcode::Fence:
     case Opcode::Count_:
       return 0;
     case Opcode::SetReg:
@@ -138,6 +162,7 @@ unsigned arg_count(Opcode op) {
     case Opcode::FRint:
       return 1;
     case Opcode::FMadd:
+    case Opcode::AtomicCas:
     case Opcode::Select:
     case Opcode::Adc:
     case Opcode::Sbc:
@@ -189,6 +214,11 @@ const char* opcode_name(Opcode op) {
     case Opcode::FlagsSbc: return "flags.sbc";
     case Opcode::FlagsLogic: return "flags.logic";
     case Opcode::CondHolds: return "cond";
+    case Opcode::StateAddr: return "state_addr";
+    case Opcode::Fence: return "fence";
+    case Opcode::AtomicRmw: return "atomic.rmw";
+    case Opcode::AtomicCas: return "atomic.cas";
+    case Opcode::AtomicCasPair: return "atomic.cas_pair";
     case Opcode::VAdd: return "v.add";
     case Opcode::VSub: return "v.sub";
     case Opcode::VMul: return "v.mul";
@@ -403,6 +433,7 @@ std::string to_string(const Block& block, const SlotNamer& namer) {
         line += std::format(" 0x{:x}", in.imm);
         break;
       case Opcode::GetReg:
+      case Opcode::StateAddr:
         line += " " + slot(in.imm);
         break;
       case Opcode::SetReg:

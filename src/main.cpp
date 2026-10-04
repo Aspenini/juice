@@ -99,7 +99,7 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg == L"--dump-ir") options.engine.dump_ir = true;
     else if (arg == L"--trace-calls") options.trace_calls = true;
     else if (arg == L"--trace-imports") options.trace_imports = true;
-    else if (arg == L"--stats") options.stats = true;
+    else if (arg == L"--stats") options.stats = options.engine.profile = true;
     else if (arg == L"--interp") options.engine.interpret = true;
     else if (arg == L"--no-opt") options.engine.optimize = false;
     else if (arg == L"--scan") scan_only = true;

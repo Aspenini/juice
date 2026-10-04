@@ -38,6 +38,7 @@ const char* mnemonic(Op op) {
     case Op::Udf: return "udf";
     case Op::Nop: return "nop";
     case Op::Clrex: return "clrex";
+    case Op::Barrier: return "dmb";
     case Op::Mrs: return "mrs";
     case Op::Msr: return "msr";
     case Op::AndReg: return "and";
@@ -282,6 +283,7 @@ std::string disassemble(const Instruction& i) {
       return std::format("{} {}", m, hex(i.imm));
     case Op::Nop:
     case Op::Clrex:
+    case Op::Barrier:
       return m;
     case Op::Mrs:
       return std::format("mrs {}, s{}_{}_c{}_c{}_{}", gpr(i.rd, true), i.sysreg >> 14, (i.sysreg >> 11) & 7,
@@ -328,6 +330,7 @@ std::string disassemble(const Instruction& i) {
         else if (i.mem_size == 2) suffix = i.mem_signed ? "sh" : "h";
         else if (i.mem_size == 4 && i.mem_signed) suffix = "sw";
       }
+      if (i.release) m = "stlr";
       return std::format("{}{} {}, {}", m, suffix, data_reg(i, i.rd), mem_operand(i));
     }
     case Op::Ldp:

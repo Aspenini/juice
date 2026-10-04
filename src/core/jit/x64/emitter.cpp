@@ -34,6 +34,14 @@ uint64_t evaluate_helper(uint64_t a, uint64_t b, uint64_t c, uint64_t packed) {
   return ir::evaluate(in, a, b, c);
 }
 
+uint64_t atomic_helper(uint64_t a, uint64_t b, uint64_t c, uint64_t packed) {
+  ir::Inst in;
+  in.op = static_cast<Opcode>(packed & 0xFF);
+  in.size = static_cast<uint8_t>(packed >> 8);
+  in.aux = static_cast<uint8_t>(packed >> 16);
+  return ir::execute_atomic(in, a, b, c);
+}
+
 constexpr Reg kState = RBX;    // guest state base
 constexpr Reg kScratch = RBP;  // IR value slots
 
@@ -174,11 +182,11 @@ class Compiler {
     put(v, RAX);
   }
 
-  void call_helper(ValueId v, const Inst& in) {
+  void call_helper(ValueId v, const Inst& in, uint64_t (*helper)(uint64_t, uint64_t, uint64_t, uint64_t)) {
     for (unsigned k = 0; k < 3; ++k)
       if (in.args[k] != ir::kNoValue) get(kCallArgs[k], in.args[k]);
     a_.mov_imm(kCallArgs[3], static_cast<uint64_t>(in.op) | (uint64_t{in.size} << 8) | (uint64_t{in.aux} << 16));
-    a_.mov_imm(RAX, reinterpret_cast<uint64_t>(&evaluate_helper));
+    a_.mov_imm(RAX, reinterpret_cast<uint64_t>(helper));
     a_.call(RAX);
     put(v, RAX);
   }
@@ -186,7 +194,7 @@ class Compiler {
   void emit(ValueId v, const Inst& in) {
     const bool w = in.size == 8;
     if (ir::is_vector_or_fp(in.op)) {
-      call_helper(v, in);
+      call_helper(v, in, &evaluate_helper);
       return;
     }
     switch (in.op) {
@@ -197,6 +205,18 @@ class Compiler {
       case Opcode::GetReg:
         a_.load(RAX, slot_mem(in.imm));
         put(v, RAX);
+        return;
+      case Opcode::StateAddr:
+        a_.lea(RAX, slot_mem(in.imm));
+        put(v, RAX);
+        return;
+      case Opcode::Fence:
+        a_.mfence();
+        return;
+      case Opcode::AtomicRmw:
+      case Opcode::AtomicCas:
+      case Opcode::AtomicCasPair:
+        call_helper(v, in, &atomic_helper);
         return;
       case Opcode::SetReg:
         if (imm32_ok(in.args[0], 8)) {

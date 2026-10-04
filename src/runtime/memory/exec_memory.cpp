@@ -11,11 +11,15 @@
 
 namespace juice::runtime {
 
+namespace {
+constexpr size_t kCommitChunk = size_t{1} << 20;
+}
+
 CodeArena::CodeArena(size_t capacity) : capacity_(capacity) {
 #if defined(_WIN32)
-  base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, capacity, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+  base_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, capacity, MEM_RESERVE, PAGE_NOACCESS));
 #else
-  void* p = mmap(nullptr, capacity, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void* p = mmap(nullptr, capacity, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   base_ = p == MAP_FAILED ? nullptr : static_cast<uint8_t*>(p);
 #endif
   if (!base_) throw std::bad_alloc();
@@ -29,9 +33,23 @@ CodeArena::~CodeArena() {
 #endif
 }
 
+bool CodeArena::commit(size_t end) {
+  if (end <= committed_) return true;
+  if (end > capacity_) return false;
+  size_t target = (end + kCommitChunk - 1) & ~(kCommitChunk - 1);
+  if (target > capacity_) target = capacity_;
+#if defined(_WIN32)
+  if (!VirtualAlloc(base_ + committed_, target - committed_, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) return false;
+#else
+  if (mprotect(base_ + committed_, target - committed_, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+#endif
+  committed_ = target;
+  return true;
+}
+
 void* CodeArena::add(std::span<const uint8_t> code) {
   size_t start = (used_ + 15) & ~size_t{15};
-  if (start + code.size() > capacity_) return nullptr;
+  if (!commit(start + code.size())) return nullptr;
   std::memcpy(base_ + start, code.data(), code.size());
   used_ = start + code.size();
 #if defined(_WIN32)
@@ -39,7 +57,5 @@ void* CodeArena::add(std::span<const uint8_t> code) {
 #endif
   return base_ + start;
 }
-
-void CodeArena::reset() { used_ = 0; }
 
 }  // namespace juice::runtime

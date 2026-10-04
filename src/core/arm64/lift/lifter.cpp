@@ -48,6 +48,7 @@ class Lifter {
   void lift_load_store(const Instruction& i);
   void lift_pair(const Instruction& i);
   void lift_atomic(const Instruction& i);
+  void lift_exclusive(const Instruction& i);
   bool lift_mrs(const Instruction& i);
   bool lift_msr(const Instruction& i);
   void lift_simd(const Instruction& i);
@@ -170,8 +171,16 @@ void Lifter::lift_load_store(const Instruction& i) {
       set_x(i.rd, v);
     }
   } else {
-    if (i.vector) b_.store_from_state(addr, slot::VLo(i.rd), i.mem_size);
-    else b_.store(addr, x(i.rd), i.mem_size);
+    if (i.vector) {
+      b_.store_from_state(addr, slot::VLo(i.rd), i.mem_size);
+    } else if (i.release) {
+      // A plain x86 store may pass a later load; STLR must not pass a later
+      // LDAR, so make it a sequentially consistent (locked) store.
+      b_.emit(Opcode::AtomicRmw, i.mem_size, addr, x(i.rd), ir::kNoValue, 0,
+              static_cast<uint8_t>(ir::AtomicOp::Swap));
+    } else {
+      b_.store(addr, x(i.rd), i.mem_size);
+    }
   }
   if (wb != ir::kNoValue) set_xsp(i.rn, wb);
 }
@@ -204,52 +213,83 @@ void Lifter::lift_pair(const Instruction& i) {
   if (wb != ir::kNoValue) set_xsp(i.rn, wb);
 }
 
-// Atomic read-modify-write instructions. JUICE currently runs guest threads
-// one at a time per CPU state, so these are lifted as plain load/op/store.
+// LSE atomics (CAS, SWP, LDADD, ...): one atomic host operation each.
 void Lifter::lift_atomic(const Instruction& i) {
   const uint8_t sz = i.mem_size;
-  const unsigned bits = sz * 8u;
-  V addr = xsp(i.rn);
-  V old = b_.load(addr, sz, false);
-  V operand = x(i.rm);
-  V operand_u = sz < 8 ? b_.zext(operand, static_cast<uint8_t>(bits)) : operand;
-  V result;
-
+  const V addr = xsp(i.rn);
+  const V operand = x(i.rm);
+  if (i.op == Op::Cas) {
+    V expected = sz < 8 ? b_.zext(operand, static_cast<uint8_t>(sz * 8)) : operand;
+    set_x(i.rm, b_.emit(Opcode::AtomicCas, sz, addr, expected, x(i.rd)));
+    return;
+  }
+  ir::AtomicOp kind;
   switch (i.op) {
-    case Op::Cas: {
-      V eq = b_.cmp(Predicate::Eq, old, operand_u);
-      result = b_.select(eq, x(i.rd), old);
-      b_.store(addr, result, sz);
-      set_x(i.rm, old);
-      return;
-    }
-    case Op::Swp:
-      b_.store(addr, operand, sz);
-      set_x(i.rd, old);
-      return;
-    case Op::Ldadd: result = b_.add(old, operand); break;
-    case Op::Ldclr: result = b_.and_(old, b_.not_(operand)); break;
-    case Op::Ldeor: result = b_.xor_(old, operand); break;
-    case Op::Ldset: result = b_.or_(old, operand); break;
-    case Op::Ldsmax:
-    case Op::Ldsmin: {
-      V so = sz < 8 ? b_.sext(old, static_cast<uint8_t>(bits)) : old;
-      V sv = sz < 8 ? b_.sext(operand, static_cast<uint8_t>(bits)) : operand;
-      V keep_old = b_.cmp(i.op == Op::Ldsmax ? Predicate::Sgt : Predicate::Slt, so, sv);
-      result = b_.select(keep_old, old, operand);
+    case Op::Swp: kind = ir::AtomicOp::Swap; break;
+    case Op::Ldadd: kind = ir::AtomicOp::Add; break;
+    case Op::Ldclr: kind = ir::AtomicOp::Clr; break;
+    case Op::Ldeor: kind = ir::AtomicOp::Eor; break;
+    case Op::Ldset: kind = ir::AtomicOp::Set; break;
+    case Op::Ldsmax: kind = ir::AtomicOp::SMax; break;
+    case Op::Ldsmin: kind = ir::AtomicOp::SMin; break;
+    case Op::Ldumax: kind = ir::AtomicOp::UMax; break;
+    default: kind = ir::AtomicOp::UMin; break;
+  }
+  set_x(i.rd, b_.emit(Opcode::AtomicRmw, sz, addr, operand, ir::kNoValue, 0, static_cast<uint8_t>(kind)));
+}
+
+// Exclusives. The monitor is emulated by value: LDXR/LDXP record what they
+// loaded, and STXR/STXP store with an atomic compare-and-swap against that
+// value, failing (status 1) if memory changed in between. Like other
+// translators this accepts an A-B-A change as unchanged.
+void Lifter::lift_exclusive(const Instruction& i) {
+  const uint8_t sz = i.mem_size;
+  const V addr = xsp(i.rn);
+  switch (i.op) {
+    case Op::Ldxr: {
+      V v = b_.load(addr, sz, false);
+      b_.set(slot::ExclValue, v);
+      set_x(i.rd, v);
       break;
     }
-    case Op::Ldumax:
-    case Op::Ldumin: {
-      V keep_old = b_.cmp(i.op == Op::Ldumax ? Predicate::Ugt : Predicate::Ult, old, operand_u);
-      result = b_.select(keep_old, old, operand);
+    case Op::Stxr: {
+      V expected = b_.get(slot::ExclValue);
+      V old = b_.emit(Opcode::AtomicCas, sz, addr, expected, x(i.rd));
+      set_x(i.rm, b_.cmp(Predicate::Ne, old, expected));
+      break;
+    }
+    case Op::Ldxp: {
+      V v1 = b_.load(addr, sz, false);
+      V v2 = b_.load(b_.add(addr, c(sz)), sz, false);
+      if (sz == 4) {
+        b_.set(slot::ExclValue, b_.or_(v1, b_.shl(v2, c(32))));
+      } else {
+        b_.set(slot::ExclValue, v1);
+        b_.set(slot::ExclValueHi, v2);
+      }
+      set_x(i.rd, v1);
+      set_x(i.ra, v2);
+      break;
+    }
+    case Op::Stxp: {
+      V status;
+      if (sz == 4) {  // 2 x 32 bits: one 64-bit compare-and-swap
+        V desired = b_.or_(b_.zext(x(i.rd), 32), b_.shl(x(i.ra), c(32)));
+        V expected = b_.get(slot::ExclValue);
+        V old = b_.emit(Opcode::AtomicCas, 8, addr, expected, desired);
+        status = b_.cmp(Predicate::Ne, old, expected);
+      } else {  // 2 x 64 bits: 128-bit compare-and-swap on {excl_value, excl_value_hi, excl_new, excl_new_hi}
+        b_.set(slot::ExclNew, x(i.rd));
+        b_.set(slot::ExclNewHi, x(i.ra));
+        V operands = b_.emit(Opcode::StateAddr, 8, ir::kNoValue, ir::kNoValue, ir::kNoValue, slot::ExclValue);
+        status = b_.emit(Opcode::AtomicCasPair, 8, addr, operands);
+      }
+      set_x(i.rm, status);
       break;
     }
     default:
-      return;
+      break;
   }
-  b_.store(addr, result, sz);
-  set_x(i.rd, old);
 }
 
 bool Lifter::lift_mrs(const Instruction& i) {
@@ -843,6 +883,9 @@ bool Lifter::lift(const Instruction& i) {
     case Op::Clrex:
     case Op::Prfm:
       return false;
+    case Op::Barrier:
+      b_.emit(Opcode::Fence, 8);
+      return false;
     case Op::Mrs:
       return lift_mrs(i);
     case Op::Msr:
@@ -984,31 +1027,12 @@ bool Lifter::lift(const Instruction& i) {
     case Op::Stp:
       lift_pair(i);
       return false;
-    case Op::Ldxr: {
-      set_x(i.rd, b_.load(xsp(i.rn), i.mem_size, false));
+    case Op::Ldxr:
+    case Op::Stxr:
+    case Op::Ldxp:
+    case Op::Stxp:
+      lift_exclusive(i);
       return false;
-    }
-    case Op::Stxr: {
-      // Single-threaded exclusive monitor: the store always succeeds.
-      b_.store(xsp(i.rn), x(i.rd), i.mem_size);
-      set_x(i.rm, c(0));
-      return false;
-    }
-    case Op::Ldxp: {
-      V addr = xsp(i.rn);
-      V v1 = b_.load(addr, i.mem_size, false);
-      V v2 = b_.load(b_.add(addr, c(i.mem_size)), i.mem_size, false);
-      set_x(i.rd, v1);
-      set_x(i.ra, v2);
-      return false;
-    }
-    case Op::Stxp: {
-      V addr = xsp(i.rn);
-      b_.store(addr, x(i.rd), i.mem_size);
-      b_.store(b_.add(addr, c(i.mem_size)), x(i.ra), i.mem_size);
-      set_x(i.rm, c(0));
-      return false;
-    }
     case Op::Cas: case Op::Swp: case Op::Ldadd: case Op::Ldclr: case Op::Ldeor: case Op::Ldset:
     case Op::Ldsmax: case Op::Ldsmin: case Op::Ldumax: case Op::Ldumin:
       lift_atomic(i);

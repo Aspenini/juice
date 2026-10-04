@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -60,6 +61,17 @@ void interpret(const Block& block, uint64_t* state, const StateLayout& layout) {
       }
       case Opcode::StoreFromState:
         std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(arg(in, 0))), state + in.imm, in.size);
+        break;
+      case Opcode::StateAddr:
+        values[i] = reinterpret_cast<uint64_t>(state + in.imm);
+        break;
+      case Opcode::Fence:
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        break;
+      case Opcode::AtomicRmw:
+      case Opcode::AtomicCas:
+      case Opcode::AtomicCasPair:
+        values[i] = execute_atomic(in, arg(in, 0), arg(in, 1), arg(in, 2));
         break;
       default:
         values[i] = evaluate(in, arg(in, 0), arg(in, 1), arg(in, 2));

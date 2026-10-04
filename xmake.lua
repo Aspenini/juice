@@ -34,6 +34,9 @@ add_cxxflags("/W4", "/permissive-", "/utf-8", "/EHsc", {tools = {"cl", "clang_cl
 -- clang-cl: these warnings are noise for low-level bit-twiddling code.
 add_cxxflags("-Wno-sign-compare", "-Wno-missing-field-initializers", {tools = "clang_cl"})
 add_cxxflags("-Wall", "-Wextra", {tools = {"gcc", "clang"}})
+-- CMPXCHG16B for 128-bit guest atomics (present on every x86-64 CPU that runs 64-bit Windows 8.1+).
+add_cxxflags("/clang:-mcx16", {tools = "clang_cl"})
+add_cxxflags("-mcx16", {tools = {"gcc", "clang"}})
 
 -- ---------------------------------------------------------------------------
 -- juice-core: portable ARM64 front end + IR (no OS dependencies)
