@@ -79,18 +79,34 @@ void usage() {
       "  --no-opt         disable IR optimizations\n"
       "  --block-size=N   maximum guest instructions per translated block (default 64)\n"
       "  --scan           don't run; list instructions in the program JUICE cannot translate\n"
+      "  --dll-path=DIR   also look for the program's ARM64 DLLs in DIR (repeatable; see also\n"
+      "                   JUICE_DLL_PATH)\n"
+      "  --no-vs-runtime  don't use Visual Studio's ARM64 C++ runtime DLLs\n"
       "  --no-host        don't start a host process for the program's manifest settings\n"
       "                   (code page, long paths, heap type, supported OS versions)\n"
       "  --help           show this help\n",
       stdout);
 }
 
+// TLS callback of juice.exe: the native loader calls it with
+// DLL_PROCESS_DETACH when the process exits, also when native code (such as the
+// x64 C runtime of a program built with /MD) calls ExitProcess directly.
+void NTAPI on_tls_event(void*, DWORD reason, void*) {
+  if (reason == DLL_PROCESS_DETACH) juice::win::notify_native_process_exit();
+}
+
 }  // namespace
+
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:juice_tls_callback")
+#pragma section(".CRT$XLB", read)
+extern "C" __declspec(allocate(".CRT$XLB")) const PIMAGE_TLS_CALLBACK juice_tls_callback = on_tls_event;
 
 int wmain(int argc, wchar_t** argv) {
   juice::win::ProcessOptions options;
   bool scan_only = false;
   bool use_host = true;
+  bool vs_runtime = true;
   int i = 1;
   for (; i < argc; ++i) {
     std::wstring arg = argv[i];
@@ -108,6 +124,8 @@ int wmain(int argc, wchar_t** argv) {
     else if (arg == L"--no-opt") options.engine.optimize = false;
     else if (arg == L"--scan") scan_only = true;
     else if (arg == L"--no-host" || arg == L"--in-host") use_host = false;  // --in-host: started by run_in_host()
+    else if (arg.starts_with(L"--dll-path=")) options.dll_paths.push_back(arg.substr(11));
+    else if (arg == L"--no-vs-runtime") vs_runtime = false;
     else if (arg.starts_with(L"--block-size=")) {
       long n = std::wcstol(arg.c_str() + 13, nullptr, 10);
       if (n < 1 || n > 4096) {
@@ -141,6 +159,21 @@ int wmain(int argc, wchar_t** argv) {
                    "are not applied\n",
                    code.error().c_str());
     }
+  }
+
+  // ARM64 DLLs: the program's directory (always searched first), --dll-path,
+  // JUICE_DLL_PATH, then Visual Studio's ARM64 C++ runtime if installed.
+  if (const wchar_t* env = _wgetenv(L"JUICE_DLL_PATH")) {
+    std::wstring list = env;
+    for (size_t pos = 0; pos <= list.size();) {
+      size_t end = list.find(L';', pos);
+      if (end == std::wstring::npos) end = list.size();
+      if (end > pos) options.dll_paths.push_back(list.substr(pos, end - pos));
+      pos = end + 1;
+    }
+  }
+  if (vs_runtime) {
+    if (auto runtime = juice::win::find_visual_studio_arm64_runtime()) options.dll_paths.push_back(*runtime);
   }
 
   std::vector<std::wstring> guest_args(argv + i + 1, argv + argc);

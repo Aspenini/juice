@@ -95,8 +95,8 @@ uint64_t RtlVirtualUnwind_(GuestProcess&, CpuState& s) {
 
 uint64_t RtlPcToFileHeader_(GuestProcess& p, CpuState& s) {
   uint64_t base = 0;
-  if (p.image().contains(s.x[0])) {
-    base = p.image().address();
+  if (const GuestModule* m = p.module_at(s.x[0])) {
+    base = m->base();
   } else {
     PVOID native = nullptr;
     RtlPcToFileHeader(ptr<void>(s.x[0]), &native);

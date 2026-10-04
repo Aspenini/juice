@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <optional>
 #include <string>
 
 #include "windows/pe/pe_loader.hpp"
@@ -12,6 +14,7 @@
 namespace juice::win {
 
 struct ImportStats {
+  size_t guest = 0;
   size_t builtin = 0;
   size_t native = 0;
   size_t data = 0;
@@ -27,8 +30,22 @@ bool is_native_code(const void* addr);
 // since it shares the host address space).
 uint64_t guest_value_for_native_export(void* addr, ThunkTable& thunks, std::string dll, std::string name);
 
+// Resolve one import to a builtin, a native export or a "missing" thunk.
+// `how` receives a description for logs; `stats` (optional) is updated.
+uint64_t resolve_native_import(const pe::Import& import, ThunkTable& thunks, const char** how = nullptr,
+                               ImportStats* stats = nullptr);
+
+// A thunk that reports a call to an unresolved import.
+uint64_t missing_import(ThunkTable& thunks, const std::string& dll, const std::string& name);
+
+// Binds an import to an export of a guest (ARM64) DLL. Returns nullopt if
+// the DLL is not a guest module, so that the import binds to a builtin or the
+// native DLL instead.
+using GuestImportBinder = std::function<std::optional<uint64_t>(const pe::Import& import)>;
+
 // Resolve every import of `image` and fill its IAT. `log` (optional) receives
 // a line per import.
-ImportStats resolve_imports(const pe::LoadedImage& image, ThunkTable& thunks, std::FILE* log);
+ImportStats resolve_imports(const pe::LoadedImage& image, ThunkTable& thunks, std::FILE* log,
+                            const GuestImportBinder& guest = {});
 
 }  // namespace juice::win

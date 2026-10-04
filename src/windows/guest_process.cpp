@@ -23,13 +23,9 @@ constexpr uint32_t kStatusStackBufferOverrun = 0xC0000409;
 constexpr uint32_t kStatusEntryPointNotFound = 0xC0000139;
 constexpr uint32_t kStatusNotSupported = 0xC00000BB;
 
-constexpr size_t kTebPeb = 0x60;
-constexpr size_t kTebThreadLocalStoragePointer = 0x58;
+constexpr uint32_t kStatusDllInitFailed = 0xC0000142;
 
-// Index of the guest image's implicit TLS block in each thread's
-// TEB->ThreadLocalStoragePointer array: past any index the host modules can
-// plausibly use.
-constexpr size_t kGuestTlsSlot = 64;
+constexpr size_t kTebPeb = 0x60;
 
 // The guest context of the calling host thread.
 thread_local GuestThread* t_thread = nullptr;
@@ -87,11 +83,13 @@ uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
 
 }  // namespace
 
+GuestThread* GuestProcess::t_current() { return t_thread; }
+
 GuestProcess::GuestProcess(ProcessOptions options) : options_(std::move(options)) { g_process = this; }
 
 GuestProcess::~GuestProcess() {
   engine_.reset();
-  pe::unmap_image(image_);
+  for (auto& m : module_storage_) pe::unmap_image(m->image);
   if (manifest_.context != INVALID_HANDLE_VALUE && !manifest_.process_default) {
     DeactivateActCtx(0, manifest_.cookie);
     ReleaseActCtx(manifest_.context);
@@ -115,18 +113,23 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
 
   auto image = pe::map_image(*file);
   if (!image) return std::unexpected(image.error());
-  image_ = std::move(*image);
-  if (!image_.entry) return std::unexpected("image has no entry point");
+  if (!image->entry) return std::unexpected("image has no entry point");
+  auto program = std::make_unique<GuestModule>();
+  program->image = std::move(*image);
+  program->path = exe_path_;
+  program->name = lower(std::filesystem::path(exe_path_).filename().wstring());
+  program->is_exe = true;
+  GuestModule& exe_module = *register_module(std::move(program));
 
   // Before binding imports: the manifest can redirect them (common controls v6).
-  auto manifest = apply_manifest(exe_path_, image_.address(), options_.trace_imports ? stderr : nullptr);
+  auto manifest = apply_manifest(exe_path_, exe_module.base(), options_.trace_imports ? stderr : nullptr);
   if (!manifest) return std::unexpected(manifest.error());
   manifest_ = *manifest;
 
-  ImportStats imports = resolve_imports(image_, thunks_, options_.trace_imports ? stderr : nullptr);
-  if (options_.trace_imports) {
-    std::fprintf(stderr, "[juice] imports: %zu builtin, %zu native, %zu data, %zu missing\n", imports.builtin,
-                 imports.native, imports.data, imports.missing);
+  {
+    std::lock_guard lock(loader_mutex_);
+    bind_module_imports(exe_module);
+    if (exe_module.image.tls) assign_tls_slot(exe_module);
   }
 
   // argv[0] is the program as the user named it (like a native launch), which
@@ -142,8 +145,7 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
   thread_fls_slot_ = FlsAlloc(&GuestProcess::release_thread);
 
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
-  install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), image_.address(),
-                         image_.address() + image_.size, this});
+  install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), this});
   return {};
 }
 
@@ -185,6 +187,7 @@ GuestThread* GuestProcess::allocate_thread(uint64_t stack_size) {
   VirtualProtect(t->stack_base, 0x1000, PAGE_NOACCESS, &old);  // overflow guard
   // Leave room above the initial SP: host calls read up to 8 stack arguments.
   t->state.sp = (reinterpret_cast<uint64_t>(t->stack_base) + t->stack_size - 0x100) & ~uint64_t{15};
+  t->teb = teb();
   t->state.x[18] = reinterpret_cast<uint64_t>(teb());  // Windows ARM64: X18 always points to the TEB
   return t;
 }
@@ -195,6 +198,10 @@ GuestThread& GuestProcess::attach_thread(uint64_t stack_size) {
   GuestThread* t = allocate_thread(stack_size);
   DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host_thread, SYNCHRONIZE, FALSE, 0);
   t_thread = t;
+  {
+    std::lock_guard lock(threads_mutex_);
+    live_threads_.push_back(t);
+  }
   activate_manifest_on_thread(manifest_);
   setup_tls_for_thread();
   if (thread_fls_slot_ != FLS_OUT_OF_INDEXES) FlsSetValue(thread_fls_slot_, t);
@@ -214,6 +221,10 @@ void WINAPI GuestProcess::release_thread(void* p) {
   // Threads created natively (thread pool, the native UCRT's _beginthreadex)
   // get their guest thread-detach notifications here.
   if (t == t_thread && !t->main && !t->detached) g_process->notify_thread(DLL_THREAD_DETACH);
+  {
+    std::lock_guard lock(g_process->threads_mutex_);
+    std::erase(g_process->live_threads_, t);
+  }
   std::lock_guard lock(g_process->exited_mutex_);
   g_process->exited_threads_.push_back(t);
 }
@@ -224,59 +235,10 @@ void GuestProcess::reclaim_threads() {
     if (t->host_thread && WaitForSingleObject(t->host_thread, 0) != WAIT_OBJECT_0) return false;
     if (t->host_thread) CloseHandle(t->host_thread);
     VirtualFree(t->stack_base, 0, MEM_RELEASE);
-    if (t->tls_data) HeapFree(GetProcessHeap(), 0, t->tls_data);
+    for (void* block : t->tls_blocks) HeapFree(GetProcessHeap(), 0, block);
     delete t;
     return true;
   });
-}
-
-void GuestProcess::setup_tls_for_thread() {
-  if (!image_.tls || !t_thread) return;
-  const pe::TlsInfo& tls = *image_.tls;
-  const size_t template_size = tls.raw_end > tls.raw_start ? tls.raw_end - tls.raw_start : 0;
-  const size_t total = template_size + tls.zero_fill;
-
-  // Implicit TLS lives in TEB->ThreadLocalStoragePointer[_tls_index]. The
-  // native loader does not know about the guest image, so give the guest a
-  // slot of its own, past ntdll's entries, in a copy of this thread's vector.
-  //
-  // ntdll's TLS vector is a process-heap block whose first 16 bytes are a
-  // header (the entry count, then a link); ThreadLocalStoragePointer points
-  // just past it. At thread exit ntdll reads the count, frees that many
-  // entries and frees the block from the header, so the copy keeps that
-  // layout and header: ntdll goes on managing its own entries and never sees
-  // the guest's. Limitation: if a native DLL with implicit TLS is loaded
-  // later, ntdll rebuilds the vectors and the guest slot is lost.
-  HANDLE heap = GetProcessHeap();
-  auto** teb_array = reinterpret_cast<void***>(teb() + kTebThreadLocalStoragePointer);
-  uint64_t header[2] = {0, 0};
-  size_t count = 0;
-  if (void** old = *teb_array) {
-    std::memcpy(header, reinterpret_cast<const uint64_t*>(old) - 2, sizeof(header));
-    count = static_cast<uint32_t>(header[0]);
-  }
-  if (count >= kGuestTlsSlot) {
-    std::fprintf(stderr, "[juice] warning: %zu native TLS modules; guest thread-local data is unavailable\n", count);
-    return;
-  }
-  auto* data = static_cast<uint8_t*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, std::max<size_t>(total, 16)));
-  auto* block = static_cast<uint64_t*>(HeapAlloc(heap, HEAP_ZERO_MEMORY, sizeof(header) + (kGuestTlsSlot + 1) * 8));
-  if (!data || !block) throw std::bad_alloc();
-  if (template_size && image_.contains(tls.raw_start))
-    std::memcpy(data, reinterpret_cast<const void*>(tls.raw_start), template_size);
-  std::memcpy(block, header, sizeof(header));
-  auto** array = reinterpret_cast<void**>(block + 2);
-  if (count) std::memcpy(array, *teb_array, count * sizeof(void*));
-  array[kGuestTlsSlot] = data;
-  *teb_array = array;  // the original vector stays allocated: ntdll may still reference it
-  t_thread->tls_data = data;
-  if (image_.contains(tls.index_address)) *reinterpret_cast<uint32_t*>(tls.index_address) = kGuestTlsSlot;
-}
-
-void GuestProcess::notify_thread(uint32_t reason) {
-  if (reason == DLL_THREAD_DETACH && t_thread) t_thread->detached = true;
-  if (!image_.tls) return;
-  for (uint64_t cb : image_.tls->callbacks) call_guest(cb, {image_.address(), reason, 0});
 }
 
 HANDLE GuestProcess::create_thread(SECURITY_ATTRIBUTES* attributes, uint64_t stack_size, uint64_t start,
@@ -315,10 +277,17 @@ int GuestProcess::run() {
   GuestThread* main = allocate_thread(0);
   main->main = true;
   t_thread = main;
+  {
+    std::lock_guard lock(threads_mutex_);
+    live_threads_.push_back(main);
+  }
   setup_tls_for_thread();
-  notify_thread(DLL_PROCESS_ATTACH);
+  // DLLs first (DllMain), then the program's own TLS callbacks.
+  GuestModule& program = *modules_[0].load(std::memory_order_acquire);
+  if (!initialize_module(program)) fatal("a DLL failed to initialize", kStatusDllInitFailed);
+  run_started_ = true;
   uint64_t peb = *reinterpret_cast<uint64_t*>(teb() + kTebPeb);
-  uint64_t result = call_guest(image_.entry, {peb});
+  uint64_t result = call_guest(program.image.entry, {peb});
   exit(static_cast<uint32_t>(result));
 }
 
@@ -402,7 +371,7 @@ bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& r
 }
 
 bool GuestProcess::read_code(uint64_t addr, uint32_t& word) {
-  if (image_.contains(addr) && image_.contains(addr + 3)) {
+  if (const GuestModule* m = module_at(addr); m && m->image.contains(addr + 3)) {
     std::memcpy(&word, reinterpret_cast<const void*>(addr), 4);
     return true;
   }
@@ -419,7 +388,7 @@ bool GuestProcess::is_host_code(uint64_t pc) {
   // Executable code of a loaded native module: the guest got a native function
   // pointer that never went through an import or GetProcAddress, typically a
   // method in the vtable of a COM object created by a system DLL.
-  if (image_.contains(pc)) return false;
+  if (module_at(pc)) return false;
   MEMORY_BASIC_INFORMATION mbi{};
   if (!VirtualQuery(reinterpret_cast<const void*>(pc), &mbi, sizeof(mbi))) return false;
   constexpr DWORD kExecute = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
@@ -512,26 +481,12 @@ runtime::Action GuestProcess::on_exit(arm64::CpuState& s) {
   return runtime::Action::Continue;
 }
 
-bool GuestProcess::is_guest_module_name(std::wstring_view name) const {
-  auto file_part = [](std::wstring_view p) {
-    size_t slash = p.find_last_of(L"\\/");
-    return slash == std::wstring_view::npos ? p : p.substr(slash + 1);
-  };
-  return lower(file_part(name)) == lower(file_part(exe_path_));
-}
-
 uint64_t GuestProcess::get_proc_address(uint64_t module, const char* name) {
   const bool by_ordinal = (reinterpret_cast<uint64_t>(name) >> 16) == 0;
   const uint16_t ordinal = static_cast<uint16_t>(reinterpret_cast<uint64_t>(name));
 
-  if (module == image_.address()) {
-    if (by_ordinal) {
-      auto it = image_.exports_by_ordinal.find(ordinal);
-      if (it != image_.exports_by_ordinal.end()) return it->second;
-    } else {
-      auto it = image_.exports_by_name.find(name);
-      if (it != image_.exports_by_name.end()) return it->second;
-    }
+  if (GuestModule* m = module_by_handle(module)) {
+    if (uint64_t addr = guest_export(*m, name)) return addr;
     SetLastError(ERROR_PROC_NOT_FOUND);
     return 0;
   }
@@ -561,8 +516,16 @@ uint64_t GuestProcess::get_proc_address(uint64_t module, const char* name) {
 // --- exit and diagnostics -------------------------------------------------------------
 
 void GuestProcess::exit(uint32_t code) {
+  if (!exiting_.load()) detach_modules();  // DLL_PROCESS_DETACH, as ExitProcess does natively
   before_exit(code);
   ExitProcess(code);
+}
+
+void notify_native_process_exit() {
+  if (g_process && !g_process->exiting_.load()) {
+    g_process->detach_modules();
+    g_process->before_exit(GuestProcess::kExitCodeUnknown);
+  }
 }
 
 void GuestProcess::before_exit(uint32_t code) {
@@ -580,7 +543,7 @@ void GuestProcess::before_exit(uint32_t code) {
       std::fprintf(stderr, "[juice]   api %s!%s: %llu calls\n", t->dll.c_str(), t->name.c_str(),
                    static_cast<unsigned long long>(calls));
     std::fprintf(stderr, "[juice] guest threads started: %u\n", threads_started_.load());
-    std::fprintf(stderr, "[juice] exit code %u (0x%x)\n", code, code);
+    if (code != kExitCodeUnknown) std::fprintf(stderr, "[juice] exit code %u (0x%x)\n", code, code);
   }
   std::fflush(stderr);
 }

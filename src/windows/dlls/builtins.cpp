@@ -21,12 +21,6 @@ bool is_kernel32_family(std::string_view dll) {
   return d == "kernel32" || d == "kernelbase" || d == "ntdll" || d.starts_with("api-ms-win-core-");
 }
 
-// The universal C runtime: ucrtbase.dll and the api-ms-win-crt-* API sets.
-bool is_ucrt_family(std::string_view dll) {
-  std::string d = lower(dll);
-  return d.starts_with("ucrtbase") || d.starts_with("api-ms-win-crt-");
-}
-
 // The Visual C++ runtime: vcruntime140.dll and vcruntime140_1.dll.
 bool is_vcruntime_family(std::string_view dll) { return lower(dll).starts_with("vcruntime140"); }
 
@@ -44,7 +38,6 @@ BuiltinFn find_builtin(std::string_view dll, std::string_view name) {
     return find_in(kernel32_builtins(), name);
   }
   if (is_vcruntime_family(dll)) return find_in(vcruntime_builtins(), name);
-  if (is_ucrt_family(dll)) return find_in(ucrt_builtins(), name);
   return nullptr;
 }
 

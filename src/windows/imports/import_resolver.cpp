@@ -38,52 +38,68 @@ uint64_t guest_value_for_native_export(void* addr, ThunkTable& thunks, std::stri
   return thunks.add_native(addr, std::move(dll), std::move(name), signature);
 }
 
-ImportStats resolve_imports(const pe::LoadedImage& image, ThunkTable& thunks, std::FILE* log) {
-  ImportStats stats;
-  std::unordered_map<std::string, HMODULE> modules;
-
-  for (const pe::Import& imp : image.imports) {
-    const std::string display = imp.by_ordinal ? std::format("#{}", imp.ordinal) : imp.name;
-    uint64_t value = 0;
-    const char* how = "";
-
-    if (BuiltinFn fn = imp.by_ordinal ? nullptr : find_builtin(imp.dll, imp.name)) {
-      Thunk t;
-      t.kind = Thunk::Kind::Builtin;
-      t.dll = imp.dll;
-      t.name = imp.name;
-      t.builtin = fn;
-      value = thunks.add(std::move(t));
-      how = "builtin";
-      ++stats.builtin;
-    } else {
-      auto [it, inserted] = modules.try_emplace(imp.dll, nullptr);
-      if (inserted) it->second = LoadLibraryA(imp.dll.c_str());
-      HMODULE mod = it->second;
-      void* addr = nullptr;
-      if (mod) {
-        addr = reinterpret_cast<void*>(
-            GetProcAddress(mod, imp.by_ordinal ? MAKEINTRESOURCEA(imp.ordinal) : imp.name.c_str()));
-      }
-      if (addr) {
-        value = guest_value_for_native_export(addr, thunks, imp.dll, display);
-        bool data = value == reinterpret_cast<uint64_t>(addr);
-        how = data ? "data" : "native";
-        ++(data ? stats.data : stats.native);
-      } else {
-        Thunk t;
-        t.kind = Thunk::Kind::Missing;
-        t.dll = imp.dll;
-        t.name = display;
-        value = thunks.add(std::move(t));
-        how = mod ? "MISSING (no such export)" : "MISSING (DLL not found)";
-        ++stats.missing;
-      }
+uint64_t resolve_native_import(const pe::Import& imp, ThunkTable& thunks, const char** how, ImportStats* stats) {
+  const std::string display = imp.by_ordinal ? std::format("#{}", imp.ordinal) : imp.name;
+  const char* result = "";
+  uint64_t value = 0;
+  if (BuiltinFn fn = imp.by_ordinal ? nullptr : find_builtin(imp.dll, imp.name)) {
+    Thunk t;
+    t.kind = Thunk::Kind::Builtin;
+    t.dll = imp.dll;
+    t.name = imp.name;
+    t.builtin = fn;
+    value = thunks.add(std::move(t));
+    result = "builtin";
+    if (stats) ++stats->builtin;
+  } else {
+    HMODULE mod = LoadLibraryA(imp.dll.c_str());
+    void* addr = nullptr;
+    if (mod) {
+      addr = reinterpret_cast<void*>(
+          GetProcAddress(mod, imp.by_ordinal ? MAKEINTRESOURCEA(imp.ordinal) : imp.name.c_str()));
     }
+    if (addr) {
+      value = guest_value_for_native_export(addr, thunks, imp.dll, display);
+      const bool data = value == reinterpret_cast<uint64_t>(addr);
+      result = data ? "data" : "native";
+      if (stats) ++(data ? stats->data : stats->native);
+    } else {
+      value = missing_import(thunks, imp.dll, display);
+      result = mod ? "MISSING (no such export)" : "MISSING (DLL not found)";
+      if (stats) ++stats->missing;
+    }
+  }
+  if (how) *how = result;
+  return value;
+}
 
+uint64_t missing_import(ThunkTable& thunks, const std::string& dll, const std::string& name) {
+  Thunk t;
+  t.kind = Thunk::Kind::Missing;
+  t.dll = dll;
+  t.name = name;
+  return thunks.add(std::move(t));
+}
+
+ImportStats resolve_imports(const pe::LoadedImage& image, ThunkTable& thunks, std::FILE* log,
+                            const GuestImportBinder& guest) {
+  ImportStats stats;
+  for (const pe::Import& imp : image.imports) {
+    const char* how = "";
+    uint64_t value = 0;
+    if (std::optional<uint64_t> bound = guest ? guest(imp) : std::nullopt) {
+      value = *bound;
+      how = "guest";
+      ++stats.guest;
+    } else {
+      value = resolve_native_import(imp, thunks, &how, &stats);
+    }
     std::memcpy(image.base + imp.iat_rva, &value, sizeof(value));
-    if (log) std::fprintf(log, "[juice] import %s!%s -> %s 0x%llx\n", imp.dll.c_str(), display.c_str(), how,
-                          static_cast<unsigned long long>(value));
+    if (log) {
+      std::fprintf(log, "[juice] import %s!%s -> %s 0x%llx\n", imp.dll.c_str(),
+                   imp.by_ordinal ? std::format("#{}", imp.ordinal).c_str() : imp.name.c_str(), how,
+                   static_cast<unsigned long long>(value));
+    }
   }
   return stats;
 }

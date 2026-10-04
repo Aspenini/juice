@@ -38,12 +38,14 @@ class NativeCallbackTarget {
   // Native code called guest address `target` (guest code or an API thunk).
   // Returns false if the call cannot be serviced.
   virtual bool call_from_native(uint64_t target, const Args& args, Result& result) = 0;
+
+  // Is `addr` inside a guest module (code native code may call into)?
+  virtual bool is_guest_address(uint64_t addr) const = 0;
 };
 
 struct FaultRegions {
   const runtime::CodeArena* jit_code = nullptr;
   uint64_t thunks_begin = 0, thunks_end = 0;
-  uint64_t image_begin = 0, image_end = 0;
   NativeCallbackTarget* callbacks = nullptr;
 };
 

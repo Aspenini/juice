@@ -43,7 +43,7 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
   const uint64_t rip = ctx->Rip;
   const bool in_jit = g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(rip));
   const bool in_thunks = rip >= g_regions.thunks_begin && rip < g_regions.thunks_end;
-  const bool in_image = rip >= g_regions.image_begin && rip < g_regions.image_end;
+  const bool in_image = g_regions.callbacks && g_regions.callbacks->is_guest_address(rip);
   if (!in_jit && !in_thunks && !in_image) return EXCEPTION_CONTINUE_SEARCH;
 
   // Native code called into the guest: emulate the call and return to it.

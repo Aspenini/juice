@@ -129,8 +129,12 @@ void parse_exports(LoadedImage& image, const PeFile& file) {
   for (uint32_t i = 0; i < num_functions; ++i) {
     uint32_t rva = 0;
     if (!r.read(functions + 4ull * i, rva) || rva == 0) continue;
-    // Forwarders (RVA inside the export directory) are not supported yet.
-    if (rva >= dir.rva && rva < dir.rva + dir.size) continue;
+    if (rva >= dir.rva && rva < dir.rva + dir.size) {
+      // A forwarder: the RVA points at a "DLL.Name" string in the export directory.
+      std::string target;
+      if (r.read_string(rva, target)) image.forwarders_by_ordinal[base + i] = std::move(target);
+      continue;
+    }
     image.exports_by_ordinal[base + i] = image.address() + rva;
   }
   for (uint32_t i = 0; i < num_names; ++i) {
@@ -139,8 +143,11 @@ void parse_exports(LoadedImage& image, const PeFile& file) {
     std::string name;
     if (!r.read(names + 4ull * i, name_rva) || !r.read(ordinals + 2ull * i, index) || !r.read_string(name_rva, name))
       continue;
-    auto it = image.exports_by_ordinal.find(base + index);
-    if (it != image.exports_by_ordinal.end()) image.exports_by_name[name] = it->second;
+    if (auto it = image.exports_by_ordinal.find(base + index); it != image.exports_by_ordinal.end()) {
+      image.exports_by_name[name] = it->second;
+    } else if (auto f = image.forwarders_by_ordinal.find(base + index); f != image.forwarders_by_ordinal.end()) {
+      image.forwarders_by_name[name] = f->second;
+    }
   }
 }
 

@@ -31,9 +31,13 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 * **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
   `thread_local` objects with constructors and destructors, and guest atomics that are really
   atomic across threads.
+* **DLLs**: the program's own ARM64 DLLs, imported or loaded with `LoadLibrary`, with
+  `DllMain`, exports (by name, by ordinal and forwarded), thread-local data and the module
+  functions. JUICE also loads the ARM64 C++ runtime DLLs (`vcruntime140`, `msvcp140`) as guest
+  code when it can find them.
 * **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
-  `RaiseException`, vectored handlers) with the static and dynamic CRT, and C++ exceptions with
-  the static CRT (`/MT`).
+  `RaiseException`, vectored handlers) and C++ exceptions, with the static and dynamic CRT.
+  C++ exceptions with the dynamic CRT need the ARM64 C++ runtime DLLs.
 * Every test program is checked against a natively compiled x86-64 build of the same source.
   Each one runs under the optimizing JIT, the unoptimized JIT and the reference IR interpreter.
 
@@ -73,6 +77,8 @@ juice [options] program.exe [arguments...]
   --no-opt         disable IR optimizations
   --block-size=N   maximum guest instructions per translated block (default 64)
   --scan           don't run; list instructions in the program JUICE cannot translate
+  --dll-path=DIR   also look for the program's ARM64 DLLs in DIR (repeatable)
+  --no-vs-runtime  don't use Visual Studio's ARM64 C++ runtime DLLs
   --no-host        don't start a host process for the program's manifest settings
 ```
 
@@ -128,6 +134,22 @@ and API built-ins do.
 
 * **Loader.** Maps the image read/write but *not executable*, applies relocations and parses
   imports, exports and TLS. X18 points to the TEB and implicit TLS gets its own slot.
+* **DLLs.** For each DLL the program imports or loads, JUICE first looks for an ARM64 copy, in
+  this order:
+  1. the program's directory;
+  2. any `--dll-path` directories;
+  3. the directories in `JUICE_DLL_PATH`;
+  4. the ARM64 C++ runtime of an installed Visual Studio (`VC\Redist\MSVC\...\arm64`).
+
+  A DLL found there becomes a guest module, as the native loader would set it up:
+  * relocation and import binding, including forwarded exports;
+  * implicit TLS, also for threads that already exist when it loads;
+  * TLS callbacks and `DllMain` notifications, called in dependency order, with
+    `DLL_PROCESS_DETACH` at exit.
+
+  Any other DLL is the native x64 one. With the ARM64 `vcruntime140` and `msvcp140`, C++
+  exceptions of programs built with `/MD` are handled entirely in guest code. Guest modules are
+  never unmapped (`FreeLibrary` keeps them), so translated code stays valid.
 * **API calls.** Each import becomes a unique address in a reserved, inaccessible region. When the
   dispatcher reaches one, it calls the native function. A generated x64 trampoline converts the
   ARM64 calling convention to x64, passing X0–X7, D0–D3 and stack arguments. It returns both RAX
@@ -196,7 +218,8 @@ and API built-ins do.
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
   threads, GUI, COM, application manifests, exit codes) built at `-O2` and `-Od`, plus C and C++
-  C-runtime programs built `/MT` and `/MD` (threads, SEH, C++ exceptions).
+  C-runtime programs built `/MT` and `/MD` (threads, SEH, C++ exceptions, a program with DLLs of
+  its own). `/MD` programs run with both the ARM64 and the native C++ runtime DLLs.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
 
@@ -209,20 +232,19 @@ These are next, roughly in the plan's order:
    program needs.
 2. **More Win32 APIs.** Signatures for more mixed int/FP functions and by-value structures, and
    structures larger than 16 bytes returned by value through X8.
-3. **DLL loading.** Load ARM64 DLLs as guest modules (`LoadLibrary`, imports between guest DLLs).
-4. **Windows exceptions.** Software exceptions work. Still missing:
+3. **Windows exceptions.** Software exceptions work. Still missing:
    * Hardware faults in guest code (such as an access violation inside `__try`) are reported
      instead of being delivered to the program.
    * Exceptions can't propagate through native code, for example from a window procedure out
-     through `DispatchMessage`.
-   * C++ exceptions with the dynamic CRT need an ARM64 `vcruntime140` frame handler.
-5. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
+     through `DispatchMessage`. A C++ exception thrown by a native DLL can't be caught by the
+     program either, which matters for a `/MD` program without the ARM64 `msvcp140`.
+4. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
    structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. `uiAccess` in a
    manifest is not honored.
-6. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
+5. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.
 
 Threading caveats: if a native DLL with implicit TLS is loaded after start-up, ntdll rebuilds the
-TLS vectors and drops the guest's slot. `SuspendThread`/`GetThreadContext` on a guest thread see
+TLS vectors and drops the guest modules' slots. `SuspendThread`/`GetThreadContext` on a guest thread see
 the host's x64 context, not the guest's ARM64 one.

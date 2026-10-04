@@ -80,15 +80,16 @@ target("juice-guest-tests")
                                         "/Fo" .. path.join(outdir, name .. "-" .. variant .. "." .. a[1] .. ".obj"),
                                         "/Fe" .. exe}, ldflags)
                 table.insert(jobs, {name = name .. " (" .. a[1] .. ", /" .. variant .. ")", exe = exe,
-                                    argv = argv, files = table.join({src}, deps)})
+                                    steps = {argv}, files = table.join({src}, deps)})
             end
         end
         local function add_guest_test(name, variant, mode, opt)
-            local test = table.join({guest = exe_name(name, variant, "arm64")}, opt)
+            local test = table.join({guest = opt.guest or exe_name(name, variant, "arm64")}, opt)
             if not opt.expect_output then
-                test.reference = exe_name(name, variant, "x64")
+                test.reference = opt.reference or exe_name(name, variant, "x64")
             end
-            local flags = {jit = {}, interp = {"--interp"}, noopt = {"--no-opt", "--block-size=1"}}
+            local flags = {jit = {}, interp = {"--interp"}, noopt = {"--no-opt", "--block-size=1"},
+                           nativert = {"--no-vs-runtime"}}
             test.flags = flags[mode]
             target:add("tests", name .. "." .. variant .. "." .. mode, test)
         end
@@ -130,17 +131,58 @@ target("juice-guest-tests")
                                 "/clang:-fno-slp-vectorize", "/vctoolsdir" .. vctools}
             local no_exceptions = {"/EHs-c-", "/D_HAS_EXCEPTIONS=0"}
             local crt_special = {crt_c = {args = {"one", "two words"}}}
-            -- C++ exceptions: /MT only, since vcruntime140.dll's C++ frame handler is x64 code.
+            -- C++ exceptions with /MD need the ARM64 C++ runtime DLLs (juice
+            -- finds Visual Studio's): vcruntime140.dll's x64 frame handler can't
+            -- handle ARM64 frames.
             local cxx_exceptions = {crt_eh = true}
+            local runtime_dlls = os.files(path.join(os.getenv("ProgramFiles") or "", "Microsoft Visual Studio", "*",
+                                                    "*", "VC", "Redist", "MSVC", "*", "arm64", "Microsoft.VC*.CRT",
+                                                    "vcruntime140.dll"))
+            local has_arm64_runtime = #runtime_dlls > 0
+            if not has_arm64_runtime then
+                print("juice: Visual Studio's ARM64 C++ runtime DLLs not found, /MD C++ exception tests disabled")
+            end
             for _, file in ipairs(target:values("guest.crt")) do
                 local name = path.basename(file)
                 local src = path.join(scriptdir, "programs", file)
                 local flags = table.join(crt_cflags, cxx_exceptions[name] and {"/EHsc"} or no_exceptions)
-                for _, rt in ipairs(cxx_exceptions[name] and {"MT"} or {"MT", "MD"}) do
+                local runtimes = {"MT", "MD"}
+                if cxx_exceptions[name] and not has_arm64_runtime then runtimes = {"MT"} end
+                for _, rt in ipairs(runtimes) do
                     add_job(name, rt, src, {}, flags, {})
-                    for _, mode in ipairs({"jit", "interp"}) do
+                    local modes = {"jit", "interp"}
+                    -- /MD programs also run with the native x64 vcruntime140.dll.
+                    if rt == "MD" and has_arm64_runtime and not cxx_exceptions[name] then table.insert(modes, "nativert") end
+                    for _, mode in ipairs(modes) do
                         add_guest_test(name, rt, mode, crt_special[name] or {})
                     end
+                end
+            end
+
+            -- A program with DLLs of its own (programs/dll), each architecture and
+            -- runtime in a directory of its own so that the DLLs sit next to the program.
+            local dll_src = path.join(scriptdir, "programs", "dll")
+            local dll_files = os.files(path.join(dll_src, "*.c"))
+            for _, rt in ipairs({"MT", "MD"}) do
+                local exes = {}
+                for _, a in ipairs(arches) do
+                    local dir = path.join(outdir, "crt_dll", a[1] .. "-" .. rt)
+                    local function compile(src, out, extra)
+                        return table.join({"--target=" .. a[2]}, crt_cflags, no_exceptions, {"/" .. rt, src,
+                                          "/Fo" .. path.join(dir, path.basename(src) .. ".obj"), "/Fe" .. out}, extra)
+                    end
+                    local lib = path.join(dir, "crt_dll_lib")
+                    local exe = path.join(dir, "crt_dll.exe")
+                    exes[a[1]] = exe
+                    table.insert(jobs, {name = "crt_dll (" .. a[1] .. ", /" .. rt .. ")", exe = exe, dir = dir,
+                                        files = dll_files, steps = {
+                        compile(path.join(dll_src, "crt_dll_lib.c"), lib .. ".dll", {"/LD"}),
+                        compile(path.join(dll_src, "crt_dll_plugin.c"), path.join(dir, "crt_dll_plugin.dll"),
+                                {"/LD", "/link", lib .. ".lib"}),
+                        compile(path.join(dll_src, "crt_dll.c"), exe, {"/link", lib .. ".lib"})}})
+                end
+                for _, mode in ipairs({"jit", "interp"}) do
+                    add_guest_test("crt_dll", rt, mode, {guest = exes.arm64, reference = exes.x64})
                 end
             end
         end
@@ -163,10 +205,13 @@ target("juice-guest-tests")
         os.mkdir(target:data("guest.outdir"))
         runjobs("guest_programs", function (index)
             local job = jobs[index]
+            if job.dir then os.mkdir(job.dir) end
             depend.on_changed(function ()
                 progress.show(opt.progress, "${color.build.object}compiling.guest %s", job.name)
-                os.vrunv(cc, job.argv)
-            end, {dependfile = job.exe .. ".d", files = job.files, values = job.argv, lastmtime = os.mtime(job.exe)})
+                for _, argv in ipairs(job.steps) do
+                    os.vrunv(cc, argv)
+                end
+            end, {dependfile = job.exe .. ".d", files = job.files, values = table.join(table.unpack(job.steps)), lastmtime = os.mtime(job.exe)})
         end, {total = #jobs, comax = os.default_njob()})
     end)
 

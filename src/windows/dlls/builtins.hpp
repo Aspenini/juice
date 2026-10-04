@@ -21,7 +21,6 @@ BuiltinFn find_builtin(std::string_view dll, std::string_view name);
 
 // Builtins grouped by the DLL that exports them.
 std::span<const BuiltinExport> kernel32_builtins();
-std::span<const BuiltinExport> ucrt_builtins();
 std::span<const BuiltinExport> exception_builtins();  // kernel32/ntdll exception handling
 std::span<const BuiltinExport> vcruntime_builtins();
 

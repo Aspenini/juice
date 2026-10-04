@@ -5,6 +5,7 @@
 
 #include <windows.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <expected>
@@ -12,6 +13,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,12 +34,29 @@ struct GuestCallLevel {
   const arm64eh::Context* link;  // for exception dispatch: the guest frames continue here
 };
 
+// A guest (ARM64) module: the program or one of its DLLs.
+struct GuestModule {
+  enum class State { Loaded, Initializing, Initialized, Failed };
+  pe::LoadedImage image;
+  std::wstring path;
+  std::wstring name;  // file name, lower case
+  bool is_exe = false;
+  bool thread_calls = true;  // DLL_THREAD_ATTACH/DETACH to DllMain (DisableThreadLibraryCalls)
+  uint32_t tls_slot = 0;     // index in the threads' implicit-TLS vectors (if image.tls)
+  std::vector<GuestModule*> dependencies;  // guest DLLs it imports
+  State state = State::Loaded;
+
+  uint64_t base() const { return image.address(); }
+};
+
 // Guest execution context of one host thread: ARM64 CPU state and stack.
 struct GuestThread {
   arm64::CpuState state{};
   uint8_t* stack_base = nullptr;
   size_t stack_size = 0;
-  void* tls_data = nullptr;  // the guest image's implicit TLS block for this thread
+  uint8_t* teb = nullptr;
+  void** tls_vector = nullptr;   // the thread's implicit-TLS vector, once guest modules use TLS
+  std::vector<void*> tls_blocks;  // implicit TLS blocks of guest modules
   HANDLE host_thread = nullptr;  // signaled once the host thread has fully terminated
   bool main = false;
   bool detached = false;         // DLL_THREAD_DETACH notifications have run
@@ -58,9 +77,13 @@ struct ProcessOptions {
   bool trace_calls = false;    // log every API call
   bool trace_imports = false;  // log import resolution
   bool stats = false;          // print engine statistics at exit
+  // Directories searched for ARM64 DLLs after the program's own directory.
+  std::vector<std::wstring> dll_paths;
 };
 
 class GuestProcess final : public runtime::Environment, public NativeCallbackTarget {
+  friend void notify_native_process_exit();
+
  public:
   explicit GuestProcess(ProcessOptions options);
   ~GuestProcess() override;
@@ -81,16 +104,32 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   // --- NativeCallbackTarget ----------------------------------------------------------
   bool call_from_native(uint64_t target, const Args& args, Result& result) override;
 
+  // --- NativeCallbackTarget / fault handler ---------------------------------------
+  bool is_guest_address(uint64_t addr) const override { return module_at(addr) != nullptr; }
+
   // --- Services for builtin API implementations -----------------------------------
-  const pe::LoadedImage& image() const { return image_; }
+  // The program's image.
+  const pe::LoadedImage& image() const { return exe().image; }
+  const GuestModule& exe() const { return *modules_[0].load(std::memory_order_acquire); }
+
+  // --- Guest modules (guest_modules.cpp) -------------------------------------------
+  // The guest module containing `addr`, the module whose base is `handle`, or
+  // a loaded module named `name` (a file name, with or without ".dll", or a path).
+  GuestModule* module_at(uint64_t addr) const;
+  GuestModule* module_by_handle(uint64_t handle) const;
+  GuestModule* find_loaded_module(std::wstring_view name) const;
+  // LoadLibrary for guest DLLs: returns the module handle, or 0 with `guest`
+  // false if `name` is not an ARM64 DLL JUICE can find (load it natively then).
+  uint64_t load_library(std::wstring_view name, bool& guest);
+  bool disable_thread_library_calls(uint64_t handle);
+  // Guest-visible address of an export of a guest module (0 if none).
+  uint64_t guest_export(GuestModule& module, const char* name_or_ordinal);
   ThunkTable& thunks() { return thunks_; }
   const std::wstring& exe_path() const { return exe_path_; }
   const std::wstring& command_line_w() const { return command_line_w_; }
   const std::string& command_line_a() const { return command_line_a_; }
   const ProcessOptions& options() const { return options_; }
 
-  // Is `name` (a module name or path as passed to GetModuleHandle) the guest executable?
-  bool is_guest_module_name(std::wstring_view name) const;
 
   // GetProcAddress as seen by the guest: guest exports, builtins, or thunked
   // native exports. Returns 0 if not found.
@@ -131,6 +170,7 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   uint64_t set_unhandled_exception_filter(uint64_t filter) { return unhandled_filter_.exchange(filter); }
 
   [[noreturn]] void exit(uint32_t code);
+  static constexpr uint32_t kExitCodeUnknown = 0xFFFFFFFF;
   // Exit hooks (statistics); idempotent. Called before the process terminates.
   void before_exit(uint32_t code);
 
@@ -150,6 +190,21 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   static void WINAPI release_thread(void* thread);  // FLS destructor
   void reclaim_threads();  // free contexts of host threads that have terminated
   void dump_state(std::FILE* out) const;
+  static GuestThread* t_current();  // the calling thread's guest context, if any
+  // Guest modules (guest_modules.cpp).
+  GuestModule* register_module(std::unique_ptr<GuestModule> module);
+  GuestModule* load_guest_dll(std::wstring_view name);
+  std::optional<std::wstring> find_guest_dll(std::wstring_view name) const;
+  std::optional<uint64_t> bind_guest_import(const pe::Import& import, GuestModule* importer);
+  uint64_t bind_forwarder(const std::string& target, int depth);
+  void bind_module_imports(GuestModule& module);
+  bool initialize_module(GuestModule& module);
+  void run_tls_callbacks(const GuestModule& module, uint32_t reason);
+  void assign_tls_slot(GuestModule& module);
+  void allocate_tls(GuestThread& thread, const GuestModule& module);
+  void ensure_tls_vector(GuestThread& thread);
+  void detach_modules();  // DLL_PROCESS_DETACH at exit
+
   // Thunk for native code the guest reached directly (is_host_code), named module+offset.
   Thunk* native_code_thunk(uint64_t pc);
   struct Resume;  // thrown to continue guest execution in an outer call level
@@ -158,7 +213,17 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
 
   ProcessOptions options_;
   ThunkTable thunks_;
-  pe::LoadedImage image_{};
+  // Guest modules, in load order; [0] is the program. Published lock-free
+  // (lookups by address happen on every translation) and never unloaded.
+  static constexpr size_t kMaxModules = 256;
+  std::array<std::atomic<GuestModule*>, kMaxModules> modules_{};
+  std::atomic<size_t> module_count_{0};
+  std::vector<std::unique_ptr<GuestModule>> module_storage_;
+  std::recursive_mutex loader_mutex_;        // like the native loader lock
+  std::vector<GuestModule*> init_order_;     // initialized DLLs
+  uint32_t tls_modules_ = 0;
+  std::mutex threads_mutex_;
+  std::vector<GuestThread*> live_threads_;  // attached, not yet reclaimed
   ManifestState manifest_;
   std::unique_ptr<runtime::Engine> engine_;
 
@@ -168,6 +233,8 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   std::mutex exited_mutex_;
   std::vector<GuestThread*> exited_threads_;  // released, waiting for their host thread to end
   std::atomic<bool> exiting_{false};
+  bool run_started_ = false;      // the program's entry point has been called
+  bool modules_detached_ = false;
 
   struct VectoredHandler {
     uint64_t handle;
@@ -182,6 +249,16 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   std::wstring command_line_w_;
   std::string command_line_a_;
 };
+
+// Native code ended the process (ExitProcess not called through the guest's
+// imports, e.g. by the native C runtime's exit()): run the guest modules'
+// DLL_PROCESS_DETACH notifications and the exit hooks. Called from juice.exe's
+// TLS callback, which the native loader runs before detaching native DLLs.
+void notify_native_process_exit();
+
+// The ARM64 C++ runtime DLLs of a Visual Studio installation (its ARM64
+// redistributable directory), if one is installed.
+std::optional<std::wstring> find_visual_studio_arm64_runtime();
 
 struct GuestProcess::Resume {
   arm64eh::Context context;

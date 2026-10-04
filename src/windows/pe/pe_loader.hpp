@@ -44,6 +44,9 @@ struct LoadedImage {
   std::vector<Import> imports;
   std::unordered_map<std::string, uint64_t> exports_by_name;
   std::unordered_map<uint32_t, uint64_t> exports_by_ordinal;
+  // Forwarded exports: "OTHERDLL.Name" or "OTHERDLL.#ordinal".
+  std::unordered_map<std::string, std::string> forwarders_by_name;
+  std::unordered_map<uint32_t, std::string> forwarders_by_ordinal;
   std::optional<TlsInfo> tls;
   DataDirectory exception_directory;  // .pdata: RUNTIME_FUNCTION entries sorted by address
 

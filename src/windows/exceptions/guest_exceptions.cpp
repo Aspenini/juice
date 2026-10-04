@@ -89,16 +89,18 @@ void GuestProcess::resume_at(const Context& context) {
 }
 
 const RuntimeFunction* GuestProcess::lookup_function_entry(uint64_t pc, uint64_t* image_base) const {
-  if (!image_.contains(pc) || !image_.exception_directory.size) return nullptr;
-  const auto* begin = image_.at_rva<const RuntimeFunction>(image_.exception_directory.rva);
-  const auto* end = begin + image_.exception_directory.size / sizeof(RuntimeFunction);
-  const uint32_t rva = static_cast<uint32_t>(pc - image_.address());
+  const GuestModule* m = module_at(pc);
+  if (!m || !m->image.exception_directory.size) return nullptr;
+  const pe::LoadedImage& image = m->image;
+  const auto* begin = image.at_rva<const RuntimeFunction>(image.exception_directory.rva);
+  const auto* end = begin + image.exception_directory.size / sizeof(RuntimeFunction);
+  const uint32_t rva = static_cast<uint32_t>(pc - image.address());
   // The last entry starting at or before the pc.
   const auto* it = std::upper_bound(begin, end, rva, [](uint32_t r, const RuntimeFunction& f) { return r < f.begin; });
   if (it == begin) return nullptr;
   --it;
-  if (rva >= it->begin + arm64eh::function_length(image_.address(), *it)) return nullptr;
-  if (image_base) *image_base = image_.address();
+  if (rva >= it->begin + arm64eh::function_length(image.address(), *it)) return nullptr;
+  if (image_base) *image_base = image.address();
   return it;
 }
 
@@ -152,7 +154,7 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
     const bool unwound = frame.flags & arm64eh::kContextUnwoundToCall;
     uint64_t base = 0;
     const RuntimeFunction* f = lookup_function_entry(unwound ? pc - 4 : pc, &base);
-    if (!f && !image_.contains(pc)) {
+    if (!f && !module_at(pc)) {
       why = "the guest stack could not be unwound";
       break;
     }
@@ -257,7 +259,7 @@ void GuestProcess::unwind(uint64_t target_frame, uint64_t target_ip, EXCEPTION_R
     const bool unwound = frame.flags & arm64eh::kContextUnwoundToCall;
     uint64_t base = 0;
     const RuntimeFunction* f = lookup_function_entry(unwound ? frame.pc - 4 : frame.pc, &base);
-    if (!f && !image_.contains(frame.pc)) fatal("the guest stack could not be unwound", kStatusBadStack);
+    if (!f && !module_at(frame.pc)) fatal("the guest stack could not be unwound", kStatusBadStack);
     const arm64eh::UnwindResult u = arm64eh::virtual_unwind(base, before.pc, f, frame);
     if (u.establisher_frame > target_frame)
       fatal(std::format("invalid unwind target frame 0x{:x}", target_frame), kStatusInvalidUnwindTarget);

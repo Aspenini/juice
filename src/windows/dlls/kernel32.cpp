@@ -57,33 +57,34 @@ uint64_t copy_module_path(const std::basic_string<Char>& path, Char* buffer, DWO
 
 // --- module functions --------------------------------------------------------------
 
+uint64_t module_handle(GuestProcess& p, const std::wstring& name) {
+  if (const GuestModule* m = p.find_loaded_module(name)) return m->base();
+  return reinterpret_cast<uint64_t>(GetModuleHandleW(name.c_str()));
+}
+
 uint64_t GetModuleHandleA_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] == 0) return p.image().address();
-  const char* name = ptr<const char>(s.x[0]);
-  if (p.is_guest_module_name(ansi_to_wide(name))) return p.image().address();
-  return reinterpret_cast<uint64_t>(GetModuleHandleA(name));
+  if (s.x[0] == 0) return p.exe().base();
+  return module_handle(p, ansi_to_wide(ptr<const char>(s.x[0])));
 }
 
 uint64_t GetModuleHandleW_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] == 0) return p.image().address();
-  const wchar_t* name = ptr<const wchar_t>(s.x[0]);
-  if (p.is_guest_module_name(name)) return p.image().address();
-  return reinterpret_cast<uint64_t>(GetModuleHandleW(name));
+  if (s.x[0] == 0) return p.exe().base();
+  return module_handle(p, ptr<const wchar_t>(s.x[0]));
 }
 
 uint64_t module_handle_ex(GuestProcess& p, CpuState& s, bool wide) {
   const DWORD flags = static_cast<DWORD>(s.x[0]);
   auto* out = ptr<HMODULE>(s.x[2]);
-  bool guest = false;
+  const GuestModule* guest = nullptr;
   if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
-    guest = p.image().contains(s.x[1]);
+    guest = p.module_at(s.x[1]);
   } else if (s.x[1] == 0) {
-    guest = true;
+    guest = &p.exe();
   } else {
-    guest = p.is_guest_module_name(wide ? std::wstring(ptr<const wchar_t>(s.x[1])) : ansi_to_wide(ptr<const char>(s.x[1])));
+    guest = p.find_loaded_module(wide ? std::wstring(ptr<const wchar_t>(s.x[1])) : ansi_to_wide(ptr<const char>(s.x[1])));
   }
   if (guest) {
-    if (out) *out = reinterpret_cast<HMODULE>(p.image().base);
+    if (out) *out = reinterpret_cast<HMODULE>(guest->base());
     return TRUE;
   }
   return wide ? GetModuleHandleExW(flags, ptr<const wchar_t>(s.x[1]), out)
@@ -97,16 +98,48 @@ uint64_t GetProcAddress_(GuestProcess& p, CpuState& s) {
   return p.get_proc_address(s.x[0], ptr<const char>(s.x[1]));
 }
 
+const GuestModule* guest_module(GuestProcess& p, uint64_t handle) {
+  return handle == 0 ? &p.exe() : p.module_by_handle(handle);
+}
+
 uint64_t GetModuleFileNameA_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] == 0 || s.x[0] == p.image().address())
-    return copy_module_path(wide_to_ansi(p.exe_path()), ptr<char>(s.x[1]), static_cast<DWORD>(s.x[2]));
+  if (const GuestModule* m = guest_module(p, s.x[0]))
+    return copy_module_path(wide_to_ansi(m->path), ptr<char>(s.x[1]), static_cast<DWORD>(s.x[2]));
   return GetModuleFileNameA(ptr<HINSTANCE__>(s.x[0]), ptr<char>(s.x[1]), static_cast<DWORD>(s.x[2]));
 }
 
 uint64_t GetModuleFileNameW_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] == 0 || s.x[0] == p.image().address())
-    return copy_module_path(p.exe_path(), ptr<wchar_t>(s.x[1]), static_cast<DWORD>(s.x[2]));
+  if (const GuestModule* m = guest_module(p, s.x[0]))
+    return copy_module_path(m->path, ptr<wchar_t>(s.x[1]), static_cast<DWORD>(s.x[2]));
   return GetModuleFileNameW(ptr<HINSTANCE__>(s.x[0]), ptr<wchar_t>(s.x[1]), static_cast<DWORD>(s.x[2]));
+}
+
+// LoadLibrary: ARM64 DLLs JUICE finds become guest modules; everything else
+// (and loads as data or resources, which work for any architecture) is native.
+constexpr DWORD kDataLoadFlags =
+    LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+
+uint64_t load_library(GuestProcess& p, const std::wstring& name, DWORD flags) {
+  if (!(flags & kDataLoadFlags)) {
+    bool guest = false;
+    const uint64_t handle = p.load_library(name, guest);
+    if (guest) return handle;
+  }
+  return reinterpret_cast<uint64_t>(LoadLibraryExW(name.c_str(), nullptr, flags));
+}
+
+uint64_t LoadLibraryA_(GuestProcess& p, CpuState& s) { return load_library(p, ansi_to_wide(ptr<const char>(s.x[0])), 0); }
+uint64_t LoadLibraryW_(GuestProcess& p, CpuState& s) { return load_library(p, ptr<const wchar_t>(s.x[0]), 0); }
+uint64_t LoadLibraryExA_(GuestProcess& p, CpuState& s) {
+  return load_library(p, ansi_to_wide(ptr<const char>(s.x[0])), static_cast<DWORD>(s.x[2]));
+}
+uint64_t LoadLibraryExW_(GuestProcess& p, CpuState& s) {
+  return load_library(p, ptr<const wchar_t>(s.x[0]), static_cast<DWORD>(s.x[2]));
+}
+
+uint64_t DisableThreadLibraryCalls_(GuestProcess& p, CpuState& s) {
+  if (p.disable_thread_library_calls(s.x[0])) return TRUE;
+  return DisableThreadLibraryCalls(ptr<HINSTANCE__>(s.x[0]));
 }
 
 // --- process functions ---------------------------------------------------------------
@@ -128,12 +161,12 @@ uint64_t ExitThread_(GuestProcess& p, CpuState& s) { p.exit_thread(static_cast<u
 // hands it out, e.g. when the C runtime pins the module of a thread routine), so
 // it must never reach the native FreeLibrary.
 uint64_t FreeLibrary_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] == p.image().address()) return TRUE;
+  if (p.module_by_handle(s.x[0])) return TRUE;  // guest modules stay loaded
   return FreeLibrary(ptr<HINSTANCE__>(s.x[0]));
 }
 
 uint64_t FreeLibraryAndExitThread_(GuestProcess& p, CpuState& s) {
-  if (s.x[0] != p.image().address()) FreeLibrary(ptr<HINSTANCE__>(s.x[0]));
+  if (!p.module_by_handle(s.x[0])) FreeLibrary(ptr<HINSTANCE__>(s.x[0]));
   p.exit_thread(static_cast<uint32_t>(s.x[1]));
 }
 
@@ -195,6 +228,11 @@ constexpr BuiltinExport kKernel32[] = {
     {"GetModuleHandleExA", GetModuleHandleExA_},
     {"GetModuleHandleExW", GetModuleHandleExW_},
     {"GetProcAddress", GetProcAddress_},
+    {"LoadLibraryA", LoadLibraryA_},
+    {"LoadLibraryW", LoadLibraryW_},
+    {"LoadLibraryExA", LoadLibraryExA_},
+    {"LoadLibraryExW", LoadLibraryExW_},
+    {"DisableThreadLibraryCalls", DisableThreadLibraryCalls_},
     {"GetModuleFileNameA", GetModuleFileNameA_},
     {"GetModuleFileNameW", GetModuleFileNameW_},
     {"GetCommandLineA", GetCommandLineA_},
