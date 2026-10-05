@@ -110,11 +110,22 @@ and API built-ins do.
 
 * **Decoder.** Covers base A64 integer instructions: arithmetic, logic, bitfield, shifts,
   multiply and divide, conditional select and compare, branches, all load/store addressing modes,
-  pairs, exclusives and LSE atomics, and system registers. It also covers the scalar FP and
-  Advanced SIMD subset that compilers and the CRT emit: LD1–LD4/ST1–ST4, lane moves,
-  compares, pairwise and across-lane ops, shifts, narrow/widen, permutes, and FP arithmetic,
-  FMA, conversions, rounding and compares.
-* **IR.** Values are 64-bit; ALU ops have a 32- or 64-bit width with zero-extended results. Guest
+  pairs, exclusives, LSE atomics including `CASP`, `DC ZVA`, and system registers. Scalar
+  floating point is covered, including fixed-point conversions. So is Advanced SIMD, in vector
+  and scalar forms:
+  * loads and stores (LD1–LD4/ST1–ST4) and lane moves;
+  * integer arithmetic, including saturating, halving and absolute-difference ops;
+  * shifts by immediate and by register (rounding, saturating, accumulating, inserting);
+  * widening, narrowing and long multiply-accumulate;
+  * by-element ops and `TBL`/`TBX`;
+  * vector floating point: arithmetic, fused multiply-add, compares, rounding, conversions
+    including fixed-point and half precision, and Arm's exact reciprocal and square-root
+    estimates.
+
+  What's still missing is the optional extensions (crypto, CRC32, dot product, FP16
+  arithmetic, SVE).
+* **IR.** Most Advanced SIMD lane operations are a single `VLane` op, whose immediate selects
+  the operation. Values are 64-bit; ALU ops have a 32- or 64-bit width with zero-extended results. Guest
   state is addressed as slots and guest memory through host pointers, since guest and host share
   the address space. Flags are a packed NZCV value that the flag-producing ops compute. Vector ops
   work on 64-bit vector halves, and FP ops carry IEEE bit patterns.
@@ -239,7 +250,7 @@ and API built-ins do.
   random data-processing instructions; and a stress test that runs one engine on several threads
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
-  threads, GUI, COM, application manifests, exit codes) built at `-O2` and `-Od`, plus C and C++
+  threads, GUI, COM, application manifests, auto-vectorized loops, exit codes) built at `-O2` and `-Od`, plus C and C++
   C-runtime programs built `/MT` and `/MD` (threads, SEH, C++ exceptions, a program with DLLs of
   its own). `/MD` programs run with both the ARM64 and the native C++ runtime DLLs.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
@@ -252,9 +263,9 @@ and API built-ins do.
 
 These are next, roughly in the plan's order:
 
-1. **More ARM64 instructions.** The remaining Advanced SIMD (vector FP, TBL, saturating and
-   widening arithmetic), CRC32, crypto, `CASP`, and LSE128/MOPS. Use `--scan` to see what a
-   program needs.
+1. **More ARM64 instructions.** The optional extensions JUICE doesn't report yet: crypto (AES,
+   SHA, PMULL 1Q), CRC32, dot product, FP16 arithmetic and LSE128/MOPS. Use `--scan` to see
+   what a program needs.
 2. **More Win32 APIs.** Signatures for more mixed int/FP functions and by-value structures, and
    structures larger than 16 bytes returned by value through X8.
 3. **Windows exceptions.** Software exceptions work. Still missing:

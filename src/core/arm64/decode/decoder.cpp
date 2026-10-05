@@ -128,7 +128,7 @@ void decode_system(Instruction& i, uint32_t w) {
   }
   if (op0 == 1) {  // SYS / SYSL (cache maintenance, TLBI, ...)
     if (!l && op1 == 3 && crn == 7 && crm == 4 && op2 == 1) {
-      i.op = Op::Unsupported;  // DC ZVA - DCZID_EL0 reports it as prohibited
+      i.op = Op::DcZva;  // block size 64 bytes, as DCZID_EL0 reports
     } else if (!l) {
       i.op = Op::Nop;  // DC CVAU, IC IVAU, ...: no-op for a translator with coherent caches
     } else {
@@ -258,8 +258,11 @@ void decode_exclusive(Instruction& i, uint32_t w) {
   if (!o2 && !o1) {
     i.op = l ? Op::Ldxr : Op::Stxr;
   } else if (!o2 && o1) {
-    if (size < 2) {
-      i.op = Op::Unsupported;  // CASP
+    if (size < 2) {  // CASP / CASPA / CASPL / CASPAL: size<0> selects 64-bit register pairs
+      if (i.ra != 31 || (i.rm & 1) || (bits(w, 4, 0) & 1)) return;
+      i.op = Op::Casp;
+      i.sf = size == 1;
+      i.mem_size = size == 1 ? 16 : 8;
       return;
     }
     i.op = l ? Op::Ldxp : Op::Stxp;

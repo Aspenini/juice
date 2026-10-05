@@ -36,7 +36,7 @@ target("juice-guest-tests")
 
     -- Freestanding programs: no C runtime, entry point mainCRTStartup.
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
-               "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings")
+               "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings", "vector")
     -- C runtime programs, built /MT and /MD.
     set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_seh.c", "crt_eh.cpp")
 
@@ -117,8 +117,13 @@ target("juice-guest-tests")
                 table.insert(deps, file)
                 link = table.join(ldflags, {"/manifest:embed", "/manifestuac:no", "/manifestinput:" .. file})
             end
+            -- vector.c is built to be auto-vectorized (no FP contraction: x86-64 has no FMA by default).
+            local flags = cflags
+            if name == "vector" then
+                flags = {"/nologo", "/GS-", "/Zl", "/W3", "/clang:-fno-math-errno", "/clang:-ffp-contract=off"}
+            end
             for _, opt in ipairs({"O2", "Od"}) do
-                add_job(name, opt, src, deps, cflags, link)
+                add_job(name, opt, src, deps, flags, link)
                 for _, mode in ipairs({"jit", "interp", "noopt"}) do
                     add_guest_test(name, opt, mode, special[name] or {})
                 end

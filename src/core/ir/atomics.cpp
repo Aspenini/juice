@@ -58,22 +58,25 @@ uint64_t cas(uint64_t addr, uint64_t expected, uint64_t desired) {
 
 // 128-bit compare-and-swap. `operands` = {expected lo, hi, desired lo, hi}.
 // Uses CMPXCHG16B (clang/gcc need -mcx16, see xmake.lua).
+// operands: {expected lo, hi, desired lo, hi}; the expected pair receives the
+// value memory held (unchanged if the swap happened).
 uint64_t cas_pair(uint64_t addr, uint64_t operands) {
-  const auto* op = host_ptr<const uint64_t>(operands);
+  auto* op = host_ptr<uint64_t>(operands);
 #if defined(_MSC_VER)
   __int64 comparand[2] = {static_cast<__int64>(op[0]), static_cast<__int64>(op[1])};
-  return _InterlockedCompareExchange128(host_ptr<volatile __int64>(addr), static_cast<__int64>(op[3]),
-                                        static_cast<__int64>(op[2]), comparand)
-             ? 0
-             : 1;
+  const bool swapped = _InterlockedCompareExchange128(host_ptr<volatile __int64>(addr), static_cast<__int64>(op[3]),
+                                                      static_cast<__int64>(op[2]), comparand);
+  op[0] = static_cast<uint64_t>(comparand[0]);
+  op[1] = static_cast<uint64_t>(comparand[1]);
 #else
   unsigned __int128 expected = (static_cast<unsigned __int128>(op[1]) << 64) | op[0];
   unsigned __int128 desired = (static_cast<unsigned __int128>(op[3]) << 64) | op[2];
-  return __atomic_compare_exchange_n(host_ptr<unsigned __int128>(addr), &expected, desired, false, __ATOMIC_SEQ_CST,
-                                     __ATOMIC_SEQ_CST)
-             ? 0
-             : 1;
+  const bool swapped = __atomic_compare_exchange_n(host_ptr<unsigned __int128>(addr), &expected, desired, false,
+                                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  op[0] = static_cast<uint64_t>(expected);
+  op[1] = static_cast<uint64_t>(expected >> 64);
 #endif
+  return swapped ? 0 : 1;
 }
 
 }  // namespace

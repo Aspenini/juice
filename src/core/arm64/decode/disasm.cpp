@@ -84,6 +84,8 @@ const char* mnemonic(Op op) {
     case Op::Ldp: return "ldp";
     case Op::Stp: return "stp";
     case Op::Prfm: return "prfm";
+    case Op::DcZva: return "dc zva";
+    case Op::Casp: return "casp";
     case Op::Ldxr: return "ldxr";
     case Op::Stxr: return "stxr";
     case Op::Ldxp: return "ldxp";
@@ -153,6 +155,17 @@ const char* mnemonic(Op op) {
     case Op::VecBsl: return "bsl";
     case Op::VecBit: return "bit";
     case Op::VecBif: return "bif";
+    case Op::VecIntOp: return "simd.int";
+    case Op::VecFpOp: return "simd.fp";
+    case Op::VecIntUnary: return "simd.int1";
+    case Op::VecFpUnary: return "simd.fp1";
+    case Op::VecLong: return "simd.long";
+    case Op::VecShiftOp: return "simd.shift";
+    case Op::VecElemOp: return "simd.elem";
+    case Op::VecTbl: return "tbl";
+    case Op::VecFpAcross: return "simd.fpv";
+    case Op::FpFixedToFp: return "cvtf.fixed";
+    case Op::FpToFixed: return "fcvtz.fixed";
     case Op::FpBinary: return "fp";
     case Op::FpUnary: return "fp";
     case Op::FpCvt: return "fcvt";
@@ -339,6 +352,12 @@ std::string disassemble(const Instruction& i) {
                          mem_operand(i));
     case Op::Prfm:
       return std::format("prfm {}", mem_operand(i));
+    case Op::DcZva:
+      return std::format("dc zva, x{}", i.rd);
+    case Op::Casp: {
+      const char r = i.sf ? 'x' : 'w';
+      return std::format("casp {}{}, {}{}, {}{}, {}{}, [x{}]", r, i.rm, r, i.rm + 1, r, i.rd, r, i.rd + 1, i.rn);
+    }
     case Op::Ldxr:
       return std::format("{} {}, [{}]", m, gpr(i.rd, i.mem_size == 8), gpr(i.rn, true, true));
     case Op::Stxr:
@@ -414,6 +433,21 @@ std::string disassemble(const Instruction& i) {
     case Op::VecBsl: case Op::VecBit: case Op::VecBif:
       return std::format("{} {}, {}, {}", m, vreg_arrangement(i.rd, i.q, i.esize),
                          vreg_arrangement(i.rn, i.q, i.esize), vreg_arrangement(i.rm, i.q, i.esize));
+    // The groups below print their operation number (the Vec* enums of instruction.hpp).
+    case Op::VecIntOp: case Op::VecFpOp: case Op::VecLong: case Op::VecElemOp: case Op::VecTbl:
+      return std::format("{}.{}{} {}, {}, {}", m, i.shift, i.scalar ? " scalar" : "",
+                         vreg_arrangement(i.rd, i.q, i.esize), vreg_arrangement(i.rn, i.q, i.esize),
+                         vreg_arrangement(i.rm, i.q, i.esize));
+    case Op::VecIntUnary: case Op::VecFpUnary: case Op::VecFpAcross:
+      return std::format("{}.{}{} {}, {}", m, i.shift, i.scalar ? " scalar" : "", vreg_arrangement(i.rd, i.q, i.esize),
+                         vreg_arrangement(i.rn, i.q, i.esize));
+    case Op::VecShiftOp:
+      return std::format("{}.{}{} {}, {}, #{}", m, i.shift, i.scalar ? " scalar" : "",
+                         vreg_arrangement(i.rd, i.q, i.esize), vreg_arrangement(i.rn, i.q, i.esize), i.imm);
+    case Op::FpFixedToFp:
+      return std::format("{} {}, {}{}, #{}", m, fpr(i.rd, i.mem_size), i.sf ? "x" : "w", i.rn, i.imm);
+    case Op::FpToFixed:
+      return std::format("{} {}{}, {}, #{}", m, i.sf ? "x" : "w", i.rd, fpr(i.rn, i.mem_size), i.imm);
     case Op::FpBinary: {
       static constexpr const char* names[9] = {"fmul", "fdiv", "fadd", "fsub", "fmax", "fmin", "fmaxnm", "fminnm",
                                                "fnmul"};

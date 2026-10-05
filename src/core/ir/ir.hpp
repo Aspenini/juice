@@ -71,6 +71,7 @@ enum class Opcode : uint8_t {
   VReduce,         // fold all lanes of a into a scalar; aux high nibble = VecReduce
   VCnt,            // population count of each byte
   VRev,            // reverse lanes within containers of (aux high nibble) bytes
+  VLane,           // imm = VecOp: the lane operation; aux and arguments as VecOp describes
 
   // --- Scalar floating point: values hold IEEE bits; size = 4 (single) or 8 (double) ---
   FAdd, FSub, FMul, FDiv,
@@ -96,6 +97,48 @@ enum class VecPred : uint8_t { Eq, Gt, Ge, Hi, Hs, Tst };  // Gt/Ge signed, Hi/H
 
 // Reduction kinds for VReduce.
 enum class VecReduce : uint8_t { Add, UMax, UMin, SMax, SMin, UAddLong, SAddLong };
+
+// Lane operations of VLane, on 64-bit vector halves. Unless noted, the low
+// nibble of aux is the element size in bytes and bit 4 means signed.
+enum class VecOp : uint8_t {
+  // --- integer: a, b lanes -> lanes ---
+  SatAdd, SatSub,        // saturating
+  Abd,                   // absolute difference
+  HAdd, RHAdd, HSub,     // halving (RHAdd rounds)
+  ShlReg,                // shift each lane of a by the signed low byte of b's lane (negative: right)
+  RShlReg,               // the same, rounding right shifts
+  SatShlReg,             // the same, saturating left shifts
+  SatRShlReg,            // rounding right shifts, saturating left shifts
+  RShr,                  // rounding right shift by b (1..bits)
+  SatShlImm,             // saturating left shift by b; aux bits 4-5: 0 signed, 1 unsigned, 2 signed to unsigned
+  SatNarrow,             // a = lanes of twice the element size -> narrowed lanes in the low 32 bits;
+                         //   aux bits 4-5 as SatShlImm (the element size is the narrow one)
+  AddLongPairwise,       // pairs of lanes -> lanes of twice the size
+  PMul,                  // polynomial (carry-less) multiply of bytes, low 8 bits
+  PMulLong,              // bytes of the low (aux bit 5 clear) or high 32 bits of a, b -> 16-bit products
+  SatDMulHigh,           // signed saturating doubling multiply high; aux bit 5 = rounding
+  TblPart,               // bytes: index b in [8k, 8k+8), k = aux, selects a byte of c; else a's byte
+  Clz, Cls, Rbit,        // per lane (Rbit: bytes)
+  SatAbs, SatNeg,        // signed saturating
+  // --- floating point: element size 4 or 8 (2: half precision, conversions only) ---
+  FAdd, FSub, FMul, FDiv, FMax, FMin, FMaxNm, FMinNm,
+  FAbd,                  // |a - b|
+  FMulX,                 // as FMul, but 0 * inf = 2 with the product's sign
+  FMla, FMls,            // c + a * b, c - a * b (fused)
+  FCmEq, FCmGe, FCmGt,   // lanes become all ones / zero
+  FAcGe, FAcGt,          // compares of absolute values
+  FRecps, FRsqrts,       // 2 - a * b, (3 - a * b) / 2 (fused)
+  FSqrt,
+  FRecpe, FRsqrte,       // Arm's reciprocal (square root) estimates
+  FRint,                 // aux bits 4-6 = FpRound
+  FToInt,                // aux bits 4-6 = FpRound, bit 7 = signed; b = fraction bits (fixed point)
+  IntToF,                // bit 4 = signed; b = fraction bits
+  FCvtUp,                // the low (aux bit 4 clear) or high 32 bits of a, converted to lanes of
+                         //   the element size (from half to single, or single to double)
+  FCvtDown,              // lanes of a and b (twice the element size) -> the element size; a's in
+                         //   the low 32 bits, b's in the high
+  Count_
+};
 
 // Floating point rounding modes for FToInt / FRint.
 enum class FpRound : uint8_t { NearestEven, PlusInf, MinusInf, Zero, NearestAway };

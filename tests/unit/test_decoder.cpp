@@ -164,7 +164,7 @@ TEST(decoder_loads_stores) {
   CHECK_EQ(i.shift, static_cast<uint8_t>(Extend::Sxtw));
   CHECK_EQ(i.amount, 2);
 
-  CHECK(decode(0xd50b7420, 0).op == Op::Unsupported);  // dc zva
+  CHECK(decode(0xd50b7420, 0).op == Op::DcZva);  // dc zva
 }
 
 TEST(decoder_simd_immediates) {

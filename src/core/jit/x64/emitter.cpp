@@ -31,6 +31,7 @@ uint64_t evaluate_helper(uint64_t a, uint64_t b, uint64_t c, uint64_t packed) {
   in.op = static_cast<Opcode>(packed & 0xFF);
   in.size = static_cast<uint8_t>(packed >> 8);
   in.aux = static_cast<uint8_t>(packed >> 16);
+  in.imm = packed >> 32;  // VLane's operation
   return ir::evaluate(in, a, b, c);
 }
 
@@ -185,7 +186,8 @@ class Compiler {
   void call_helper(ValueId v, const Inst& in, uint64_t (*helper)(uint64_t, uint64_t, uint64_t, uint64_t)) {
     for (unsigned k = 0; k < 3; ++k)
       if (in.args[k] != ir::kNoValue) get(kCallArgs[k], in.args[k]);
-    a_.mov_imm(kCallArgs[3], static_cast<uint64_t>(in.op) | (uint64_t{in.size} << 8) | (uint64_t{in.aux} << 16));
+    a_.mov_imm(kCallArgs[3], static_cast<uint64_t>(in.op) | (uint64_t{in.size} << 8) | (uint64_t{in.aux} << 16) |
+                                 ((in.imm & 0xFFFF'FFFFu) << 32));
     a_.mov_imm(RAX, reinterpret_cast<uint64_t>(helper));
     a_.call(RAX);
     put(v, RAX);

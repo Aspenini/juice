@@ -296,3 +296,59 @@ TEST(jit_terminators) {
     }
   }
 }
+
+namespace {
+
+uint64_t lane(ir::VecOp op, unsigned aux, uint64_t a, uint64_t b = 0, uint64_t c = 0) {
+  ir::Inst in;
+  in.op = Opcode::VLane;
+  in.size = 8;
+  in.imm = static_cast<uint64_t>(op);
+  in.aux = static_cast<uint8_t>(aux);
+  return ir::evaluate(in, a, b, c);
+}
+
+}  // namespace
+
+TEST(vlane_semantics) {
+  using ir::VecOp;
+  // Arm's 8-bit estimates (values as the hardware returns them)
+  CHECK_EQ(lane(VecOp::FRecpe, 4, 0x400000003F800000ull), 0x3EFF80003F7F8000ull);  // 1/2, 1/1
+  CHECK_EQ(lane(VecOp::FRsqrte, 4, 0x408000003F800000ull), 0x3EFF80003F7F8000ull); // 1/sqrt(4), 1/sqrt(1)
+  CHECK_EQ(lane(VecOp::FRecps, 4, 0x40000000ull, 0x3F000000ull), 0x400000003F800000ull);  // 2 - 2 * 0.5, 2 - 0 * 0
+  // saturation
+  CHECK_EQ(lane(VecOp::SatAdd, 1 | 16, 0x7F, 0x01), 0x7Full);
+  CHECK_EQ(lane(VecOp::SatSub, 1, 0x05, 0x09), 0x00ull);
+  CHECK_EQ(lane(VecOp::SatNarrow, 1, 0xFF00'0100ull), 0x807Full);  // s16 -> s8: 256 -> 127, -256 -> -128
+  CHECK_EQ(lane(VecOp::SatNarrow, 1 | 32, 0xFF00'0100ull), 0x00FFull);  // s16 -> u8
+  CHECK_EQ(lane(VecOp::SatDMulHigh, 2 | 16 | 32, 0x4000, 0x4000), 0x2000ull);
+  CHECK_EQ(lane(VecOp::SatDMulHigh, 2 | 16, 0x8000, 0x8000), 0x7FFFull);
+  // shifts
+  CHECK_EQ(lane(VecOp::RShr, 1, 0x03, 1), 0x02ull);
+  CHECK_EQ(lane(VecOp::ShlReg, 1 | 16, 0xFD, 0xFF), 0xFEull);  // -3 >> 1 (arithmetic)
+  CHECK_EQ(lane(VecOp::RShlReg, 1, 0x03, 0xFF), 0x02ull);
+  CHECK_EQ(lane(VecOp::SatShlImm, 1, 0x40, 1), 0x7Full);        // signed: 64 << 1 saturates
+  CHECK_EQ(lane(VecOp::SatShlImm, 1 | 16, 0x40, 1), 0x80ull);    // unsigned: fits
+  // bytes
+  CHECK_EQ(lane(VecOp::PMul, 1, 0x03, 0x03), 0x05ull);
+  CHECK_EQ(lane(VecOp::TblPart, 0, 0, 0xFFFFFFFFFFFF0901ull, 0x0807060504030201ull), 0x02ull);  // 9, 0xFF: out of range
+  CHECK_EQ(lane(VecOp::AddLongPairwise, 1, 0xFFFF), 0x1FEull);
+  // conversions
+  CHECK_EQ(lane(VecOp::FCvtUp, 4, 0x3C00), 0x3F800000ull);       // half 1.0 -> single
+  CHECK_EQ(lane(VecOp::FCvtDown, 2, 0x3FC00000ull, 0), 0x3E00ull);  // single 1.5 -> half
+  CHECK_EQ(lane(VecOp::FToInt, 4 | (3 << 4) | 128, 0x3FA00000ull, 2), 5ull);  // 1.25 * 4
+  CHECK_EQ(lane(VecOp::IntToF, 4 | 16, 5, 2), 0x3FA00000ull);  // 5 / 4
+}
+
+TEST(jit_matches_interpreter_for_vlane) {
+  std::mt19937_64 rng(4321);
+  for (unsigned op = 0; op < static_cast<unsigned>(ir::VecOp::Count_); ++op) {
+    for (unsigned aux : {1u, 2u | 16u, 4u, 8u | 16u, 4u | (3u << 4) | 128u}) {
+      ir::Block block;
+      ir::Builder b(block);
+      b.set(10, b.emit(Opcode::VLane, 8, b.get(0), b.get(1), b.get(2), op, static_cast<uint8_t>(aux)));
+      b.jump(0);
+      compare_backends(std::format("v.lane.{}/{}", op, aux).c_str(), block, rng, 50);
+    }
+  }
+}

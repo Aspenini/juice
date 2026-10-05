@@ -161,6 +161,9 @@ class Optimizer {
         case Opcode::LoadToState:
           for (unsigned s = 0; s < state_slots(in); ++s) known[in.imm + s] = kNoValue;
           break;
+        case Opcode::AtomicCasPair:  // writes guest state through a StateAddr pointer
+          std::fill(known.begin(), known.end(), kNoValue);
+          break;
         case Opcode::Load:
         case Opcode::Store:
         case Opcode::StoreFromState:

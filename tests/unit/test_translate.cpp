@@ -596,6 +596,52 @@ TEST(translate_atomics) {
   CHECK_EQ(cell[0], 0x120000AAAAull);
 }
 
+TEST(translate_casp) {
+  alignas(16) static uint64_t pair[2];
+  // caspal x2, x3, x4, x5, [x0]: matches -> stores x4:x5, x2:x3 keep the old value
+  CpuState s = run({0x4862FC04}, [&](CpuState& s) {
+    pair[0] = 10;
+    pair[1] = 20;
+    s.x[0] = reinterpret_cast<uint64_t>(pair);
+    s.x[2] = 10;
+    s.x[3] = 20;
+    s.x[4] = 111;
+    s.x[5] = 222;
+  });
+  CHECK_EQ(pair[0], 111u);
+  CHECK_EQ(pair[1], 222u);
+  CHECK_EQ(s.x[2], 10u);
+  CHECK_EQ(s.x[3], 20u);
+  // no match: memory unchanged, x2:x3 receive its value
+  s = run({0x4862FC04}, [&](CpuState& s) {
+    s.x[0] = reinterpret_cast<uint64_t>(pair);
+    s.x[2] = 1;
+    s.x[3] = 2;
+    s.x[4] = 3;
+    s.x[5] = 4;
+  });
+  CHECK_EQ(pair[0], 111u);
+  CHECK_EQ(pair[1], 222u);
+  CHECK_EQ(s.x[2], 111u);
+  CHECK_EQ(s.x[3], 222u);
+
+  alignas(8) static uint32_t words[2];
+  // casp w6, w7, w8, w9, [x1]
+  s = run({0x08267C28}, [&](CpuState& s) {
+    words[0] = 0x11;
+    words[1] = 0x22;
+    s.x[1] = reinterpret_cast<uint64_t>(words);
+    s.x[6] = 0x11;
+    s.x[7] = 0x22;
+    s.x[8] = 0x33;
+    s.x[9] = 0x44;
+  });
+  CHECK_EQ(words[0], 0x33u);
+  CHECK_EQ(words[1], 0x44u);
+  CHECK_EQ(s.x[6], 0x11u);
+  CHECK_EQ(s.x[7], 0x22u);
+}
+
 TEST(translate_system_registers) {
   // msr nzcv, x1; mrs x0, nzcv; msr tpidr_el0, x2; mrs x3, tpidr_el0
   CpuState s = run({0xd51b4201, 0xd53b4200, 0xd51bd042, 0xd53bd043}, [](CpuState& s) {

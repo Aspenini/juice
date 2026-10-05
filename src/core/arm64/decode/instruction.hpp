@@ -46,9 +46,11 @@ enum class Op : uint16_t {
   Ldr, Str,        // single register (integer or SIMD&FP)
   Ldp, Stp,        // register pair
   Prfm,            // prefetch (no-op)
+  DcZva,           // DC ZVA Xt: zero the 64-byte block containing Xt
   Ldxr, Stxr,      // exclusive (also acquire/release forms)
   Ldxp, Stxp,
   Cas,
+  Casp,            // CASP: rm = Rs (even), rd = Rt (even); sf = 64-bit registers
   Swp,
   Ldadd, Ldclr, Ldeor, Ldset, Ldsmax, Ldsmin, Ldumax, Ldumin,
 
@@ -88,6 +90,18 @@ enum class Op : uint16_t {
   VecUzp, VecZip, VecTrn,  // index = 1 for the "2" forms
   VecExt,              // imm = byte position
   VecBsl, VecBit, VecBif,
+  VecIntOp,            // three same, integer: shift = VecInt
+  VecFpOp,             // three same, floating point (and FP pairwise): shift = VecFp, esize 4/8
+  VecIntUnary,         // two-register misc, integer: shift = VecIntUn, amount = narrowing mode
+  VecFpUnary,          // two-register misc, floating point: shift = VecFpUn, amount = rounding / compare
+  VecLong,             // three different: shift = VecLongKind, esize = narrow size, index = "2" form
+  VecShiftOp,          // shift by immediate: shift = VecShiftKind, imm = amount / fraction bits,
+                       //   amount = narrowing mode (bit 2: rounding)
+  VecElemOp,           // by element: shift = VecElemKind, index2 = element index
+  VecTbl,              // TBL / TBX: amount = table registers, index = 1 for TBX
+  VecFpAcross,         // FMAXV / FMINV / FMAXNMV / FMINNMV: shift = VecFp
+  FpFixedToFp,         // SCVTF / UCVTF (fixed point, from Wn/Xn): imm = fraction bits
+  FpToFixed,           // FCVTZS / FCVTZU (fixed point, to Wd/Xd): imm = fraction bits
 
   // Scalar floating point (mem_size = 4 single / 8 double)
   FpBinary,            // shift = FpBinaryOp
@@ -106,6 +120,24 @@ enum class Op : uint16_t {
 };
 
 enum class VecZeroCmp : uint8_t { Gt, Ge, Eq, Le, Lt };
+enum class VecInt : uint8_t {
+  SatAdd, SatSub, Abd, Aba, HAdd, RHAdd, HSub, ShlReg, SatShlReg, RShlReg, SatRShlReg, Mla, Mls, PMul, SqDMulH,
+  SqRDMulH
+};
+enum class VecFp : uint8_t {
+  Add, Sub, Mul, Div, Max, Min, MaxNm, MinNm, Abd, MulX, Mla, Mls, CmEq, CmGe, CmGt, AcGe, AcGt, Recps, Rsqrts,
+  AddP, MaxP, MinP, MaxNmP, MinNmP
+};
+enum class VecIntUn : uint8_t { Clz, Cls, Rbit, AddLP, AdaLP, SatAbs, SatNeg, SatXtn, Shll };
+enum class VecFpUn : uint8_t { Abs, Neg, Sqrt, Rint, ToInt, FromInt, CmpZero, Recpe, Rsqrte, CvtLong, CvtNarrow };
+enum class VecLongKind : uint8_t {
+  AddL, AddW, SubL, SubW, AddHN, RAddHN, SubHN, RSubHN, AbaL, AbdL, MlaL, MlsL, MulL, PMulL, SqDMulL, SqDMlaL,
+  SqDMlsL
+};
+enum class VecShiftKind : uint8_t { Sra, RShr, RSra, Sri, Sli, SatShl, Rshrn, SatShrn, FixedToFp, FpToFixed };
+enum class VecElemKind : uint8_t {
+  Mul, Mla, Mls, MulL, MlaL, MlsL, FMul, FMla, FMls, FMulX, SqDMulH, SqRDMulH, SqDMulL, SqDMlaL, SqDMlsL
+};
 enum class FpBinaryOp : uint8_t { Mul, Div, Add, Sub, Max, Min, MaxNm, MinNm, NMul };
 enum class FpUnaryOp : uint8_t { Abs = 1, Neg = 2, Sqrt = 3 };
 
@@ -171,6 +203,7 @@ struct Instruction {
 
   // SIMD
   bool q = false;           // 128-bit vector
+  bool scalar = false;      // AdvSIMD scalar form: one element in the low lane, the rest zeroed
   uint8_t esize = 0;        // element size in bytes
   uint8_t index = 0;        // element index (destination for INS)
   uint8_t index2 = 0;       // source element index

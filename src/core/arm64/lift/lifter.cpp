@@ -1,5 +1,7 @@
 #include "core/arm64/lift/lifter.hpp"
 
+#include <bit>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 
@@ -55,6 +57,7 @@ class Lifter {
   void lift_simd_memory(const Instruction& i);
   void lift_vector(const Instruction& i);
   void lift_fp(const Instruction& i);
+  void lift_vector_ext(const Instruction& i);
 
   // Vector helpers: lane ops on 64-bit halves (see ir::Opcode::VAdd and friends).
   V vop(Opcode o, V a, V b, unsigned esize, unsigned high = 0) {
@@ -224,6 +227,27 @@ void Lifter::lift_atomic(const Instruction& i) {
   const uint8_t sz = i.mem_size;
   const V addr = xsp(i.rn);
   const V operand = x(i.rm);
+  if (i.op == Op::Casp) {
+    // Compare the pair Rs:Rs+1 with memory and store Rt:Rt+1 if equal; Rs:Rs+1
+    // receive the old value either way.
+    if (i.sf) {  // 128-bit: CMPXCHG16B on {expected, desired} staged in guest state
+      b_.set(slot::ExclValue, x(i.rm));
+      b_.set(slot::ExclValueHi, x(i.rm + 1));
+      b_.set(slot::ExclNew, x(i.rd));
+      b_.set(slot::ExclNewHi, x(i.rd + 1));
+      V operands = b_.emit(Opcode::StateAddr, 8, ir::kNoValue, ir::kNoValue, ir::kNoValue, slot::ExclValue);
+      b_.emit(Opcode::AtomicCasPair, 8, addr, operands);
+      V old_lo = b_.get(slot::ExclValue), old_hi = b_.get(slot::ExclValueHi);
+      set_x(i.rm, old_lo);
+      set_x(i.rm + 1, old_hi);
+    } else {  // two 32-bit registers: one 64-bit compare-and-swap
+      auto pack = [&](unsigned r) { return b_.or_(b_.zext(x(r), 32), b_.shl(x(r + 1), c(32))); };
+      V old = b_.emit(Opcode::AtomicCas, 8, addr, pack(i.rm), pack(i.rd));
+      set_x(i.rm, b_.zext(old, 32));
+      set_x(i.rm + 1, b_.lshr(old, c(32)));
+    }
+    return;
+  }
   if (i.op == Op::Cas) {
     V expected = sz < 8 ? b_.zext(operand, static_cast<uint8_t>(sz * 8)) : operand;
     set_x(i.rm, b_.emit(Opcode::AtomicCas, sz, addr, expected, x(i.rd)));
@@ -306,7 +330,7 @@ bool Lifter::lift_mrs(const Instruction& i) {
     case sysreg::FPSR: v = b_.get(slot::FPSR); break;
     case sysreg::TPIDR_EL0: v = b_.get(slot::TPIDR_EL0); break;
     case sysreg::TPIDRRO_EL0: v = b_.get(slot::TPIDRRO_EL0); break;
-    case sysreg::DCZID_EL0: v = c(0x10); break;          // DZP: DC ZVA prohibited
+    case sysreg::DCZID_EL0: v = c(4); break;             // DC ZVA allowed, 2^4 words = 64-byte blocks
     case sysreg::CTR_EL0: v = c(0x8444C004); break;      // 64-byte cache lines
     case sysreg::MIDR_EL1: v = c(0x410FD0C0); break;     // generic Arm Cortex
     case sysreg::CurrentEL: v = c(0); break;             // user mode (EL0)
@@ -770,6 +794,445 @@ void Lifter::lift_fp(const Instruction& i) {
   }
 }
 
+// The Advanced SIMD groups built on VLane (integer saturating/halving/rounding
+// operations, floating point vectors, widening and narrowing, by element,
+// table lookups) and the fixed-point conversions.
+void Lifter::lift_vector_ext(const Instruction& i) {
+  static constexpr uint64_t kReplicate[9] = {0, 0x0101010101010101ull, 0x0001000100010001ull, 0,
+                                             0x0000000100000001ull, 0, 0, 0, 1};
+  const unsigned e = i.esize;
+  const bool q = i.q && !i.scalar;
+  const unsigned sign = i.mem_signed ? 1 : 0;
+  using ir::VecOp;
+  const V none = ir::kNoValue;
+  auto lane = [&](VecOp o, V a, V b = ir::kNoValue, V cc = ir::kNoValue, unsigned aux = 0) {
+    return b_.emit(Opcode::VLane, 8, a, b, cc, static_cast<uint64_t>(o), static_cast<uint8_t>(aux));
+  };
+  auto half = [&](unsigned reg, unsigned h) { return h ? vhi(reg) : vlo(reg); };
+  auto rep = [&](uint64_t lane_value, unsigned esize) {  // a constant in every lane
+    return c(esize == 8 ? lane_value : (lane_value & low_mask(esize * 8)) * kReplicate[esize]);
+  };
+  // Write the result halves (computed from both halves before writing: rd may alias the sources).
+  auto write = [&](auto f) {
+    if (i.scalar) {
+      V r = f(0u);
+      if (e < 8) r = b_.and_(r, c(low_mask(e * 8)));
+      set_v(i.rd, r, c(0));
+      return;
+    }
+    V lo = f(0u);
+    V hi = q ? f(1u) : c(0);
+    set_v(i.rd, lo, hi);
+  };
+  // Narrow results (64 bits from both source halves) go to the low half, or
+  // the high half for the "2" forms (keeping the low one).
+  auto write_narrow = [&](V narrow) {
+    if (i.scalar) {
+      set_v(i.rd, b_.and_(narrow, c(low_mask(e * 8))), c(0));
+    } else if (i.index) {
+      b_.set(slot::VHi(i.rd), narrow);
+    } else {
+      set_v(i.rd, narrow, c(0));
+    }
+  };
+  auto join32 = [&](V lo, V hi) {  // two 32-bit results into one half
+    return b_.or_(b_.and_(lo, c(0xFFFF'FFFFu)), b_.shl(hi, c(32)));
+  };
+  auto widen = [&](V src, unsigned part, unsigned esize, unsigned s) {
+    return vop(Opcode::VWiden, src, ir::kNoValue, esize, s | (part << 1));
+  };
+  // The element `index` of register `reg`, replicated across a half.
+  auto element = [&](unsigned reg, unsigned index, unsigned esize) {
+    V v = vector_element(reg, index, esize);
+    if (esize < 8) v = b_.and_(v, c(low_mask(esize * 8)));
+    return esize == 8 ? v : b_.binary(Opcode::Mul, v, c(kReplicate[esize]), 8);
+  };
+
+  switch (i.op) {
+    case Op::VecIntOp: {
+      const auto k = static_cast<VecInt>(i.shift);
+      const unsigned aux = e | (sign << 4);
+      switch (k) {
+        case VecInt::SatAdd: write([&](unsigned h) { return lane(VecOp::SatAdd, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::SatSub: write([&](unsigned h) { return lane(VecOp::SatSub, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::Abd: write([&](unsigned h) { return lane(VecOp::Abd, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::Aba:
+          write([&](unsigned h) {
+            return vop(Opcode::VAdd, half(i.rd, h), lane(VecOp::Abd, half(i.rn, h), half(i.rm, h), none, aux), e);
+          });
+          break;
+        case VecInt::HAdd: write([&](unsigned h) { return lane(VecOp::HAdd, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::RHAdd: write([&](unsigned h) { return lane(VecOp::RHAdd, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::HSub: write([&](unsigned h) { return lane(VecOp::HSub, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::ShlReg: write([&](unsigned h) { return lane(VecOp::ShlReg, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::SatShlReg: write([&](unsigned h) { return lane(VecOp::SatShlReg, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::RShlReg: write([&](unsigned h) { return lane(VecOp::RShlReg, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::SatRShlReg: write([&](unsigned h) { return lane(VecOp::SatRShlReg, half(i.rn, h), half(i.rm, h), none, aux); }); break;
+        case VecInt::Mla:
+          write([&](unsigned h) { return vop(Opcode::VAdd, half(i.rd, h), vop(Opcode::VMul, half(i.rn, h), half(i.rm, h), e), e); });
+          break;
+        case VecInt::Mls:
+          write([&](unsigned h) { return vop(Opcode::VSub, half(i.rd, h), vop(Opcode::VMul, half(i.rn, h), half(i.rm, h), e), e); });
+          break;
+        case VecInt::PMul: write([&](unsigned h) { return lane(VecOp::PMul, half(i.rn, h), half(i.rm, h), none, 1); }); break;
+        case VecInt::SqDMulH:
+        case VecInt::SqRDMulH: {
+          const unsigned a = e | (1u << 4) | (k == VecInt::SqRDMulH ? 1u << 5 : 0u);
+          write([&](unsigned h) { return lane(VecOp::SatDMulHigh, half(i.rn, h), half(i.rm, h), none, a); });
+          break;
+        }
+      }
+      break;
+    }
+
+    case Op::VecFpOp: {
+      const auto k = static_cast<VecFp>(i.shift);
+      static constexpr VecOp kOps[] = {VecOp::FAdd,  VecOp::FSub,  VecOp::FMul,  VecOp::FDiv,   VecOp::FMax,  VecOp::FMin,
+                                       VecOp::FMaxNm, VecOp::FMinNm, VecOp::FAbd, VecOp::FMulX, VecOp::FMla, VecOp::FMls,
+                                       VecOp::FCmEq, VecOp::FCmGe, VecOp::FCmGt, VecOp::FAcGe, VecOp::FAcGt,
+                                       VecOp::FRecps, VecOp::FRsqrts};
+      if (k >= VecFp::AddP) {  // pairwise: adjacent lanes of Vm:Vn (scalar: of Vn's two lanes)
+        static constexpr VecOp kPair[] = {VecOp::FAdd, VecOp::FMax, VecOp::FMin, VecOp::FMaxNm, VecOp::FMinNm};
+        const VecOp o = kPair[static_cast<unsigned>(k) - static_cast<unsigned>(VecFp::AddP)];
+        if (i.scalar) {
+          V r = e == 8 ? lane(o, vlo(i.rn), vhi(i.rn), none, e) : lane(o, vlo(i.rn), b_.lshr(vlo(i.rn), c(32)), none, e);
+          set_v(i.rd, e == 8 ? r : b_.and_(r, c(0xFFFF'FFFFu)), c(0));
+          break;
+        }
+        V nlo = vlo(i.rn), mlo = vlo(i.rm);
+        if (q) {
+          V nhi = vhi(i.rn), mhi = vhi(i.rm);
+          V lo = lane(o, vop(Opcode::VUnzip, nlo, nhi, e, 0), vop(Opcode::VUnzip, nlo, nhi, e, 1), none, e);
+          V hi = lane(o, vop(Opcode::VUnzip, mlo, mhi, e, 0), vop(Opcode::VUnzip, mlo, mhi, e, 1), none, e);
+          set_v(i.rd, lo, hi);
+        } else {
+          set_v(i.rd, lane(o, vop(Opcode::VUnzip, nlo, mlo, e, 0), vop(Opcode::VUnzip, nlo, mlo, e, 1), none, e), c(0));
+        }
+        break;
+      }
+      const VecOp o = kOps[static_cast<unsigned>(k)];
+      if (o == VecOp::FMla || o == VecOp::FMls) {
+        write([&](unsigned h) { return lane(o, half(i.rn, h), half(i.rm, h), half(i.rd, h), e); });
+      } else {
+        write([&](unsigned h) { return lane(o, half(i.rn, h), half(i.rm, h), none, e); });
+      }
+      break;
+    }
+
+    case Op::VecFpAcross: {  // 4 single lanes: op(op(l0, l1), op(l2, l3))
+      static constexpr VecOp kOps[] = {VecOp::FAdd, VecOp::FSub, VecOp::FMul, VecOp::FDiv, VecOp::FMax, VecOp::FMin,
+                                       VecOp::FMaxNm, VecOp::FMinNm};
+      const VecOp o = kOps[i.shift];
+      V lo = vlo(i.rn), hi = vhi(i.rn);
+      V a = lane(o, lo, b_.lshr(lo, c(32)), none, 4);
+      V b = lane(o, hi, b_.lshr(hi, c(32)), none, 4);
+      set_v(i.rd, b_.and_(lane(o, a, b, none, 4), c(0xFFFF'FFFFu)), c(0));
+      break;
+    }
+
+    case Op::VecIntUnary: {
+      const auto k = static_cast<VecIntUn>(i.shift);
+      const unsigned aux = e | (sign << 4);
+      switch (k) {
+        case VecIntUn::Clz: write([&](unsigned h) { return lane(VecOp::Clz, half(i.rn, h), none, none, e); }); break;
+        case VecIntUn::Cls: write([&](unsigned h) { return lane(VecOp::Cls, half(i.rn, h), none, none, e); }); break;
+        case VecIntUn::Rbit: write([&](unsigned h) { return lane(VecOp::Rbit, half(i.rn, h), none, none, 1); }); break;
+        case VecIntUn::SatAbs: write([&](unsigned h) { return lane(VecOp::SatAbs, half(i.rn, h), none, none, aux); }); break;
+        case VecIntUn::SatNeg: write([&](unsigned h) { return lane(VecOp::SatNeg, half(i.rn, h), none, none, aux); }); break;
+        case VecIntUn::AddLP: write([&](unsigned h) { return lane(VecOp::AddLongPairwise, half(i.rn, h), none, none, aux); }); break;
+        case VecIntUn::AdaLP:
+          write([&](unsigned h) {
+            return vop(Opcode::VAdd, half(i.rd, h), lane(VecOp::AddLongPairwise, half(i.rn, h), none, none, aux), e * 2);
+          });
+          break;
+        case VecIntUn::SatXtn: {  // esize = narrow size; amount = mode
+          const unsigned a = e | (static_cast<unsigned>(i.amount) << 4);
+          if (i.scalar) {
+            write_narrow(lane(VecOp::SatNarrow, vlo(i.rn), none, none, a));
+          } else {
+            write_narrow(join32(lane(VecOp::SatNarrow, vlo(i.rn), none, none, a), lane(VecOp::SatNarrow, vhi(i.rn), none, none, a)));
+          }
+          break;
+        }
+        case VecIntUn::Shll: {  // SHLL: widen and shift by the element size
+          V src = i.index ? vhi(i.rn) : vlo(i.rn);
+          V lo = vop(Opcode::VShl, widen(src, 0, e, 0), c(e * 8), e * 2);
+          V hi = vop(Opcode::VShl, widen(src, 1, e, 0), c(e * 8), e * 2);
+          set_v(i.rd, lo, hi);
+          break;
+        }
+      }
+      break;
+    }
+
+    case Op::VecFpUnary: {
+      const auto k = static_cast<VecFpUn>(i.shift);
+      const uint64_t sign_bits = e == 8 ? 1ull << 63 : (1ull << (e * 8 - 1)) * kReplicate[e];
+      switch (k) {
+        case VecFpUn::Abs: write([&](unsigned h) { return b_.and_(half(i.rn, h), b_.not_(c(sign_bits))); }); break;
+        case VecFpUn::Neg: write([&](unsigned h) { return b_.xor_(half(i.rn, h), c(sign_bits)); }); break;
+        case VecFpUn::Sqrt: write([&](unsigned h) { return lane(VecOp::FSqrt, half(i.rn, h), none, none, e); }); break;
+        case VecFpUn::Recpe: write([&](unsigned h) { return lane(VecOp::FRecpe, half(i.rn, h), none, none, e); }); break;
+        case VecFpUn::Rsqrte: write([&](unsigned h) { return lane(VecOp::FRsqrte, half(i.rn, h), none, none, e); }); break;
+        case VecFpUn::Rint:
+          write([&](unsigned h) { return lane(VecOp::FRint, half(i.rn, h), none, none, e | (i.amount << 4)); });
+          break;
+        case VecFpUn::ToInt:
+          write([&](unsigned h) { return lane(VecOp::FToInt, half(i.rn, h), c(0), none, e | (i.amount << 4) | (sign << 7)); });
+          break;
+        case VecFpUn::FromInt:
+          write([&](unsigned h) { return lane(VecOp::IntToF, half(i.rn, h), c(0), none, e | (sign << 4)); });
+          break;
+        case VecFpUn::CmpZero: {
+          const auto z = static_cast<VecZeroCmp>(i.amount);
+          write([&](unsigned h) {
+            V n = half(i.rn, h), zero = c(0);
+            switch (z) {
+              case VecZeroCmp::Gt: return lane(VecOp::FCmGt, n, zero, none, e);
+              case VecZeroCmp::Ge: return lane(VecOp::FCmGe, n, zero, none, e);
+              case VecZeroCmp::Eq: return lane(VecOp::FCmEq, n, zero, none, e);
+              case VecZeroCmp::Le: return lane(VecOp::FCmGe, zero, n, none, e);
+              default: return lane(VecOp::FCmGt, zero, n, none, e);
+            }
+          });
+          break;
+        }
+        case VecFpUn::CvtLong: {  // esize = destination size
+          V src = i.index ? vhi(i.rn) : vlo(i.rn);
+          set_v(i.rd, lane(VecOp::FCvtUp, src, none, none, e), lane(VecOp::FCvtUp, src, none, none, e | 16));
+          break;
+        }
+        case VecFpUn::CvtNarrow:  // esize = destination size
+          write_narrow(lane(VecOp::FCvtDown, vlo(i.rn), vhi(i.rn), none, e));
+          break;
+      }
+      break;
+    }
+
+    case Op::VecLong: {  // esize = narrow size; wide lanes are 2e
+      const auto k = static_cast<VecLongKind>(i.shift);
+      const unsigned w2 = e * 2;
+      V n_src = i.index ? vhi(i.rn) : vlo(i.rn);
+      V m_src = i.index ? vhi(i.rm) : vlo(i.rm);
+      auto wn = [&](unsigned p) { return widen(n_src, p, e, sign); };
+      auto wm = [&](unsigned p) { return widen(m_src, p, e, sign); };
+      auto both = [&](auto f) {
+        V lo = f(0u), hi = f(1u);
+        set_v(i.rd, lo, hi);
+      };
+      switch (k) {
+        case VecLongKind::AddL: both([&](unsigned p) { return vop(Opcode::VAdd, wn(p), wm(p), w2); }); break;
+        case VecLongKind::SubL: both([&](unsigned p) { return vop(Opcode::VSub, wn(p), wm(p), w2); }); break;
+        case VecLongKind::AddW: both([&](unsigned p) { return vop(Opcode::VAdd, half(i.rn, p), wm(p), w2); }); break;
+        case VecLongKind::SubW: both([&](unsigned p) { return vop(Opcode::VSub, half(i.rn, p), wm(p), w2); }); break;
+        case VecLongKind::AbdL: both([&](unsigned p) { return lane(VecOp::Abd, wn(p), wm(p), none, w2 | (sign << 4)); }); break;
+        case VecLongKind::AbaL:
+          both([&](unsigned p) {
+            return vop(Opcode::VAdd, half(i.rd, p), lane(VecOp::Abd, wn(p), wm(p), none, w2 | (sign << 4)), w2);
+          });
+          break;
+        case VecLongKind::MulL: both([&](unsigned p) { return vop(Opcode::VMul, wn(p), wm(p), w2); }); break;
+        case VecLongKind::MlaL:
+          both([&](unsigned p) { return vop(Opcode::VAdd, half(i.rd, p), vop(Opcode::VMul, wn(p), wm(p), w2), w2); });
+          break;
+        case VecLongKind::MlsL:
+          both([&](unsigned p) { return vop(Opcode::VSub, half(i.rd, p), vop(Opcode::VMul, wn(p), wm(p), w2), w2); });
+          break;
+        case VecLongKind::PMulL:
+          both([&](unsigned p) { return lane(VecOp::PMulLong, n_src, m_src, none, 1 | (p << 5)); });
+          break;
+        case VecLongKind::SqDMulL:
+        case VecLongKind::SqDMlaL:
+        case VecLongKind::SqDMlsL: {
+          const unsigned a = w2 | (1u << 4);
+          both([&](unsigned p) {
+            V prod = vop(Opcode::VMul, widen(n_src, p, e, 1), widen(m_src, p, e, 1), w2);
+            V doubled = lane(VecOp::SatAdd, prod, prod, none, a);
+            if (k == VecLongKind::SqDMulL) return doubled;
+            return lane(k == VecLongKind::SqDMlaL ? VecOp::SatAdd : VecOp::SatSub, half(i.rd, p), doubled, none, a);
+          });
+          break;
+        }
+        case VecLongKind::AddHN:
+        case VecLongKind::RAddHN:
+        case VecLongKind::SubHN:
+        case VecLongKind::RSubHN: {  // here e is the narrow (destination) size
+          const bool sub = k == VecLongKind::SubHN || k == VecLongKind::RSubHN;
+          const bool round = k == VecLongKind::RAddHN || k == VecLongKind::RSubHN;
+          V sums[2];
+          for (unsigned p = 0; p < 2; ++p) {
+            V s = vop(sub ? Opcode::VSub : Opcode::VAdd, half(i.rn, p), half(i.rm, p), w2);
+            if (round) s = vop(Opcode::VAdd, s, rep(1ull << (e * 8 - 1), w2), w2);
+            sums[p] = s;
+          }
+          write_narrow(vop(Opcode::VUnzip, sums[0], sums[1], e, 1));
+          break;
+        }
+      }
+      break;
+    }
+
+    case Op::VecShiftOp: {
+      const auto k = static_cast<VecShiftKind>(i.shift);
+      const unsigned n = static_cast<unsigned>(i.imm);
+      const unsigned aux = e | (sign << 4);
+      auto shr = [&](V v) { return vop(i.mem_signed ? Opcode::VAShr : Opcode::VLShr, v, c(n), e); };
+      switch (k) {
+        case VecShiftKind::Sra: write([&](unsigned h) { return vop(Opcode::VAdd, half(i.rd, h), shr(half(i.rn, h)), e); }); break;
+        case VecShiftKind::RShr: write([&](unsigned h) { return lane(VecOp::RShr, half(i.rn, h), c(n), none, aux); }); break;
+        case VecShiftKind::RSra:
+          write([&](unsigned h) { return vop(Opcode::VAdd, half(i.rd, h), lane(VecOp::RShr, half(i.rn, h), c(n), none, aux), e); });
+          break;
+        case VecShiftKind::Sri: {
+          const uint64_t keep = n >= e * 8 ? low_mask(e * 8) : ~(low_mask(e * 8) >> n) & low_mask(e * 8);
+          write([&](unsigned h) {
+            V shifted = vop(Opcode::VLShr, half(i.rn, h), c(n), e);
+            return b_.or_(b_.and_(half(i.rd, h), rep(keep, e)), shifted);
+          });
+          break;
+        }
+        case VecShiftKind::Sli: {
+          const uint64_t keep = low_mask(n);
+          write([&](unsigned h) {
+            V shifted = vop(Opcode::VShl, half(i.rn, h), c(n), e);
+            return b_.or_(b_.and_(half(i.rd, h), rep(keep, e)), shifted);
+          });
+          break;
+        }
+        case VecShiftKind::SatShl:
+          write([&](unsigned h) { return lane(VecOp::SatShlImm, half(i.rn, h), c(n), none, e | (i.amount << 4)); });
+          break;
+        case VecShiftKind::Rshrn: {  // e = destination size
+          V lo = lane(VecOp::RShr, vlo(i.rn), c(n), none, e * 2);
+          V hi = lane(VecOp::RShr, vhi(i.rn), c(n), none, e * 2);
+          write_narrow(vop(Opcode::VUnzip, lo, hi, e, 0));
+          break;
+        }
+        case VecShiftKind::SatShrn: {  // e = destination size; amount: mode | rounding << 2
+          const unsigned mode = i.amount & 3;
+          const bool rounding = i.amount & 4;
+          const bool source_signed = mode != 1;
+          auto narrow_half = [&](V v) {
+            V shifted = rounding ? lane(VecOp::RShr, v, c(n), none, e * 2 | (source_signed ? 16u : 0u))
+                                 : vop(source_signed ? Opcode::VAShr : Opcode::VLShr, v, c(n), e * 2);
+            return lane(VecOp::SatNarrow, shifted, none, none, e | (mode << 4));
+          };
+          if (i.scalar) {
+            write_narrow(narrow_half(vlo(i.rn)));
+          } else {
+            write_narrow(join32(narrow_half(vlo(i.rn)), narrow_half(vhi(i.rn))));
+          }
+          break;
+        }
+        case VecShiftKind::FixedToFp:
+          write([&](unsigned h) { return lane(VecOp::IntToF, half(i.rn, h), c(n), none, aux); });
+          break;
+        case VecShiftKind::FpToFixed: {
+          const unsigned a = e | (static_cast<unsigned>(ir::FpRound::Zero) << 4) | (sign << 7);
+          write([&](unsigned h) { return lane(VecOp::FToInt, half(i.rn, h), c(n), none, a); });
+          break;
+        }
+      }
+      break;
+    }
+
+    case Op::VecElemOp: {
+      const auto k = static_cast<VecElemKind>(i.shift);
+      V el = element(i.rm, i.index2, e);  // read before any write
+      switch (k) {
+        case VecElemKind::Mul: write([&](unsigned h) { return vop(Opcode::VMul, half(i.rn, h), el, e); }); break;
+        case VecElemKind::Mla:
+          write([&](unsigned h) { return vop(Opcode::VAdd, half(i.rd, h), vop(Opcode::VMul, half(i.rn, h), el, e), e); });
+          break;
+        case VecElemKind::Mls:
+          write([&](unsigned h) { return vop(Opcode::VSub, half(i.rd, h), vop(Opcode::VMul, half(i.rn, h), el, e), e); });
+          break;
+        case VecElemKind::FMul: write([&](unsigned h) { return lane(VecOp::FMul, half(i.rn, h), el, none, e); }); break;
+        case VecElemKind::FMulX: write([&](unsigned h) { return lane(VecOp::FMulX, half(i.rn, h), el, none, e); }); break;
+        case VecElemKind::FMla: write([&](unsigned h) { return lane(VecOp::FMla, half(i.rn, h), el, half(i.rd, h), e); }); break;
+        case VecElemKind::FMls: write([&](unsigned h) { return lane(VecOp::FMls, half(i.rn, h), el, half(i.rd, h), e); }); break;
+        case VecElemKind::SqDMulH:
+        case VecElemKind::SqRDMulH: {
+          const unsigned a = e | (1u << 4) | (k == VecElemKind::SqRDMulH ? 1u << 5 : 0u);
+          write([&](unsigned h) { return lane(VecOp::SatDMulHigh, half(i.rn, h), el, none, a); });
+          break;
+        }
+        default: {  // long forms: e = narrow size
+          const unsigned w2 = e * 2;
+          V src = i.index ? vhi(i.rn) : vlo(i.rn);
+          const unsigned s = (k == VecElemKind::SqDMulL || k == VecElemKind::SqDMlaL || k == VecElemKind::SqDMlsL) ? 1 : sign;
+          auto product = [&](unsigned p) { return vop(Opcode::VMul, widen(src, p, e, s), widen(el, p, e, s), w2); };
+          auto compute = [&](unsigned p) -> V {
+            switch (k) {
+              case VecElemKind::MulL: return product(p);
+              case VecElemKind::MlaL: return vop(Opcode::VAdd, half(i.rd, p), product(p), w2);
+              case VecElemKind::MlsL: return vop(Opcode::VSub, half(i.rd, p), product(p), w2);
+              default: {
+                const unsigned a = w2 | (1u << 4);
+                V pr = product(p);
+                V doubled = lane(VecOp::SatAdd, pr, pr, none, a);
+                if (k == VecElemKind::SqDMulL) return doubled;
+                return lane(k == VecElemKind::SqDMlaL ? VecOp::SatAdd : VecOp::SatSub, half(i.rd, p), doubled, none, a);
+              }
+            }
+          };
+          if (i.scalar) {
+            set_v(i.rd, b_.and_(compute(0), c(low_mask(w2 * 8))), c(0));
+          } else {
+            V lo = compute(0), hi = compute(1);
+            set_v(i.rd, lo, hi);
+          }
+          break;
+        }
+      }
+      break;
+    }
+
+    case Op::VecTbl: {
+      const unsigned regs = i.amount;
+      V tables[8];
+      for (unsigned t = 0; t < regs; ++t) {
+        tables[2 * t] = vlo((i.rn + t) % 32);
+        tables[2 * t + 1] = vhi((i.rn + t) % 32);
+      }
+      auto lookup = [&](unsigned h) {
+        V acc = i.index ? half(i.rd, h) : c(0);  // TBX keeps the destination's bytes
+        V idx = half(i.rm, h);
+        for (unsigned part = 0; part < 2 * regs; ++part) acc = lane(VecOp::TblPart, acc, idx, tables[part], part);
+        return acc;
+      };
+      V lo = lookup(0);
+      V hi = i.q ? lookup(1) : c(0);
+      set_v(i.rd, lo, hi);
+      break;
+    }
+
+    case Op::FpFixedToFp: {  // integer register / 2^fbits
+      const uint8_t fs = i.mem_size;
+      const auto aux = static_cast<uint8_t>((i.mem_signed ? 1 : 0) | (i.sf ? 2 : 0));
+      V v = b_.emit(Opcode::IntToF, fs, x(i.rn), ir::kNoValue, ir::kNoValue, 0, aux);
+      const int fbits = static_cast<int>(i.imm);
+      const uint64_t scale = fs == 8 ? std::bit_cast<uint64_t>(std::ldexp(1.0, -fbits))
+                                     : std::bit_cast<uint32_t>(std::ldexp(1.0f, -fbits));
+      set_v(i.rd, b_.emit(Opcode::FMul, fs, v, c(scale)), c(0));
+      break;
+    }
+    case Op::FpToFixed: {  // truncate(value * 2^fbits)
+      const uint8_t fs = i.mem_size;
+      const int fbits = static_cast<int>(i.imm);
+      const uint64_t scale = fs == 8 ? std::bit_cast<uint64_t>(std::ldexp(1.0, fbits))
+                                     : std::bit_cast<uint32_t>(std::ldexp(1.0f, fbits));
+      V scaled = b_.emit(Opcode::FMul, fs, vlo(i.rn), c(scale));
+      const auto aux = static_cast<uint8_t>(static_cast<unsigned>(ir::FpRound::Zero) | (i.mem_signed ? 8 : 0) |
+                                            (fs == 8 ? 16 : 0));
+      set_x(i.rd, b_.emit(Opcode::FToInt, i.sf ? 8 : 4, scaled, ir::kNoValue, ir::kNoValue, 0, aux));
+      break;
+    }
+    default:
+      break;
+  }
+}
+
 bool Lifter::lift(const Instruction& i) {
   const uint8_t s = i.sf ? 8 : 4;
   const uint64_t next = i.pc + 4;
@@ -885,6 +1348,11 @@ bool Lifter::lift(const Instruction& i) {
     case Op::Hlt:
       b_.exit(static_cast<uint32_t>(ExitReason::Hlt), static_cast<uint32_t>(imm), i.pc);
       return true;
+    case Op::DcZva: {
+      V base = b_.and_(x(i.rd), c(~uint64_t{63}));
+      for (unsigned k = 0; k < 64; k += 8) b_.store(k ? b_.add(base, c(k)) : base, c(0), 8);
+      return false;
+    }
     case Op::Nop:
     case Op::Clrex:
     case Op::Prfm:
@@ -1039,7 +1507,7 @@ bool Lifter::lift(const Instruction& i) {
     case Op::Stxp:
       lift_exclusive(i);
       return false;
-    case Op::Cas: case Op::Swp: case Op::Ldadd: case Op::Ldclr: case Op::Ldeor: case Op::Ldset:
+    case Op::Cas: case Op::Casp: case Op::Swp: case Op::Ldadd: case Op::Ldclr: case Op::Ldeor: case Op::Ldset:
     case Op::Ldsmax: case Op::Ldsmin: case Op::Ldumax: case Op::Ldumin:
       lift_atomic(i);
       return false;
@@ -1062,6 +1530,12 @@ bool Lifter::lift(const Instruction& i) {
     case Op::VecNot: case Op::VecNeg: case Op::VecAbs: case Op::VecRev: case Op::VecUzp: case Op::VecZip:
     case Op::VecTrn: case Op::VecExt: case Op::VecBsl: case Op::VecBit: case Op::VecBif:
       lift_vector(i);
+      return false;
+
+    case Op::VecIntOp: case Op::VecFpOp: case Op::VecIntUnary: case Op::VecFpUnary: case Op::VecLong:
+    case Op::VecShiftOp: case Op::VecElemOp: case Op::VecTbl: case Op::VecFpAcross: case Op::FpFixedToFp:
+    case Op::FpToFixed:
+      lift_vector_ext(i);
       return false;
 
     case Op::FpBinary: case Op::FpUnary: case Op::FpCvt: case Op::FpRint: case Op::FpFma: case Op::FpCmp:

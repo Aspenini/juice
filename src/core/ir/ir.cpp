@@ -162,6 +162,7 @@ unsigned arg_count(Opcode op) {
     case Opcode::FRint:
       return 1;
     case Opcode::FMadd:
+    case Opcode::VLane:
     case Opcode::AtomicCas:
     case Opcode::Select:
     case Opcode::Adc:
@@ -236,6 +237,7 @@ const char* opcode_name(Opcode op) {
     case Opcode::VReduce: return "v.reduce";
     case Opcode::VCnt: return "v.cnt";
     case Opcode::VRev: return "v.rev";
+    case Opcode::VLane: return "v.lane";
     case Opcode::FAdd: return "f.add";
     case Opcode::FSub: return "f.sub";
     case Opcode::FMul: return "f.mul";
@@ -458,6 +460,7 @@ std::string to_string(const Block& block, const SlotNamer& namer) {
           static constexpr const char* preds[] = {"eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"};
           line += std::format(".{}", preds[in.aux]);
         }
+        if (in.op == Opcode::VLane) line += std::format(".op{}", in.imm);
         if (in.op == Opcode::CondHolds || is_vector_or_fp(in.op)) line += std::format(".{:x}", in.aux);
         for (unsigned k = 0; k < arg_count(in.op); ++k) line += (k ? ", " : " ") + val(in.args[k]);
         break;

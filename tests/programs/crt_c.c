@@ -96,6 +96,13 @@ int main(int argc, char** argv) {
     memset(big, 'z', sizeof(big));
     big[999] = 0;
     printf("%zu %d\n", strlen(big), memcmp(big, big + 1, 500));
+    /* Large, unaligned clears: memset zeroes whole cache lines (DC ZVA on ARM64). */
+    static unsigned char huge[70000];
+    memset(huge, 0x5a, sizeof(huge));
+    memset(huge + 13, 0, 65000);
+    unsigned long long sum = 0;
+    for (size_t i = 0; i < sizeof(huge); ++i) sum = sum * 31 + huge[i];
+    printf("large memset: %llx, edges %d %d %d %d\n", sum, huge[12], huge[13], huge[65012], huge[65013]);
     char out[64];
     int len = snprintf(out, sizeof(out), "%s-%05.2f-%llx", "juice", 3.14159, 0xabcdefull);
     printf("%s %d\n", out, len);
