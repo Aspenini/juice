@@ -1,9 +1,10 @@
 -- JUICE Uses Instruction Conversion Efficiently
--- ARM64 -> x86-64 dynamic binary translator.
+-- ARM64 -> x86-64 dynamic binary translator: libjuice plus Windows and Linux frontends.
 --
---   xmake                       build juice.exe (clang-cl by default)
---   xmake f --toolchain=msvc    build with cl.exe instead
+--   xmake                       build juice (Windows: juice.exe with clang-cl by default)
+--   xmake f --toolchain=msvc    build with cl.exe instead (Windows)
 --   xmake test                  build and run all tests
+--   xmake install -o DIR        install juice, libjuice and its headers
 
 set_project("juice")
 set_version("0.1.0")
@@ -39,45 +40,48 @@ add_cxxflags("/clang:-mcx16", {tools = "clang_cl"})
 add_cxxflags("-mcx16", {tools = {"gcc", "clang"}})
 
 -- ---------------------------------------------------------------------------
--- juice-core: portable ARM64 front end + IR (no OS dependencies)
+-- libjuice: the portable translator library
+--
+-- ARM64 decoder and lifter, IR and optimizer, reference interpreter, x86-64
+-- code generator, block cache and dispatcher. No operating system code beyond
+-- allocating executable memory: frontends supply the guest program and its
+-- system (runtime::Environment). Public header: <juice/juice.hpp>.
 -- ---------------------------------------------------------------------------
-target("juice-core")
+target("libjuice")
     set_kind("static")
-    add_files("src/core/arm64/**.cpp", "src/core/ir/*.cpp")
+    set_basename(is_plat("windows") and "libjuice" or "juice")  -- libjuice.lib / libjuice.a
+    add_files("libjuice/src/core/**.cpp", "libjuice/src/runtime/**.cpp")
+    add_includedirs("libjuice/src", "libjuice/include", {public = true})
+    add_headerfiles("libjuice/include/(juice/*.hpp)")
+    add_headerfiles("libjuice/src/(core/**.hpp)", "libjuice/src/(runtime/**.hpp)", {prefixdir = "juice"})
+    if not is_plat("windows") then
+        add_syslinks("pthread", {public = true})
+    end
+
+-- ---------------------------------------------------------------------------
+-- Linux ELF/ABI support that does not need Linux itself (ELF parsing, the
+-- initial stack, structure and flag translation): built everywhere so the
+-- unit tests can cover it on any host.
+-- ---------------------------------------------------------------------------
+target("juice-linux-abi")
+    set_kind("static")
+    add_deps("libjuice")
+    add_files("src/linux/elf/*.cpp", "src/linux/abi/*.cpp")
     add_includedirs("src", {public = true})
-    add_headerfiles("src/core/arm64/**.hpp", "src/core/ir/*.hpp")
 
 -- ---------------------------------------------------------------------------
--- juice-jit: x86-64 code generator (portable across x86-64 operating systems)
--- ---------------------------------------------------------------------------
-target("juice-jit")
-    set_kind("static")
-    add_deps("juice-core")
-    add_files("src/core/jit/x64/*.cpp")
-    add_headerfiles("src/core/jit/x64/*.hpp")
-
--- ---------------------------------------------------------------------------
--- juice-runtime: block cache, executable memory, dispatcher
--- ---------------------------------------------------------------------------
-target("juice-runtime")
-    set_kind("static")
-    add_deps("juice-jit")
-    add_files("src/runtime/**.cpp")
-    add_headerfiles("src/runtime/**.hpp")
-
--- ---------------------------------------------------------------------------
--- Windows compatibility layer
+-- Windows frontend: runs Windows ARM64 .exe programs
 -- ---------------------------------------------------------------------------
 if is_plat("windows") then
     target("juice-pe")
         set_kind("static")
-        add_deps("juice-core")
+        add_deps("libjuice")
         add_files("src/windows/pe/*.cpp")
-        add_headerfiles("src/windows/pe/*.hpp")
+        add_includedirs("src", {public = true})
 
     target("juice-win")
         set_kind("static")
-        add_deps("juice-pe", "juice-runtime")
+        add_deps("juice-pe", "libjuice")
         add_files("src/windows/thunk/*.cpp",
                   "src/windows/imports/*.cpp",
                   "src/windows/exceptions/*.cpp",
@@ -86,12 +90,28 @@ if is_plat("windows") then
                   "src/windows/guest_modules.cpp",
                   "src/windows/host_manifest.cpp",
                   "src/windows/guest_process.cpp")
-        add_headerfiles("src/windows/**.hpp")
 
     target("juice")
         set_kind("binary")
         add_deps("juice-win")
-        add_files("src/main.cpp")
+        add_files("src/windows/main.cpp")
+end
+
+-- ---------------------------------------------------------------------------
+-- Linux frontend: runs Linux ARM64 ELF programs (static and dynamically
+-- linked, through the guest's own ld.so), and can register itself with
+-- binfmt_misc.
+-- ---------------------------------------------------------------------------
+if is_plat("linux") then
+    target("juice-linux")
+        set_kind("static")
+        add_deps("juice-linux-abi", "libjuice")
+        add_files("src/linux/*.cpp|main.cpp")
+
+    target("juice")
+        set_kind("binary")
+        add_deps("juice-linux")
+        add_files("src/linux/main.cpp")
 end
 
 includes("tests")

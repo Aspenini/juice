@@ -41,6 +41,7 @@ class TestEnv final : public runtime::Environment {
   }
 
   arm64::ExitReason last_exit = arm64::ExitReason::None;
+  std::vector<uint32_t>& code() { return code_; }
 
  private:
   std::vector<uint32_t> code_;
@@ -681,6 +682,30 @@ TEST(translate_exits) {
     engine.run(s);
     CHECK(env.last_exit == arm64::ExitReason::FetchFault);
     CHECK_EQ(s.pc, kCodeBase + 0x400);
+  }
+}
+
+// Self-modifying code: IC IVAU drops the stale translation.
+TEST(translate_ic_ivau) {
+  for (const Config& cfg : configs()) {
+    TestEnv env({0xd2800020 /* movz x0, #1 */, kBrk0, 0xd50b7521 /* ic ivau, x1 */, kBrk0});
+    runtime::Engine engine(env, cfg.options);
+    CpuState s{};
+    s.pc = kCodeBase;
+    engine.run(s);
+    CHECK_EQ(s.x[0], 1u);
+    env.code()[0] = 0xd2800040;  // movz x0, #2
+    s.pc = kCodeBase;
+    engine.run(s);
+    CHECK_EQ(s.x[0], 1u);  // still the cached translation
+    s.x[1] = kCodeBase + 4;  // any address in the line
+    s.pc = kCodeBase + 8;
+    engine.run(s);
+    CHECK(env.last_exit == arm64::ExitReason::Brk);
+    CHECK_EQ(s.pc, kCodeBase + 12);
+    s.pc = kCodeBase;
+    engine.run(s);
+    CHECK_EQ(s.x[0], 2u);
   }
 }
 

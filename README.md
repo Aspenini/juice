@@ -1,9 +1,14 @@
 # JUICE
 
 **JUICE Uses Instruction Conversion Efficiently** — a portable ARM64 → x86-64 dynamic binary
-translator with a Windows ARM64 compatibility layer. JUICE runs Windows ARM64 `.exe` programs on
-x86-64 Windows without a virtual machine. It translates ARM64 code to x86-64 on demand and forwards
-Windows API calls to the native x64 DLLs.
+translator. Its core, **libjuice**, is a library with no operating-system dependencies beyond
+executable memory. Two front ends sit on top of it:
+
+* **Windows**: runs Windows ARM64 `.exe` programs on x86-64 Windows without a virtual machine,
+  forwarding Windows API calls to the native x64 DLLs.
+* **Linux** (new, untested): runs Linux AArch64 ELF programs on x86-64 Linux, statically or
+  dynamically linked, forwarding system calls to the host kernel, optionally registered with
+  `binfmt_misc`.
 
 ```text
 Windows ARM64 .exe ─► PE loader ─► ARM64 decoder ─► IR ─► optimizer ─► x86-64 JIT ─► block cache
@@ -50,6 +55,11 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 Hello, World!
 ```
 
+The Linux front end is written but has **not yet been compiled or run on Linux**. Its portable
+parts (ELF parsing, the initial stack, structure and flag translation, signal frames, the
+`binfmt_misc` rule) are unit-tested on every platform, and the rest has only been syntax-checked.
+See [Linux layer](#linux-layer).
+
 ## Building
 
 Requirements: [xmake](https://xmake.io) ≥ 2.9 and clang-cl or MSVC (C++23). The tests also need
@@ -66,6 +76,14 @@ xmake test     # build and run the unit and guest-program tests
 run `xmake f --toolchain=msvc`; for a debug build, run `xmake f -m debug`. `xmake test -v` shows
 the output of failing tests, and `xmake test "juice-guest-tests/crt_*"` runs a subset.
 `build/compile_commands.json` is kept up to date for editors.
+
+On Linux, the same `xmake` builds `build/linux/x86_64/releasedbg/juice` with GCC or Clang (C++23).
+The Linux guest tests need an AArch64 cross compiler (`aarch64-linux-gnu-gcc`/`g++`, e.g. Debian's
+`gcc-aarch64-linux-gnu` and `g++-aarch64-linux-gnu`), whose C library also serves the dynamically
+linked tests.
+
+To use the translator from another project, link the `libjuice` target and include
+`<juice/juice.hpp>`. It documents the `Environment` interface a front end implements.
 
 ## Usage
 
@@ -89,22 +107,44 @@ juice [options] program.exe [arguments...]
 `--scan` statically decodes a program's code sections. It shows how close the program is to
 running before you try it.
 
+On Linux:
+
+```text
+juice [options] [--] program [arguments...]
+
+  --sysroot=DIR       root of the AArch64 system the program expects (its ld.so, libraries,
+                      configuration); default JUICE_SYSROOT or QEMU_LD_PREFIX, else wherever
+                      the program's ld.so is found (the host, /usr/aarch64-linux-gnu, ...)
+  --argv0=NAME        argv[0] for the program
+  --strace            log every system call
+  --trace, --dump-ir, --stats, --interp, --no-opt, --block-size=N   as on Windows
+  --install-binfmt    register with binfmt_misc so AArch64 programs run directly (root)
+  --uninstall-binfmt  remove the registration (root)
+  --binfmt-config     print the rule for /etc/binfmt.d/juice-aarch64.conf
+  --binfmt-status     show the current registration
+```
+
 ## Architecture
 
-The translator core does not depend on Windows. Only the PE loader, API thunks, exception handling
-and API built-ins do.
+The translator is the portable `libjuice` library. Each operating system is a front end that
+implements its `Environment` interface: reading guest code, handling SVC/BRK/undefined-instruction
+exits, calls to host code and asynchronous interrupts.
 
 | Library | Directory | Contents |
 |---|---|---|
-| `juice-core` | `src/core/arm64/state` | Guest CPU state (`CpuState`), laid out as 64-bit slots |
-| | `src/core/arm64/decode` | Pure decoder (`word, pc → Instruction`) and disassembler |
-| | `src/core/arm64/lift` | ARM64 → IR lifter, one basic block at a time |
-| | `src/core/ir` | ISA-neutral SSA IR, optimizer, reference interpreter, shared semantics (`evaluate`) |
-| `juice-jit` | `src/core/jit/x64` | x86-64 assembler and IR → x86-64 code generator (Win64 and SysV) |
-| `juice-runtime` | `src/runtime` | Executable memory, block cache, dispatcher (`Engine`), `Environment` interface |
+| `libjuice` | `libjuice/include/juice` | Public umbrella header `juice.hpp` |
+| | `libjuice/src/core/arm64/state` | Guest CPU state (`CpuState`), laid out as 64-bit slots |
+| | `libjuice/src/core/arm64/decode` | Pure decoder (`word, pc → Instruction`) and disassembler |
+| | `libjuice/src/core/arm64/lift` | ARM64 → IR lifter, one basic block at a time |
+| | `libjuice/src/core/ir` | ISA-neutral SSA IR, optimizer, reference interpreter, shared semantics (`evaluate`) |
+| | `libjuice/src/core/jit/x64` | x86-64 assembler and IR → x86-64 code generator (Win64 and SysV ABIs) |
+| | `libjuice/src/runtime` | Executable memory, block cache, dispatcher (`Engine`), `Environment` interface |
 | `juice-pe` | `src/windows/pe` | PE32+ parser and loader (mapping, relocations, imports, exports, TLS) |
 | `juice-win` | `src/windows` | Import binding, API thunks, ABI bridge, callbacks, fault reporting, built-in APIs |
-| `juice.exe` | `src/main.cpp` | Command line front end |
+| `juice.exe` | `src/windows/main.cpp` | Windows command line front end |
+| `juice-linux-abi` | `src/linux/elf`, `src/linux/abi` | Portable Linux pieces: ELF parser, AArch64 syscall table, x86-64 ⇄ AArch64 structure and flag translation, initial stack, signal frames, `binfmt_misc` rule |
+| `juice-linux` | `src/linux` | Linux process: loader, system calls, threads, signals, `binfmt_misc` installation |
+| `juice` | `src/linux/main.cpp` | Linux command line front end |
 
 ### Translation
 
@@ -140,6 +180,9 @@ and API built-ins do.
   with a compare-and-swap against it (`CMPXCHG16B` for 128-bit pairs), failing if memory changed.
   Like other translators, this accepts an A-B-A change as unchanged. `STLR` is a locked store, and
   full `DMB`/`DSB` barriers become `MFENCE`. x86-64's stronger ordering covers the other variants.
+* **Self-modifying code.** `IC IVAU`, which code generators run after writing code, drops the
+  translations of its cache line. The Linux layer also drops translations on `munmap`, `mremap`,
+  fixed `mmap` and `mprotect` to executable.
 * **Block cache.** Each block is translated once and shared by all threads. Each thread looks
   blocks up through its own direct-mapped table, so dispatch takes no lock; the shared map is
   locked only on a miss. Blocks and code are never freed while the process runs, so no thread
@@ -242,6 +285,54 @@ and API built-ins do.
   APIs are reported with the guest register state. Crashes inside JUICE itself print a host
   stack trace as `module+offset` (for `llvm-symbolizer --obj=juice.exe`).
 
+### Linux layer
+
+This layer is written against the kernel ABI but has **not yet been compiled or run on Linux**
+(see the status above).
+
+* **Loading.** `juice` maps the AArch64 program's `PT_LOAD` segments readable but never executable
+  on the host. A fixed-address program goes at its addresses; a PIE goes wherever the kernel
+  places it. For a dynamically linked program, `juice` maps the program's own interpreter
+  (`ld-linux-aarch64.so.1` or musl's) and starts there, so the guest's dynamic linker loads its
+  libraries. The interpreter is looked up under `--sysroot`, then on the host (multiarch
+  installs), then in the usual cross-toolchain roots. The directory it was found in becomes the
+  sysroot for the guest's other absolute-path lookups.
+* **Process image.** The guest stack follows `RLIMIT_STACK` and has the Linux initial stack layout:
+  `argc`, `argv`, `envp` and an auxiliary vector with `AT_PHDR`, `AT_BASE`, `AT_ENTRY`,
+  `AT_RANDOM`, and `AT_HWCAP` set to FP, ASIMD and atomics. `brk` is emulated in a region
+  reserved after the program.
+* **System calls.** Guest and host share the address space, so most AArch64 system calls go
+  straight to the host kernel under their x86-64 numbers. The exceptions:
+  * calls whose structures differ: `fstat`/`newfstatat` (`struct stat` is 128 bytes on AArch64,
+    144 on x86-64) and `epoll_ctl`/`epoll_pwait` (x86-64 packs `epoll_event`);
+  * flags with other values: `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT` and `O_LARGEFILE` in
+    `openat`, `fcntl` and `pipe2`;
+  * emulated state:
+    * `brk`;
+    * `clone`: threads become host threads, and `fork` forks the emulator;
+    * `set_tid_address`/`exit`, for `CLONE_CHILD_CLEARTID` futex wakeups;
+    * `rt_sig*` and `sigaltstack`;
+    * `uname`, which reports `aarch64`;
+    * `/proc/self/exe`;
+  * `execve` of an AArch64 program, or of a script whose interpreter is one, starts a new
+    `juice` with the same options; other programs are executed natively;
+  * calls that would reach the emulator itself are refused, and the C library falls back:
+    `rseq`, `seccomp`, `ptrace`, `io_uring`, `clone3` and `openat2`.
+* **Signals.** Handlers stay in JUICE. The host handler records the signal, and the dispatcher
+  delivers it between blocks: it pushes a genuine AArch64 `rt_sigframe` (siginfo, `ucontext`,
+  FP/SIMD record) and runs the guest handler, which returns through `rt_sigreturn`. Implemented:
+  * masks and default actions;
+  * `SA_RESTART`, `SA_ONSTACK`, `SA_RESETHAND` and `SA_NODEFER`;
+  * the temporary masks of `sigsuspend`, `ppoll` and `pselect`;
+  * the C library's internal signals 32 and 33.
+
+  `BRK` and undefined instructions raise `SIGTRAP`/`SIGILL` for the guest's handlers.
+* **binfmt_misc.** `juice --install-binfmt` registers a rule with flags `P` and `F` that matches
+  AArch64 ELF executables, using the same magic and mask as `qemu-aarch64`. The interpreter is a
+  `juice-binfmt` symlink next to `juice`. Started under that name, juice reads its arguments the
+  way the kernel passes them, and takes its options from the environment (`JUICE_SYSROOT`,
+  `JUICE_STRACE=1`, `JUICE_STATS=1`).
+
 ## Tests
 
 * `tests/unit`: decoder tests against LLVM-assembled encodings; IR semantics and optimizer tests;
@@ -255,6 +346,9 @@ and API built-ins do.
   its own). `/MD` programs run with both the ARM64 and the native C++ runtime DLLs.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
+* `tests/linux` (Linux hosts with an AArch64 cross compiler): C and C++ programs that cover
+  arguments and the heap, files and epoll, threads, signals, `fork`/`execve` and C++ exceptions.
+  Each one is linked statically and dynamically and compared with a native x86-64 build.
 * `tests/sdk`: inputs for the Windows SDK tools. If the SDK's ARM64 tools are installed, each
   tool runs as ARM64 under JUICE and as x64 natively, in the same directory. The exit code,
   console output and every file written must match.
@@ -283,3 +377,12 @@ These are next, roughly in the plan's order:
 
 Threading caveat: `SuspendThread`/`GetThreadContext` on a guest thread see the host's x64
 context, not the guest's ARM64 one.
+
+The Linux front end comes next: compile and run it on a Linux host, then run the guest tests.
+Known gaps:
+* Hardware faults in guest code (`SIGSEGV`, `SIGBUS`, `SIGFPE`) are reported instead of being
+  delivered to guest handlers.
+* There is no vDSO, so time functions make real system calls.
+* `/proc/self/maps`, `/proc/self/auxv` and `/proc/cpuinfo` show the host's view.
+* A `vfork` child gets a copy of memory instead of sharing it.
+* Robust futex lists are recorded but not walked when a thread dies.

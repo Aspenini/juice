@@ -4,9 +4,118 @@
 target("juice-unit-tests")
     set_kind("binary")
     set_default(false)
-    add_deps("juice-runtime")
+    add_deps("libjuice", "juice-linux-abi")
     add_files("unit/*.cpp")
     add_tests("unit")
+
+-- ---------------------------------------------------------------------------
+-- Linux guest program tests
+--
+-- Each program in linux/ is cross-compiled for AArch64, linked statically and
+-- dynamically, and run under juice; a native x86-64 build is the reference
+-- for stdout and the exit code. Needs an AArch64 cross toolchain
+-- (aarch64-linux-gnu-gcc/g++, e.g. Debian's gcc-aarch64-linux-gnu and
+-- g++-aarch64-linux-gnu, which also install the C library juice's
+-- dynamic tests load from /usr/aarch64-linux-gnu).
+-- ---------------------------------------------------------------------------
+if is_plat("linux") then
+    target("juice-linux-guest-tests")
+        set_kind("phony")
+        set_default(false)
+        add_deps("juice")
+        set_values("linux.programs", "hello.c", "files.c", "threads.c", "signals.c", "exec.c", "cxx.cpp")
+
+        on_load(function (target)
+            import("lib.detect.find_program")
+            local cross = {c = find_program("aarch64-linux-gnu-gcc"), cxx = find_program("aarch64-linux-gnu-g++")}
+            local native = {c = find_program("cc") or find_program("gcc"), cxx = find_program("c++") or find_program("g++")}
+            if not cross.c or not native.c then
+                print("juice: aarch64-linux-gnu-gcc not found, Linux guest program tests disabled")
+                return
+            end
+            local scriptdir = target:scriptdir()
+            local outdir = path.join(target:targetdir(), "linux-guest")
+            local jobs = {}
+            local special = {
+                hello = {args = {"one", "two words"}, env = {JUICE_TEST_VAR = "set"}},
+            }
+            for _, file in ipairs(target:values("linux.programs")) do
+                local name = path.basename(file)
+                local lang = path.extension(file) == ".cpp" and "cxx" or "c"
+                local src = path.join(scriptdir, "linux", file)
+                local flags = {"-O2", "-Wall", "-pthread", lang == "cxx" and "-std=c++17" or "-std=gnu11"}
+                local reference = path.join(outdir, name .. ".x86_64")
+                table.insert(jobs, {name = name .. " (x86_64)", exe = reference, src = src,
+                                    steps = {{native[lang], table.join(flags, {src, "-o", reference})}}})
+                if cross[lang] then
+                    for _, link in ipairs({"static", "dynamic"}) do
+                        local guest = path.join(outdir, name .. "-" .. link .. ".aarch64")
+                        local ldflags = link == "static" and {"-static"} or {}
+                        table.insert(jobs, {name = name .. " (aarch64, " .. link .. ")", exe = guest, src = src,
+                                            steps = {{cross[lang], table.join(flags, ldflags, {src, "-o", guest})}}})
+                        local modes = {jit = {}, interp = {"--interp"}, noopt = {"--no-opt", "--block-size=1"}}
+                        for mode, mode_flags in pairs(modes) do
+                            local test = table.join({guest = guest, reference = reference, flags = mode_flags},
+                                                    special[name] or {})
+                            target:add("tests", name .. "." .. link .. "." .. mode, test)
+                        end
+                    end
+                end
+            end
+            target:data_set("linux.jobs", jobs)
+            target:data_set("linux.outdir", outdir)
+        end)
+
+        on_build(function (target, opt)
+            import("core.project.depend")
+            import("utils.progress")
+            local jobs = target:data("linux.jobs")
+            if not jobs then
+                return
+            end
+            os.mkdir(target:data("linux.outdir"))
+            for _, job in ipairs(jobs) do
+                depend.on_changed(function ()
+                    progress.show(opt.progress, "${color.build.object}compiling.guest %s", job.name)
+                    for _, step in ipairs(job.steps) do
+                        os.vrunv(step[1], step[2])
+                    end
+                end, {dependfile = job.exe .. ".d", files = {job.src}, lastmtime = os.mtime(job.exe)})
+            end
+        end)
+
+        on_test(function (target, opt)
+            local juice = path.absolute(target:dep("juice"):targetfile())
+            local logdir = path.join(target:autogendir(), "tests")
+            local logname = opt.name:gsub("[/\\:]", "_")
+            os.mkdir(logdir)
+            local function run(program, argv, tag)
+                local outfile = path.join(logdir, logname .. "." .. tag .. ".out")
+                local errfile = path.join(logdir, logname .. "." .. tag .. ".err")
+                local code = os.execv(program, argv, {try = true, timeout = 120000, stdout = outfile,
+                                                      stderr = errfile, envs = opt.env})
+                local out = os.isfile(outfile) and io.readfile(outfile) or ""
+                local err = os.isfile(errfile) and io.readfile(errfile) or ""
+                os.tryrm(outfile)
+                os.tryrm(errfile)
+                return code, out, err
+            end
+            local args = opt.args or {}
+            local code, out, err = run(juice, table.join(opt.flags, {"--", opt.guest}, args), "juice")
+            local ref_code, ref_out = run(opt.reference, args, "reference")
+            if code ~= ref_code then
+                opt.errors = string.format("exit code mismatch: juice=%s expected=%s\n%s", tostring(code),
+                                           tostring(ref_code), err)
+                return false
+            end
+            if out ~= ref_out then
+                opt.errors = "output mismatch\n--- juice ---\n" .. out .. "\n--- expected ---\n" .. ref_out ..
+                             "\n--- juice stderr ---\n" .. err
+                return false
+            end
+            return true
+        end)
+end
 
 if not is_plat("windows") then
     return

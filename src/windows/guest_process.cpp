@@ -478,6 +478,7 @@ runtime::Action GuestProcess::on_exit(arm64::CpuState& s) {
     case arm64::ExitReason::FetchFault:
       fatal(std::format("guest jumped to non-executable address 0x{:x}", s.pc), kStatusAccessViolation);
     case arm64::ExitReason::None:
+    case arm64::ExitReason::CodeModified:  // handled by the Engine
       break;
   }
   return runtime::Action::Continue;

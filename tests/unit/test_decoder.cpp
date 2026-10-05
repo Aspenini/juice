@@ -165,6 +165,8 @@ TEST(decoder_loads_stores) {
   CHECK_EQ(i.amount, 2);
 
   CHECK(decode(0xd50b7420, 0).op == Op::DcZva);  // dc zva
+  CHECK(decode(0xd50b7520, 0).op == Op::IcIvau);  // ic ivau, x0
+  CHECK(decode(0xd50b7b20, 0).op == Op::Nop);     // dc cvau, x0
 }
 
 TEST(decoder_simd_immediates) {
