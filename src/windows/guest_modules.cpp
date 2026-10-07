@@ -1,12 +1,12 @@
 // Guest modules: the program and the ARM64 DLLs it loads.
 //
 // An imported or LoadLibrary'd DLL becomes a guest module when an ARM64 copy
-// of it is found in the program's directory or in one of the configured DLL
-// directories (ProcessOptions::dll_paths); everything else binds to builtins
-// and native x64 DLLs. Guest modules get what the native loader would give
-// them: relocation, import binding (including forwarded exports), implicit
-// TLS, TLS callbacks and DllMain notifications in dependency order.
-// Modules are never unmapped, so translated code stays valid.
+// of it is found on the DLL search path (find_guest_dll); everything else
+// binds to builtins and native x64 DLLs. Guest modules get what the native
+// loader would give them: relocation, import binding (including forwarded
+// exports), implicit TLS, TLS callbacks and DllMain notifications in
+// dependency order, and reference counts: the last FreeLibrary detaches and
+// unmaps a DLL, dropping its translations.
 
 #include <windows.h>
 
@@ -86,9 +86,19 @@ GuestModule* GuestProcess::module_at(uint64_t addr) const {
   const size_t n = module_count_.load(std::memory_order_acquire);
   for (size_t i = 0; i < n; ++i) {
     GuestModule* m = modules_[i].load(std::memory_order_acquire);
-    if (m->image.contains(addr)) return m;
+    if (m->image.contains(addr) && !m->unloaded.load(std::memory_order_acquire)) return m;
   }
   return nullptr;
+}
+
+std::vector<GuestModule*> GuestProcess::loaded_modules() const {
+  std::vector<GuestModule*> out;
+  const size_t n = module_count_.load(std::memory_order_acquire);
+  for (size_t i = 0; i < n; ++i) {
+    GuestModule* m = modules_[i].load(std::memory_order_acquire);
+    if (!m->unloaded.load(std::memory_order_acquire)) out.push_back(m);
+  }
+  return out;
 }
 
 GuestModule* GuestProcess::module_by_handle(uint64_t handle) const {
@@ -102,6 +112,7 @@ GuestModule* GuestProcess::find_loaded_module(std::wstring_view name) const {
   const size_t n = module_count_.load(std::memory_order_acquire);
   for (size_t i = 0; i < n; ++i) {
     GuestModule* m = modules_[i].load(std::memory_order_acquire);
+    if (m->unloaded.load(std::memory_order_acquire)) continue;
     if (m->name == file || lower(m->path) == path) return m;
     // The program also answers to its name without extension (GetModuleHandle("app")).
     if (m->is_exe && module_file_name(m->name) == file) return m;
@@ -121,31 +132,102 @@ GuestModule* GuestProcess::register_module(std::unique_ptr<GuestModule> module) 
 
 // --- loading -------------------------------------------------------------------------
 
-std::optional<std::wstring> GuestProcess::find_guest_dll(std::wstring_view name) const {
+// The DLL search order (Windows' standard and "safe" orders), for ARM64 DLLs:
+// anything else, including every DLL the system directory has, is left to the
+// native loader.
+std::optional<std::wstring> GuestProcess::find_guest_dll(std::wstring_view name, const DllSearch& search) const {
   const std::wstring file = module_file_name(name);
   if (is_system_name(file)) return std::nullopt;
-  std::vector<std::filesystem::path> candidates;
-  if (is_path(name)) {
-    candidates.emplace_back(name);
-  } else {
-    candidates.push_back(std::filesystem::path(exe().path).parent_path() / file);
-    for (const std::wstring& dir : options_.dll_paths) candidates.push_back(std::filesystem::path(dir) / file);
-  }
-  for (const auto& path : candidates) {
+  auto arm64_dll = [](const std::filesystem::path& path) -> std::optional<std::wstring> {
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(path, ec)) continue;
-    // Only ARM64 DLLs: anything else is left to the native loader.
+    if (!std::filesystem::is_regular_file(path, ec)) return std::nullopt;
     pe::PeHeaderInfo header;
     if (pe::peek_pe_header(path, header) && header.machine == pe::kMachineArm64 && header.is_dll())
       return std::filesystem::absolute(path, ec).wstring();
+    return std::nullopt;
+  };
+  if (is_path(name)) return arm64_dll(std::filesystem::path(name));
+
+  const std::filesystem::path app_dir = std::filesystem::path(exe().path).parent_path();
+  auto in = [&](const std::filesystem::path& dir) { return dir.empty() ? std::nullopt : arm64_dll(dir / file); };
+  auto system_has = [&] {
+    wchar_t system[MAX_PATH];
+    const UINT n = GetSystemDirectoryW(system, MAX_PATH);
+    std::error_code ec;
+    return n && std::filesystem::exists(std::filesystem::path(std::wstring(system, n)) / file, ec);
+  };
+  constexpr uint32_t kSearchDllLoadDir = 0x100, kSearchApplicationDir = 0x200, kSearchUserDirs = 0x400,
+                     kSearchSystem32 = 0x800, kSearchDefaultDirs = 0x1000, kAlteredSearchPath = 0x8;
+  constexpr uint32_t kSearchMask = kSearchDllLoadDir | kSearchApplicationDir | kSearchUserDirs | kSearchSystem32 |
+                                   kSearchDefaultDirs;
+  uint32_t flags = search.flags & kSearchMask;
+  if (!flags && !(search.flags & kAlteredSearchPath)) flags = default_search_flags_;
+  if (flags & kSearchDefaultDirs) flags |= kSearchApplicationDir | kSearchUserDirs | kSearchSystem32;
+
+  if (flags) {  // the "safe" order: only the directories named
+    if (flags & kSearchDllLoadDir)
+      if (auto p = in(search.load_dir)) return p;
+    if (flags & kSearchApplicationDir)
+      if (auto p = in(app_dir)) return p;
+    for (const std::wstring& dir : options_.dll_paths)
+      if (auto p = in(dir)) return p;
+    if (flags & kSearchUserDirs) {
+      for (const auto& [cookie, dir] : user_dll_dirs_)
+        if (auto p = in(dir)) return p;
+    }
+    return std::nullopt;
+  }
+  // The standard order: the loading DLL's directory (altered search path), the
+  // program's, SetDllDirectory's, JUICE's own; then the system directories
+  // (native DLLs); then the current directory and PATH.
+  if (auto p = in(search.load_dir)) return p;
+  if (auto p = in(app_dir)) return p;
+  if (auto p = in(dll_directory_)) return p;
+  for (const std::wstring& dir : options_.dll_paths)
+    if (auto p = in(dir)) return p;
+  if (system_has()) return std::nullopt;
+  if (dll_directory_.empty()) {
+    std::error_code ec;
+    if (auto p = in(std::filesystem::current_path(ec))) return p;
+  }
+  if (const DWORD n = GetEnvironmentVariableW(L"PATH", nullptr, 0)) {
+    std::wstring path(n, L'\0');
+    path.resize(GetEnvironmentVariableW(L"PATH", path.data(), n));
+    for (size_t start = 0; start <= path.size();) {
+      size_t end = path.find(L';', start);
+      if (end == std::wstring::npos) end = path.size();
+      if (end > start)
+        if (auto p = in(path.substr(start, end - start))) return p;
+      start = end + 1;
+    }
   }
   return std::nullopt;
 }
 
-GuestModule* GuestProcess::load_guest_dll(std::wstring_view name) {
+void GuestProcess::set_dll_directory(const wchar_t* dir) {
+  std::lock_guard lock(loader_mutex_);
+  dll_directory_ = dir ? dir : L"";
+}
+
+void GuestProcess::add_dll_directory(uint64_t cookie, std::wstring dir) {
+  std::lock_guard lock(loader_mutex_);
+  user_dll_dirs_.emplace_back(cookie, std::move(dir));
+}
+
+void GuestProcess::remove_dll_directory(uint64_t cookie) {
+  std::lock_guard lock(loader_mutex_);
+  std::erase_if(user_dll_dirs_, [&](const auto& e) { return e.first == cookie; });
+}
+
+void GuestProcess::set_default_dll_directories(uint32_t flags) {
+  std::lock_guard lock(loader_mutex_);
+  default_search_flags_ = flags;
+}
+
+GuestModule* GuestProcess::load_guest_dll(std::wstring_view name, const DllSearch& search) {
   std::lock_guard lock(loader_mutex_);
   if (GuestModule* m = find_loaded_module(name)) return m;
-  const std::optional<std::wstring> path = find_guest_dll(name);
+  const std::optional<std::wstring> path = find_guest_dll(name, search);
   if (!path) return nullptr;
   if (GuestModule* m = find_loaded_module(*path)) return m;
 
@@ -160,6 +242,9 @@ GuestModule* GuestProcess::load_guest_dll(std::wstring_view name) {
   module->image = std::move(*image);
   module->path = *path;
   module->name = module_file_name(*path);
+  // LOAD_WITH_ALTERED_SEARCH_PATH / LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: its
+  // imports are looked for next to it first.
+  if (search.flags & (0x8 | 0x100)) module->dependency_dir = std::filesystem::path(*path).parent_path().wstring();
   GuestModule* m = register_module(std::move(module));
   if (options_.trace_imports)
     std::fprintf(stderr, "[juice] guest module %ls at 0x%llx\n", m->path.c_str(), static_cast<unsigned long long>(m->base()));
@@ -184,15 +269,24 @@ std::optional<uint64_t> GuestProcess::bind_guest_import(const pe::Import& imp, G
       if (importer && std::find(importer->dependencies.begin(), importer->dependencies.end(), vcruntime) ==
                           importer->dependencies.end()) {
         importer->dependencies.push_back(vcruntime);
+        ++vcruntime->refs;
       }
       if (uint64_t value = guest_export(*vcruntime, target)) return value;
     }
   }
-  GuestModule* dll = load_guest_dll(widen(imp.dll));
+  DllSearch search;
+  if (importer && !importer->dependency_dir.empty()) {
+    search.flags = 0x100;  // the importer's directory first, then the standard order
+    search.load_dir = importer->dependency_dir;
+  }
+  GuestModule* dll = load_guest_dll(widen(imp.dll), search);
+  if (!dll && !search.load_dir.empty()) dll = load_guest_dll(widen(imp.dll));
   if (!dll) return std::nullopt;
   if (importer && dll != importer &&
       std::find(importer->dependencies.begin(), importer->dependencies.end(), dll) == importer->dependencies.end()) {
     importer->dependencies.push_back(dll);
+    ++dll->refs;  // released when the importer unloads
+    if (importer->is_exe) dll->pinned = true;  // the program's own imports never unload
   }
   const std::string ordinal_name = std::format("#{}", imp.ordinal);
   const uint64_t value =
@@ -270,16 +364,55 @@ bool GuestProcess::initialize_module(GuestModule& module) {
   return true;
 }
 
-uint64_t GuestProcess::load_library(std::wstring_view name, bool& guest) {
+uint64_t GuestProcess::load_library(std::wstring_view name, uint32_t flags, bool& guest) {
   std::lock_guard lock(loader_mutex_);
-  GuestModule* m = load_guest_dll(name);
+  GuestModule* m = load_guest_dll(name, DllSearch{flags, {}});
   guest = m != nullptr;
   if (!m) return 0;
-  if (!initialize_module(*m)) {
+  ++m->refs;
+  // DONT_RESOLVE_DLL_REFERENCES: mapped (and bound), but DllMain does not run.
+  if (!(flags & DONT_RESOLVE_DLL_REFERENCES) && !initialize_module(*m)) {
+    --m->refs;
     SetLastError(ERROR_DLL_INIT_FAILED);
     return 0;
   }
   return m->base();
+}
+
+void GuestProcess::reference_module(GuestModule& module, bool pin) {
+  std::lock_guard lock(loader_mutex_);
+  if (pin) module.pinned = true;
+  ++module.refs;
+}
+
+bool GuestProcess::free_library(uint64_t handle) {
+  std::lock_guard lock(loader_mutex_);
+  GuestModule* m = module_by_handle(handle);
+  if (!m) return false;
+  if (m->is_exe || m->pinned) return true;
+  if (--m->refs <= 0) unload_module(*m);
+  return true;
+}
+
+// The last reference is gone: DLL_PROCESS_DETACH, then the image goes away
+// (its translations with it), and its own imports are released.
+void GuestProcess::unload_module(GuestModule& module) {
+  if (module.state == GuestModule::State::Initialized) {
+    if (module.image.entry) {
+      if (options_.trace_calls) std::fprintf(stderr, "[juice] DllMain(%ls, DLL_PROCESS_DETACH)\n", module.name.c_str());
+      call_guest(module.image.entry, {module.base(), DLL_PROCESS_DETACH, 0 /* FreeLibrary */});
+    }
+    run_tls_callbacks(module, DLL_PROCESS_DETACH);
+  }
+  std::erase(init_order_, &module);
+  module.unloaded.store(true, std::memory_order_release);
+  engine_->invalidate(module.base(), module.base() + module.image.size);
+  if (options_.trace_imports) std::fprintf(stderr, "[juice] guest module %ls unloaded\n", module.path.c_str());
+  pe::unmap_image(module.image);
+  for (GuestModule* dep : module.dependencies) {
+    if (dep->is_exe || dep->pinned || dep->unloaded) continue;
+    if (--dep->refs <= 0) unload_module(*dep);
+  }
 }
 
 bool GuestProcess::disable_thread_library_calls(uint64_t handle) {

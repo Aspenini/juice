@@ -38,15 +38,34 @@ uint64_t guest_value_for_native_export(void* addr, ThunkTable& thunks, std::stri
   return thunks.add_native(addr, std::move(dll), std::move(name), signature);
 }
 
+// The name a native DLL exports `ordinal` under (empty if it has none).
+std::string export_name_for_ordinal(HMODULE mod, uint32_t ordinal) {
+  if (!mod) return {};
+  auto* base = reinterpret_cast<const uint8_t*>(mod);
+  auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+  const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+  if (!dir.VirtualAddress) return {};
+  auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + dir.VirtualAddress);
+  if (ordinal < exports->Base) return {};
+  const auto* names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+  const auto* indexes = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+  for (DWORD k = 0; k < exports->NumberOfNames; ++k)
+    if (indexes[k] == ordinal - exports->Base) return reinterpret_cast<const char*>(base + names[k]);
+  return {};
+}
+
 uint64_t resolve_native_import(const pe::Import& imp, ThunkTable& thunks, const char** how, ImportStats* stats) {
-  const std::string display = imp.by_ordinal ? std::format("#{}", imp.ordinal) : imp.name;
+  // Imports by ordinal (OLEAUT32's, for instance) go by the exported name where there is one.
+  std::string name = imp.name;
+  if (imp.by_ordinal) name = export_name_for_ordinal(LoadLibraryA(imp.dll.c_str()), imp.ordinal);
+  const std::string display = name.empty() ? std::format("#{}", imp.ordinal) : name;
   const char* result = "";
   uint64_t value = 0;
-  if (BuiltinFn fn = imp.by_ordinal ? nullptr : find_builtin(imp.dll, imp.name)) {
+  if (BuiltinFn fn = name.empty() ? nullptr : find_builtin(imp.dll, name)) {
     Thunk t;
     t.kind = Thunk::Kind::Builtin;
     t.dll = imp.dll;
-    t.name = imp.name;
+    t.name = name;
     t.builtin = fn;
     value = thunks.add(std::move(t));
     result = "builtin";

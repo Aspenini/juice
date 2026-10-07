@@ -161,7 +161,9 @@ class Optimizer {
         case Opcode::LoadToState:
           for (unsigned s = 0; s < state_slots(in); ++s) known[in.imm + s] = kNoValue;
           break;
-        case Opcode::AtomicCasPair:  // writes guest state through a StateAddr pointer
+        case Opcode::AtomicCasPair:  // write guest state through a StateAddr pointer
+        case Opcode::AtomicRmwPair:
+        case Opcode::StateOp:        // writes guest state directly
           std::fill(known.begin(), known.end(), kNoValue);
           break;
         case Opcode::Load:
@@ -223,7 +225,9 @@ class Optimizer {
           for (unsigned s = 0; s < state_slots(in); ++s) overwritten[in.imm + s] = 0;
           break;
         case Opcode::AtomicCasPair:
-          // Reads guest state through a StateAddr pointer: keep every earlier store.
+        case Opcode::AtomicRmwPair:
+        case Opcode::StateOp:
+          // Reads guest state from memory: keep every earlier store.
           std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
           break;
         default:

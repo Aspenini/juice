@@ -244,19 +244,30 @@ template <typename T>
 uint64_t fp_to_int(T x, FpRound mode, bool sign, unsigned size) {
   if (std::isnan(x)) return 0;
   const double r = static_cast<double>(round_to_integral(x, mode));
+  const unsigned bits = size * 8;
   if (sign) {
-    const double lo = size == 8 ? -9223372036854775808.0 : -2147483648.0;
-    const double hi = size == 8 ? 9223372036854775808.0 : 2147483648.0;
+    const double lo = -std::ldexp(1.0, static_cast<int>(bits) - 1), hi = std::ldexp(1.0, static_cast<int>(bits) - 1);
     int64_t v;
-    if (r < lo) v = size == 8 ? std::numeric_limits<int64_t>::min() : std::numeric_limits<int32_t>::min();
-    else if (r >= hi) v = size == 8 ? std::numeric_limits<int64_t>::max() : std::numeric_limits<int32_t>::max();
+    if (r < lo) v = bits == 64 ? std::numeric_limits<int64_t>::min() : -(int64_t{1} << (bits - 1));
+    else if (r >= hi) v = bits == 64 ? std::numeric_limits<int64_t>::max() : (int64_t{1} << (bits - 1)) - 1;
     else v = static_cast<int64_t>(r);
-    return size == 8 ? static_cast<uint64_t>(v) : static_cast<uint32_t>(v);
+    return static_cast<uint64_t>(v) & lane_mask(bits);
   }
-  const double hi = size == 8 ? 18446744073709551616.0 : 4294967296.0;
   if (r <= 0) return 0;
-  if (r >= hi) return size == 8 ? ~0ull : 0xFFFF'FFFFu;
+  if (r >= std::ldexp(1.0, static_cast<int>(bits))) return lane_mask(bits);
   return static_cast<uint64_t>(r);
+}
+
+// FRINT32* / FRINT64*: round to an integral value that fits a signed integer of
+// `bits`, else the most negative one.
+template <typename T>
+uint64_t round_bounded(T x, FpRound mode, unsigned bits) {
+  uint64_t nan;
+  if (process_nans({x}, nan)) return to_bits(-std::ldexp(T(1), static_cast<int>(bits) - 1));
+  const T r = round_to_integral(x, mode);
+  const T limit = std::ldexp(T(1), static_cast<int>(bits) - 1);
+  if (std::isinf(r) || r < -limit || r >= limit) return to_bits(-limit);
+  return to_bits(r);
 }
 
 template <typename T>
@@ -275,7 +286,8 @@ uint64_t eval_fp(const Inst& in, uint64_t ra, uint64_t rb, uint64_t rc) {
     case Opcode::FSqrt: return process_nans({a}, nan) ? nan : result_bits(std::sqrt(a));
     case Opcode::FMadd: return process_nans({c, a, b}, nan) ? nan : result_bits(std::fma(a, b, c));
     case Opcode::FRint:
-      return process_nans({a}, nan) ? nan : to_bits(round_to_integral(a, static_cast<FpRound>(in.aux)));
+      if (in.aux & 0x18) return round_bounded(a, static_cast<FpRound>(in.aux & 7), (in.aux & 8) ? 32 : 64);
+      return process_nans({a}, nan) ? nan : to_bits(round_to_integral(a, static_cast<FpRound>(in.aux & 7)));
     case Opcode::FCmp:
       if (std::isnan(a) || std::isnan(b)) return kFlagC | kFlagV;
       if (a == b) return kFlagZ | kFlagC;
@@ -457,6 +469,155 @@ unsigned rsqrt_estimate(unsigned a) {  // 128 <= a <= 511
   return (b + 1) / 2;
 }
 
+// --- half precision arithmetic ----------------------------------------------------------
+// Values are computed exactly or in double precision and rounded once to half
+// precision (double has more than 2 * 11 + 2 significant bits, so rounding the
+// double result of +, -, *, / or sqrt again is exact); fused multiply-add goes
+// through round-to-odd.
+
+constexpr uint64_t kHalfDefaultNaN = 0x7E00;
+bool h_isnan(uint64_t h) { return (h & 0x7C00) == 0x7C00 && (h & 0x3FF); }
+bool h_issnan(uint64_t h) { return h_isnan(h) && !(h & 0x200); }
+
+bool h_process_nans(std::initializer_list<uint64_t> ops, uint64_t& out) {
+  for (uint64_t v : ops)
+    if (h_issnan(v)) {
+      out = (v | 0x200) & 0xFFFF;
+      return true;
+    }
+  for (uint64_t v : ops)
+    if (h_isnan(v)) {
+      out = v & 0xFFFF;
+      return true;
+    }
+  return false;
+}
+
+double h_to_d(uint64_t h) {
+  const int exp = static_cast<int>((h >> 10) & 0x1F);
+  const uint64_t mant = h & 0x3FF;
+  double v;
+  if (exp == 0x1F) v = mant ? std::numeric_limits<double>::quiet_NaN() : std::numeric_limits<double>::infinity();
+  else if (exp == 0) v = std::ldexp(static_cast<double>(mant), -24);
+  else v = std::ldexp(static_cast<double>(mant | 0x400), exp - 25);
+  return (h & 0x8000) ? -v : v;
+}
+
+// Round to nearest even; NaN gives the default NaN.
+uint64_t d_to_h(double d) {
+  if (std::isnan(d)) return kHalfDefaultNaN;
+  const uint64_t sign = std::signbit(d) ? 0x8000 : 0;
+  const double a = std::fabs(d);
+  if (a >= 65520.0) return sign | 0x7C00;
+  if (a < 0x1p-14) return sign | static_cast<uint64_t>(std::nearbyint(a * 0x1p24));  // subnormal (1024: the smallest normal)
+  int e;
+  const double m = std::frexp(a, &e);  // a = m * 2^e, m in [0.5, 1)
+  double q = std::nearbyint(m * 2048.0);
+  int exp = e - 1 + 15;
+  if (q >= 2048.0) {
+    q = 1024.0;
+    ++exp;
+  }
+  if (exp >= 31) return sign | 0x7C00;
+  return sign | (static_cast<uint64_t>(exp) << 10) | (static_cast<uint64_t>(q) - 1024);
+}
+
+// a + b = s + e exactly.
+void two_sum(double a, double b, double& s, double& e) {
+  s = a + b;
+  const double bp = s - a;
+  e = (a - (s - bp)) + (b - bp);
+}
+
+// hi + lo (lo the exact remainder of hi) rounded to odd in double precision:
+// rounding that once more to a narrower format rounds hi + lo correctly.
+double round_odd(double hi, double lo) {
+  if (lo == 0 || !std::isfinite(hi)) return hi;
+  uint64_t bits = std::bit_cast<uint64_t>(hi);
+  if ((lo < 0) != (hi < 0)) --bits;  // the exact magnitude is just below |hi|
+  return std::bit_cast<double>(bits | 1);
+}
+
+uint64_t h_fma(uint64_t a, uint64_t b, uint64_t c, double scale = 1.0) {  // (a * b + c) * scale, one rounding
+  const double p = h_to_d(a) * h_to_d(b);  // exact
+  double sum, err;
+  two_sum(p, h_to_d(c), sum, err);
+  return d_to_h(round_odd(sum, err) * scale);
+}
+
+uint64_t h_minmax(uint64_t x, uint64_t y, bool max, bool number) {
+  uint64_t nan;
+  if (number) {
+    const bool xq = h_isnan(x) && !h_issnan(x), yq = h_isnan(y) && !h_issnan(y);
+    if (xq && !h_isnan(y)) return y;
+    if (yq && !h_isnan(x)) return x;
+  }
+  if (h_process_nans({x, y}, nan)) return nan;
+  const double a = h_to_d(x), b = h_to_d(y);
+  if (a == 0 && b == 0 && ((x ^ y) & 0x8000)) return max ? 0 : 0x8000;
+  return max ? (a > b ? x : y) : (a < b ? x : y);
+}
+
+// --- BFloat16 ------------------------------------------------------------------------------
+
+uint32_t bf16_to_f32(uint64_t h) { return static_cast<uint32_t>(h & 0xFFFF) << 16; }
+
+uint64_t f32_to_bf16(uint32_t f) {  // round to nearest even; NaNs quieted
+  if ((f & 0x7F80'0000u) == 0x7F80'0000u && (f & 0x7F'FFFFu)) return ((f >> 16) | 0x40) & 0xFFFF;
+  return ((uint64_t{f} + 0x7FFF + ((f >> 16) & 1)) >> 16) & 0xFFFF;
+}
+
+// The exact value s + e rounded to odd in single precision, as BFDOT rounds:
+// subnormal results flushed to zero, overflow to infinity.
+uint32_t f32_round_odd_ftz(double s, double e) {
+  if (std::isnan(s)) return 0x7FC0'0000u;
+  const uint32_t sign = std::signbit(s) ? 0x8000'0000u : 0;
+  if (std::isinf(s)) return sign | 0x7F80'0000u;
+  if (s == 0) return sign;
+  const uint64_t b = std::bit_cast<uint64_t>(s);
+  int fexp = static_cast<int>((b >> 52) & 0x7FF) - 1023 + 127;
+  const uint64_t mant = b & ((uint64_t{1} << 52) - 1);
+  if (fexp >= 255) return sign | 0x7F80'0000u;
+  if (fexp <= 0) return sign;
+  uint32_t fm = static_cast<uint32_t>(mant >> 29);
+  const uint64_t rest = mant & ((uint64_t{1} << 29) - 1);
+  if (!rest && e != 0 && ((e < 0) != (s < 0))) {  // the exact magnitude is just below |s|
+    if (fm == 0) {
+      if (--fexp <= 0) return sign;
+      fm = 0x7F'FFFF;
+    } else {
+      --fm;
+    }
+  }
+  if (rest || e != 0) fm |= 1;
+  return sign | (static_cast<uint32_t>(fexp) << 23) | fm;
+}
+
+double f32_ftz(uint32_t f) {
+  if ((f & 0x7F80'0000u) == 0) f &= 0x8000'0000u;
+  return static_cast<double>(std::bit_cast<float>(f));
+}
+
+}  // namespace
+
+// acc + a0 * b0 + a1 * b1 as Arm's BFDotAdd: products and sums rounded to odd,
+// denormals flushed to zero, NaNs give the default NaN.
+uint32_t bf_dot_add(uint32_t acc, uint16_t a0, uint16_t a1, uint16_t b0, uint16_t b1) {
+  const double x0 = f32_ftz(bf16_to_f32(a0)), x1 = f32_ftz(bf16_to_f32(a1));
+  const double y0 = f32_ftz(bf16_to_f32(b0)), y1 = f32_ftz(bf16_to_f32(b1));
+  const double sum = f32_ftz(acc);
+  if (std::isnan(x0) || std::isnan(x1) || std::isnan(y0) || std::isnan(y1) || std::isnan(sum)) return 0x7FC0'0000u;
+  const double p0 = std::bit_cast<float>(f32_round_odd_ftz(x0 * y0, 0));  // products of bf16 values are exact in double
+  const double p1 = std::bit_cast<float>(f32_round_odd_ftz(x1 * y1, 0));
+  double s, e;
+  two_sum(p0, p1, s, e);
+  const double t = std::bit_cast<float>(f32_round_odd_ftz(s, e));
+  two_sum(sum, t, s, e);
+  return f32_round_odd_ftz(s, e);
+}
+
+namespace {
+
 template <typename T>
 uint64_t fp_recip_estimate(T x) {
   using Bits = typename FpTraits<T>::Bits;
@@ -519,6 +680,111 @@ uint64_t fp_rsqrt_estimate(T x) {
   return (static_cast<Bits>(result_exp) << kMant) | (static_cast<Bits>(estimate & 0xFF) << (kMant - 8));
 }
 
+uint64_t h_recip_estimate(uint64_t x) {
+  uint64_t nan;
+  if (h_process_nans({x}, nan)) return nan;
+  const uint64_t sign = x & 0x8000;
+  int exp = static_cast<int>((x >> 10) & 0x1F);
+  uint64_t fraction = x & 0x3FF;
+  if (exp == 0x1F) return sign;                       // infinity -> zero
+  if ((x & 0x7FFF) < 0x100) return sign | 0x7C00;      // zero, or too small: infinity
+  if (exp == 0) {
+    if (!((fraction >> 9) & 1)) {
+      exp = -1;
+      fraction = (fraction << 2) & 0x3FF;
+    } else {
+      fraction = (fraction << 1) & 0x3FF;
+    }
+  }
+  const unsigned estimate = recip_estimate(static_cast<unsigned>(0x100 | (fraction >> 2)));
+  int result_exp = 2 * 15 - 1 - exp;
+  uint64_t out_fraction = uint64_t{estimate & 0xFF} << 2;
+  if (result_exp == 0) {
+    out_fraction = (uint64_t{1} << 9) | (out_fraction >> 1);
+  } else if (result_exp == -1) {
+    out_fraction = (uint64_t{1} << 8) | (out_fraction >> 2);
+    result_exp = 0;
+  }
+  return sign | (static_cast<uint64_t>(result_exp) << 10) | out_fraction;
+}
+
+uint64_t h_rsqrt_estimate(uint64_t x) {
+  uint64_t nan;
+  if (h_process_nans({x}, nan)) return nan;
+  if ((x & 0x7FFF) == 0) return (x & 0x8000) | 0x7C00;
+  if (x & 0x8000) return kHalfDefaultNaN;
+  int exp = static_cast<int>((x >> 10) & 0x1F);
+  uint64_t fraction = x & 0x3FF;
+  if (exp == 0x1F) return 0;
+  if (exp == 0) {
+    while (!((fraction >> 9) & 1)) {
+      fraction <<= 1;
+      --exp;
+    }
+    fraction = (fraction << 1) & 0x3FF;
+  }
+  const unsigned scaled = (exp & 1) == 0 ? static_cast<unsigned>(0x100 | (fraction >> 2))
+                                         : static_cast<unsigned>(0x80 | (fraction >> 3));
+  const int result_exp = (3 * 15 - 1 - exp) / 2;
+  return (static_cast<uint64_t>(result_exp) << 10) | (uint64_t{rsqrt_estimate(scaled) & 0xFF} << 2);
+}
+
+uint64_t fp_lane_half(VecOp op, uint64_t a, uint64_t b, uint64_t c, unsigned aux, uint64_t fbits) {
+  uint64_t nan;
+  const double x = h_to_d(a), y = h_to_d(b);
+  auto inf_times_zero = [&] {
+    return (std::isinf(x) && y == 0) || (x == 0 && std::isinf(y));
+  };
+  switch (op) {
+    case VecOp::FAdd: return h_process_nans({a, b}, nan) ? nan : d_to_h(x + y);
+    case VecOp::FSub: return h_process_nans({a, b}, nan) ? nan : d_to_h(x - y);
+    case VecOp::FMul: return h_process_nans({a, b}, nan) ? nan : d_to_h(x * y);
+    case VecOp::FDiv: return h_process_nans({a, b}, nan) ? nan : d_to_h(x / y);
+    case VecOp::FMax: return h_minmax(a, b, true, false);
+    case VecOp::FMin: return h_minmax(a, b, false, false);
+    case VecOp::FMaxNm: return h_minmax(a, b, true, true);
+    case VecOp::FMinNm: return h_minmax(a, b, false, true);
+    case VecOp::FAbd: return h_process_nans({a, b}, nan) ? nan : d_to_h(x - y) & 0x7FFF;
+    case VecOp::FMulX:
+      if (h_process_nans({a, b}, nan)) return nan;
+      if (inf_times_zero()) return ((a ^ b) & 0x8000) | 0x4000;
+      return d_to_h(x * y);
+    case VecOp::FMla: return h_process_nans({c, a, b}, nan) ? nan : h_fma(a, b, c);
+    case VecOp::FMls: return h_process_nans({c, a ^ 0x8000, b}, nan) ? nan : h_fma(a ^ 0x8000, b, c);
+    case VecOp::FCmEq: return !std::isnan(x) && !std::isnan(y) && x == y ? 0xFFFF : 0;
+    case VecOp::FCmGe: return !std::isnan(x) && !std::isnan(y) && x >= y ? 0xFFFF : 0;
+    case VecOp::FCmGt: return !std::isnan(x) && !std::isnan(y) && x > y ? 0xFFFF : 0;
+    case VecOp::FAcGe: return !std::isnan(x) && !std::isnan(y) && std::fabs(x) >= std::fabs(y) ? 0xFFFF : 0;
+    case VecOp::FAcGt: return !std::isnan(x) && !std::isnan(y) && std::fabs(x) > std::fabs(y) ? 0xFFFF : 0;
+    case VecOp::FRecps:
+      if (h_process_nans({a, b}, nan)) return nan;
+      if (inf_times_zero()) return 0x4000;  // 2.0
+      return h_fma(a ^ 0x8000, b, 0x4000);
+    case VecOp::FRsqrts:
+      if (h_process_nans({a, b}, nan)) return nan;
+      if (inf_times_zero()) return 0x3E00;  // 1.5
+      return h_fma(a ^ 0x8000, b, 0x4200, 0.5);  // (3 - a * b) / 2
+    case VecOp::FSqrt: return h_process_nans({a}, nan) ? nan : d_to_h(std::sqrt(x));
+    case VecOp::FRecpe: return h_recip_estimate(a);
+    case VecOp::FRsqrte: return h_rsqrt_estimate(a);
+    case VecOp::FRint:
+      return h_process_nans({a}, nan) ? nan : d_to_h(round_to_integral(x, static_cast<FpRound>((aux >> 4) & 7)));
+    case VecOp::FToInt:
+      if (std::isnan(x)) return 0;
+      return fp_to_int(fbits ? std::ldexp(x, static_cast<int>(fbits)) : x, static_cast<FpRound>((aux >> 4) & 7),
+                       (aux >> 7) & 1, 2);
+    case VecOp::IntToF: {
+      const double v = (aux >> 4) & 1 ? static_cast<double>(static_cast<int16_t>(a & 0xFFFF)) : static_cast<double>(a & 0xFFFF);
+      return d_to_h(fbits ? std::ldexp(v, -static_cast<int>(fbits)) : v);
+    }
+    default:
+      return 0;
+  }
+}
+
+// One floating point element operation of size `esize` (2, 4 or 8 bytes).
+uint64_t fp_elem(VecOp op, unsigned esize, uint64_t a, uint64_t b, uint64_t c = 0);
+
 template <typename T>
 uint64_t fp_lane(VecOp op, uint64_t ra, uint64_t rb, uint64_t rc, unsigned aux, uint64_t fbits) {
   const T a = from_bits<T>(ra), b = from_bits<T>(rb), c = from_bits<T>(rc);
@@ -566,6 +832,8 @@ uint64_t fp_lane(VecOp op, uint64_t ra, uint64_t rb, uint64_t rc, unsigned aux, 
     case VecOp::FRecpe: return fp_recip_estimate(a);
     case VecOp::FRsqrte: return fp_rsqrt_estimate(a);
     case VecOp::FRint: return scalar(Opcode::FRint, ra, 0, 0, static_cast<uint8_t>((aux >> 4) & 7));
+    case VecOp::FRint32: return round_bounded(a, static_cast<FpRound>((aux >> 4) & 7), 32);
+    case VecOp::FRint64: return round_bounded(a, static_cast<FpRound>((aux >> 4) & 7), 64);
     case VecOp::FToInt: {
       const T scaled = fbits ? std::ldexp(a, static_cast<int>(fbits)) : a;
       return fp_to_int(scaled, static_cast<FpRound>((aux >> 4) & 7), (aux >> 7) & 1, sizeof(T));
@@ -582,6 +850,58 @@ uint64_t fp_lane(VecOp op, uint64_t ra, uint64_t rb, uint64_t rc, unsigned aux, 
       return 0;
   }
   (void)c;
+}
+
+uint64_t fp_elem(VecOp op, unsigned esize, uint64_t a, uint64_t b, uint64_t c) {
+  switch (esize) {
+    case 8: return fp_lane<double>(op, a, b, c, 8, 0);
+    case 4: return fp_lane<float>(op, a, b, c, 4, 0);
+    default: return fp_lane_half(op, a, b, c, 2, 0);
+  }
+}
+
+// Scalar operations of half precision values.
+uint64_t eval_half(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
+  auto lane = [&](VecOp op, uint64_t x, uint64_t y = 0, uint64_t z = 0, unsigned aux = 2) {
+    return fp_lane_half(op, x, y, z, aux, 0);
+  };
+  switch (in.op) {
+    case Opcode::FAdd: return lane(VecOp::FAdd, a, b);
+    case Opcode::FSub: return lane(VecOp::FSub, a, b);
+    case Opcode::FMul: return lane(VecOp::FMul, a, b);
+    case Opcode::FDiv: return lane(VecOp::FDiv, a, b);
+    case Opcode::FMax: return lane(VecOp::FMax, a, b) & 0xFFFF;
+    case Opcode::FMin: return lane(VecOp::FMin, a, b) & 0xFFFF;
+    case Opcode::FMaxNm: return lane(VecOp::FMaxNm, a, b) & 0xFFFF;
+    case Opcode::FMinNm: return lane(VecOp::FMinNm, a, b) & 0xFFFF;
+    case Opcode::FSqrt: return lane(VecOp::FSqrt, a);
+    case Opcode::FMadd: return lane(VecOp::FMla, a, b, c);
+    case Opcode::FRint: return lane(VecOp::FRint, a, 0, 0, 2 | ((in.aux & 7u) << 4));
+    case Opcode::FCmp: {
+      const double x = h_to_d(a), y = h_to_d(b);
+      if (std::isnan(x) || std::isnan(y)) return kFlagC | kFlagV;
+      if (x == y) return kFlagZ | kFlagC;
+      return x < y ? kFlagN : kFlagC;
+    }
+    default:
+      return 0;
+  }
+}
+
+// An integer (64-bit if `wide`) divided by 2^fbits, rounded once to half precision.
+uint64_t int_to_half(uint64_t v, bool sign, bool wide, unsigned fbits) {
+  if (!wide) v = sign ? static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(v))) : (v & 0xFFFF'FFFFu);
+  const bool negative = sign && static_cast<int64_t>(v) < 0;
+  uint64_t magnitude = negative ? 0 - v : v;
+  int exp = -static_cast<int>(fbits);
+  if (magnitude >> 53) {  // keep 53 bits, the rest as a sticky bit (exact for one more rounding)
+    const int shift = 64 - std::countl_zero(magnitude) - 53;
+    const uint64_t sticky = (magnitude & ((uint64_t{1} << shift) - 1)) ? 1 : 0;
+    magnitude = (magnitude >> shift) | sticky;
+    exp += shift;
+  }
+  const double d = std::ldexp(static_cast<double>(magnitude), exp);
+  return d_to_h(negative ? -d : d);
 }
 
 uint64_t eval_lane(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
@@ -686,6 +1006,75 @@ uint64_t eval_lane(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
         if (v == lane_smin(l.bits)) return static_cast<uint64_t>(lane_smax(l.bits));
         return static_cast<uint64_t>(-v);
       });
+    case VecOp::Dot: {
+      const Lanes bytes(1), words(4);
+      const bool sa = (aux >> 4) & 1, sb = (aux >> 5) & 1;
+      uint64_t r = 0;
+      for (unsigned w = 0; w < 2; ++w) {
+        uint32_t acc = static_cast<uint32_t>(words.get(c, w));
+        for (unsigned k = 4 * w; k < 4 * w + 4; ++k) {
+          const int64_t x = sa ? bytes.sget(a, k) : static_cast<int64_t>(bytes.get(a, k));
+          const int64_t y = sb ? bytes.sget(b, k) : static_cast<int64_t>(bytes.get(b, k));
+          acc += static_cast<uint32_t>(x * y);
+        }
+        r = words.put(r, w, acc);
+      }
+      return r;
+    }
+    case VecOp::SatRdmAcc: {
+      const bool sub = (aux >> 5) & 1;
+      return map2(a, b, l, [&](unsigned i) {
+        const int64_t p = l.sget(a, i) * l.sget(b, i);  // elements of at most 32 bits
+        const int64_t round = int64_t{1} << (l.bits - 2);
+        // (accumulator << bits +- 2 * p + 2^(bits - 1)) >> bits, without overflowing
+        const int64_t t = ((sub ? -p : p) + round) >> (l.bits - 1);
+        return sat_signed(l.sget(c, i) + t, l.bits) & lane_mask(l.bits);
+      });
+    }
+    case VecOp::SatAccMixed: {
+      const bool usq = (aux >> 4) & 1;
+      return map2(a, b, l, [&](unsigned i) -> uint64_t {
+        if (!usq) {  // signed a + unsigned b
+          const int64_t x = l.sget(a, i);
+          const uint64_t y = l.get(b, i);
+          const uint64_t max = static_cast<uint64_t>(lane_smax(l.bits));
+          if (x >= 0) return (y > max - static_cast<uint64_t>(x) ? max : static_cast<uint64_t>(x) + y) & lane_mask(l.bits);
+          const uint64_t neg = 0 - static_cast<uint64_t>(x);  // |x|
+          if (y >= neg) return std::min(y - neg, max) & lane_mask(l.bits);
+          return static_cast<uint64_t>(x + static_cast<int64_t>(y)) & lane_mask(l.bits);
+        }
+        const uint64_t x = l.get(a, i);  // unsigned a + signed b
+        const int64_t y = l.sget(b, i);
+        if (y >= 0) {
+          const uint64_t sum = (x + static_cast<uint64_t>(y)) & lane_mask(l.bits);
+          return (sum < x || (l.bits < 64 && x + static_cast<uint64_t>(y) > lane_mask(l.bits))) ? lane_mask(l.bits) : sum;
+        }
+        const uint64_t neg = 0 - static_cast<uint64_t>(y);
+        return neg > x ? 0 : x - neg;
+      });
+    }
+    case VecOp::URecpe:
+    case VecOp::URsqrte: {
+      const Lanes words(4);
+      return map2(a, b, words, [&](unsigned i) -> uint64_t {
+        const uint64_t v = words.get(a, i);
+        if (op == VecOp::URecpe) {
+          if (!(v >> 31)) return 0xFFFF'FFFFu;
+          return uint64_t{recip_estimate(static_cast<unsigned>(v >> 23)) & 0x1FF} << 23;
+        }
+        if (!(v >> 30)) return 0xFFFF'FFFFu;
+        return uint64_t{rsqrt_estimate(static_cast<unsigned>(v >> 23)) & 0x1FF} << 23;
+      });
+    }
+    case VecOp::Crc32: {
+      const uint32_t poly = (aux >> 4) & 1 ? 0x82F6'3B78u : 0xEDB8'8320u;
+      uint32_t crc = static_cast<uint32_t>(a);
+      for (unsigned byte = 0; byte < (aux & 0xF); ++byte) {
+        crc ^= static_cast<uint8_t>(b >> (8 * byte));
+        for (unsigned k = 0; k < 8; ++k) crc = (crc >> 1) ^ ((crc & 1) ? poly : 0);
+      }
+      return crc;
+    }
     case VecOp::FCvtUp: {
       const uint64_t src = (aux >> 4) & 1 ? a >> 32 : a & 0xFFFF'FFFFu;
       if (l.esize == 8) {
@@ -710,12 +1099,89 @@ uint64_t eval_lane(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
       };
       return pack(a) | (pack(b) << 32);
     }
+    case VecOp::FCmla:
+    case VecOp::FCadd: {
+      const unsigned rot = (aux >> 4) & 3;
+      const uint64_t sign_bit = uint64_t{1} << (l.bits - 1);
+      uint64_t r = 0;
+      // (Pairs of 64-bit elements span both halves: those are lifted as scalar operations.)
+      for (unsigned k = 0; k + 1 < l.count; k += 2) {
+        const uint64_t nre = l.get(a, k), nim = l.get(a, k + 1), mre = l.get(b, k), mim = l.get(b, k + 1);
+        uint64_t re, im;
+        if (op == VecOp::FCadd) {
+          const uint64_t e1 = rot == 1 ? mim ^ sign_bit : mim, e3 = rot == 1 ? mre : mre ^ sign_bit;
+          re = fp_elem(VecOp::FAdd, l.esize, nre, e1);
+          im = fp_elem(VecOp::FAdd, l.esize, nim, e3);
+        } else {
+          uint64_t e1, e2, e3;
+          switch (rot) {
+            case 0: e1 = mre, e2 = nre, e3 = mim; break;
+            case 1: e1 = mim ^ sign_bit, e2 = nim, e3 = mre; break;
+            case 2: e1 = mre ^ sign_bit, e2 = nre, e3 = mim ^ sign_bit; break;
+            default: e1 = mim, e2 = nim, e3 = mre ^ sign_bit; break;
+          }
+          re = fp_elem(VecOp::FMla, l.esize, e2, e1, l.get(c, k));
+          im = fp_elem(VecOp::FMla, l.esize, e2, e3, l.get(c, k + 1));
+        }
+        r = l.put(l.put(r, k, re), k + 1, im);
+      }
+      return r;
+    }
+    case VecOp::FJcvt: {
+      const double d = from_bits<double>(a);
+      uint32_t result = 0;
+      bool exact = false;
+      if (std::isfinite(d)) {
+        const double t = std::trunc(d);
+        uint64_t magnitude = 0;  // the low 64 bits of |t|
+        if (t != 0) {
+          const uint64_t bits = std::bit_cast<uint64_t>(t);
+          const int exp = static_cast<int>((bits >> 52) & 0x7FF) - 1075;
+          const uint64_t mant = (bits & ((uint64_t{1} << 52) - 1)) | (uint64_t{1} << 52);
+          magnitude = exp >= 64 ? 0 : exp >= 0 ? mant << exp : mant >> -exp;
+        }
+        const uint32_t low = static_cast<uint32_t>(magnitude);
+        result = t < 0 ? 0u - low : low;
+        exact = t == d && d >= -2147483648.0 && d <= 2147483647.0 && !(d == 0 && std::signbit(d));
+      }
+      if ((aux >> 4) & 1) return exact ? kFlagZ : 0;
+      return result;
+    }
+    case VecOp::BfDot: {
+      const Lanes halves(2), words(4);
+      uint64_t r = 0;
+      for (unsigned w = 0; w < 2; ++w) {
+        const uint32_t v = bf_dot_add(static_cast<uint32_t>(words.get(c, w)), static_cast<uint16_t>(halves.get(a, 2 * w)),
+                                      static_cast<uint16_t>(halves.get(a, 2 * w + 1)),
+                                      static_cast<uint16_t>(halves.get(b, 2 * w)),
+                                      static_cast<uint16_t>(halves.get(b, 2 * w + 1)));
+        r = words.put(r, w, v);
+      }
+      return r;
+    }
+    case VecOp::BfMlal: {
+      const Lanes halves(2), words(4);
+      const unsigned top = (aux >> 4) & 1;
+      uint64_t r = 0;
+      for (unsigned w = 0; w < 2; ++w) {
+        const uint64_t x = bf16_to_f32(halves.get(a, 2 * w + top)), y = bf16_to_f32(halves.get(b, 2 * w + top));
+        r = words.put(r, w, fp_lane<float>(VecOp::FMla, x, y, words.get(c, w), 4, 0));
+      }
+      return r;
+    }
+    case VecOp::BfCvt:
+      return f32_to_bf16(static_cast<uint32_t>(a)) | (f32_to_bf16(static_cast<uint32_t>(a >> 32)) << 16) |
+             (f32_to_bf16(static_cast<uint32_t>(b)) << 32) | (f32_to_bf16(static_cast<uint32_t>(b >> 32)) << 48);
     default: {
       if (op < VecOp::FAdd || op >= VecOp::Count_) return 0;
       const uint64_t fbits = (op == VecOp::FToInt || op == VecOp::IntToF) ? b : 0;
       return map2(a, b, l, [&](unsigned i) {
         const uint64_t x = l.get(a, i), y = l.get(b, i), z = l.get(c, i);
-        return l.esize == 8 ? fp_lane<double>(op, x, y, z, aux, fbits) : fp_lane<float>(op, x, y, z, aux, fbits);
+        switch (l.esize) {
+          case 8: return fp_lane<double>(op, x, y, z, aux, fbits);
+          case 4: return fp_lane<float>(op, x, y, z, aux, fbits);
+          default: return fp_lane_half(op, x, y, z, aux, fbits);
+        }
       });
     }
   }
@@ -728,8 +1194,24 @@ uint64_t evaluate_simd(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
     case Opcode::FAdd: case Opcode::FSub: case Opcode::FMul: case Opcode::FDiv: case Opcode::FMax:
     case Opcode::FMin: case Opcode::FMaxNm: case Opcode::FMinNm: case Opcode::FSqrt: case Opcode::FMadd:
     case Opcode::FRint: case Opcode::FCmp:
+      if (in.size == 2) return eval_half(in, a, b, c);
       return in.size == 4 ? eval_fp<float>(in, a, b, c) : eval_fp<double>(in, a, b, c);
     case Opcode::FCvt:
+      if (in.aux == 2) {  // from half precision (NaNs keep their payload, quieted)
+        const uint32_t f = f16_to_f32(static_cast<uint16_t>(a));
+        if (in.size == 4) return f;
+        Inst up;
+        up.op = Opcode::FCvt;
+        up.size = 8;
+        up.aux = 4;
+        return evaluate_simd(up, f, 0, 0);
+      }
+      if (in.size == 2) {  // to half precision
+        if (in.aux == 4) return f32_to_f16(static_cast<uint32_t>(a));
+        const double d = from_bits<double>(a);
+        if (std::isnan(d)) return ((a >> 48) & 0x8000) | 0x7E00 | ((a >> 42) & 0x1FF);
+        return d_to_h(d);
+      }
       if (in.aux == 4 && in.size == 8) {
         const float f = from_bits<float>(a);
         return std::isnan(f) ? to_bits(static_cast<double>(from_bits<float>(quiet(f)))) | FpTraits<double>::kQuiet
@@ -743,6 +1225,10 @@ uint64_t evaluate_simd(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
     case Opcode::FToInt: {
       const auto mode = static_cast<FpRound>(in.aux & 7);
       const bool sign = (in.aux >> 3) & 1;
+      if ((in.aux >> 5) & 1) {  // half precision source; imm = fraction bits
+        const double x = h_to_d(a);
+        return fp_to_int(in.imm ? std::ldexp(x, static_cast<int>(in.imm)) : x, mode, sign, in.size);
+      }
       return (in.aux >> 4) & 1 ? fp_to_int(from_bits<double>(a), mode, sign, in.size)
                                : fp_to_int(from_bits<float>(a), mode, sign, in.size);
     }
@@ -751,6 +1237,7 @@ uint64_t evaluate_simd(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
       const bool wide = (in.aux >> 1) & 1;
       const uint64_t u = wide ? a : (a & 0xFFFF'FFFFu);
       const int64_t s = wide ? static_cast<int64_t>(a) : static_cast<int64_t>(static_cast<int32_t>(a));
+      if (in.size == 2) return int_to_half(a, sign, wide, static_cast<unsigned>(in.imm));
       if (in.size == 4) return to_bits(sign ? static_cast<float>(s) : static_cast<float>(u));
       return to_bits(sign ? static_cast<double>(s) : static_cast<double>(u));
     }

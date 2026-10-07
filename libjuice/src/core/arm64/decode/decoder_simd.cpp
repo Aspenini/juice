@@ -17,8 +17,15 @@ namespace {
 enum VecPredCode : uint8_t { kEq, kGt, kGe, kHi, kHs, kTst };
 enum RoundCode : uint8_t { kNearestEven, kPlusInf, kMinusInf, kZero, kNearestAway };
 
-// Size in bytes for an FP `ftype` field (0 if unsupported: half precision / reserved).
-uint8_t fp_size(unsigned ftype) { return ftype == 0 ? 4 : ftype == 1 ? 8 : 0; }
+// Size in bytes for an FP `ftype` field (0 if reserved).
+uint8_t fp_size(unsigned ftype) { return ftype == 0 ? 4 : ftype == 1 ? 8 : ftype == 3 ? 2 : 0; }
+
+// VFPExpandImm for half precision.
+uint64_t expand_fp16_immediate(unsigned imm8) {
+  const unsigned a = (imm8 >> 7) & 1, b = (imm8 >> 6) & 1, cd = (imm8 >> 4) & 3, efgh = imm8 & 0xF;
+  const unsigned exp = ((b ^ 1) << 4) | (b ? 0b1100 : 0) | cd;
+  return (a << 15) | (exp << 10) | (efgh << 6);
+}
 
 void decode_fp_int_conversion(Instruction& i, uint32_t w) {
   i.sf = bit(w, 31);
@@ -26,8 +33,36 @@ void decode_fp_int_conversion(Instruction& i, uint32_t w) {
   const unsigned rmode = bits(w, 20, 19);
   const unsigned opcode = bits(w, 18, 16);
 
+  if (!i.sf && ftype == 1 && rmode == 3 && opcode == 6) {
+    i.op = Op::FJcvtzs;
+    return;
+  }
+  {  // FPRCVT: conversions between FP and integers held in SIMD&FP registers (different sizes)
+    const unsigned key = (rmode << 3) | opcode;
+    const uint8_t int_size = i.sf ? 8 : 4;
+    const uint8_t fsize = fp_size(ftype);
+    static constexpr int8_t kToInt[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, -1, -1, -1, -1,
+                                          -1, -1, 1, 1, 2, 2, 3, 3, -1, -1, 4, 4, -1, -1, -1, -1};
+    if (fsize && fsize != int_size && (kToInt[key] >= 0 || key == 0b11100 || key == 0b11101)) {
+      i.mem_size = fsize;
+      i.vector = true;
+      if (key >= 0b11100) {  // SCVTF / UCVTF Hd/Sd/Dd, Sn/Dn
+        i.op = Op::IntToFp;
+        i.mem_signed = key == 0b11100;
+      } else {
+        static constexpr uint8_t kRound[5] = {kNearestEven, kPlusInf, kMinusInf, kZero, kNearestAway};
+        i.op = Op::FpToInt;
+        i.shift = kRound[kToInt[key]];
+        i.mem_signed = !(key & 1);
+      }
+      return;
+    }
+  }
   if (opcode == 6 || opcode == 7) {  // FMOV (general)
-    if (rmode == 0 && ((!i.sf && ftype == 0) || (i.sf && ftype == 1))) {
+    if (rmode == 0 && ftype == 3) {  // FMOV Wd/Xd, Hn and back
+      i.mem_size = 2;
+      i.index = 0;
+    } else if (rmode == 0 && ((!i.sf && ftype == 0) || (i.sf && ftype == 1))) {
       i.mem_size = i.sf ? 8 : 4;
       i.index = 0;
     } else if (rmode == 1 && i.sf && ftype == 2) {
@@ -69,9 +104,10 @@ void decode_fp_data(Instruction& i, uint32_t w) {
       case 0b000011: i.op = Op::FpUnary; i.shift = static_cast<uint8_t>(FpUnaryOp::Sqrt); return;
       case 0b000100:
       case 0b000101:
+      case 0b000111:
         i.op = Op::FpCvt;
         i.esize = i.mem_size;
-        i.mem_size = opcode == 0b000100 ? 4 : 8;
+        i.mem_size = opcode == 0b000100 ? 4 : opcode == 0b000101 ? 8 : 2;
         if (i.esize == i.mem_size) i.op = Op::Invalid;
         return;
       case 0b001000: i.op = Op::FpRint; i.shift = kNearestEven; return;
@@ -83,6 +119,14 @@ void decode_fp_data(Instruction& i, uint32_t w) {
       case 0b001111:  // FRINTI (current rounding mode: round to nearest)
         i.op = Op::FpRint;
         i.shift = kNearestEven;
+        return;
+      case 0b010000: case 0b010001: case 0b010010: case 0b010011:  // FRINT32Z/32X/64Z/64X
+        i.op = Op::FpRint;
+        i.shift = (opcode & 1) ? kNearestEven : kZero;
+        i.amount = (opcode & 2) ? 2 : 1;
+        return;
+      case 0b000110:  // BFCVT Hd, Sn (ftype 01)
+        if (i.mem_size == 8) i.op = Op::BfCvt;
         return;
       default:
         return;
@@ -97,7 +141,7 @@ void decode_fp_data(Instruction& i, uint32_t w) {
   if ((w & 0x1C00) == 0x1000) {  // FMOV (scalar, immediate)
     if (bits(w, 9, 5) != 0) return;
     const unsigned imm8 = bits(w, 20, 13);
-    uint64_t value = expand_simd_immediate(i.mem_size == 8 ? 1 : 0, 0b1111, imm8);
+    uint64_t value = i.mem_size == 2 ? expand_fp16_immediate(imm8) : expand_simd_immediate(i.mem_size == 8 ? 1 : 0, 0b1111, imm8);
     if (i.mem_size == 4) value &= 0xFFFF'FFFFu;
     i.op = Op::FpMovImm;
     i.imm = static_cast<int64_t>(value);
@@ -125,6 +169,9 @@ void decode_fp_data(Instruction& i, uint32_t w) {
   }
 }
 
+void decode_fp_three_same_key(Instruction& i, unsigned key);
+void decode_int_three_same(Instruction& i, bool u, unsigned size, unsigned opcode);
+
 void decode_three_same(Instruction& i, uint32_t w) {
   const bool u = bit(w, 29);
   const unsigned size = bits(w, 23, 22);
@@ -146,10 +193,27 @@ void decode_three_same(Instruction& i, uint32_t w) {
     i.esize = (size & 1) ? 8 : 4;
     if (i.esize == 8 && !i.q && !i.scalar) return;
     const unsigned key = (u << 6) | (a << 5) | (opcode & 0x1F);
-    auto fp = [&](VecFp f) {
-      i.op = Op::VecFpOp;
-      i.shift = static_cast<uint8_t>(f);
-    };
+    if ((key == 0b0011101 || key == 0b0111101 || key == 0b1011001 || key == 0b1111001) && !(size & 1)) {
+      if (i.scalar) return;  // FMLAL / FMLSL / FMLAL2 / FMLSL2
+      i.op = Op::VecExtra;
+      i.shift = static_cast<uint8_t>(a ? VecExtraKind::Fmlsl : VecExtraKind::Fmlal);
+      i.esize = 2;
+      i.index = u;
+      return;
+    }
+    decode_fp_three_same_key(i, key);
+    return;
+  }
+  if (size == 3 && !i.q && !i.scalar) return;
+  decode_int_three_same(i, u, size, opcode);
+}
+
+void decode_fp_three_same_key(Instruction& i, unsigned key) {
+  auto fp = [&](VecFp f) {
+    i.op = Op::VecFpOp;
+    i.shift = static_cast<uint8_t>(f);
+  };
+  {
     switch (key) {
       case 0b0011000: fp(VecFp::MaxNm); break;
       case 0b0011001: fp(VecFp::Mla); break;
@@ -175,12 +239,14 @@ void decode_three_same(Instruction& i, uint32_t w) {
       case 0b1111100: fp(VecFp::CmGt); break;
       case 0b1111101: fp(VecFp::AcGt); break;
       case 0b1111110: fp(VecFp::MinP); break;
+      case 0b0111011: fp(VecFp::AMax); break;  // FAMAX (FEAT_FAMINMAX)
+      case 0b1111011: fp(VecFp::AMin); break;  // FAMIN
       default: break;
     }
-    return;
   }
-  if (size == 3 && !i.q && !i.scalar) return;
+}
 
+void decode_int_three_same(Instruction& i, bool u, unsigned size, unsigned opcode) {
   auto cmp = [&](uint8_t pred) {
     i.op = Op::VecCmp;
     i.shift = pred;
@@ -225,20 +291,28 @@ void decode_three_same(Instruction& i, uint32_t w) {
 }
 
 // Floating point two-register misc (and its scalar form).
-void decode_two_reg_misc_fp(Instruction& i, uint32_t w) {
+void decode_two_reg_misc_fp(Instruction& i, uint32_t w, bool half = false) {
   const bool u = bit(w, 29);
   const unsigned size = bits(w, 23, 22);
   const unsigned opcode = bits(w, 16, 12);
   const unsigned a = size >> 1, sz = size & 1;
   auto fp = [&](VecFpUn k, uint8_t amount = 0, bool sign = false) {
-    i.esize = sz ? 8 : 4;
+    i.esize = half ? 2 : sz ? 8 : 4;
     if (i.esize == 8 && !i.q && !i.scalar) return;
+    if (half && (k == VecFpUn::Rint32 || k == VecFpUn::Rint64)) return;
     i.op = Op::VecFpUnary;
     i.shift = static_cast<uint8_t>(k);
     i.amount = amount;
     i.mem_signed = sign;
   };
   const unsigned key = (u << 6) | (a << 5) | opcode;
+  if (half && (key == 0b0010110 || key == 0b0010111 || key == 0b0110110)) return;
+  if ((key == 0b0111100 || key == 0b1111100) && !half && !sz && !i.scalar) {  // URECPE / URSQRTE
+    i.op = Op::VecIntUnary;
+    i.shift = static_cast<uint8_t>(u ? VecIntUn::URsqrte : VecIntUn::URecpe);
+    i.esize = 4;
+    return;
+  }
   switch (key) {
     case 0b0010110:  // FCVTN / FCVTN2: esize = destination size
       if (i.scalar) return;
@@ -247,6 +321,16 @@ void decode_two_reg_misc_fp(Instruction& i, uint32_t w) {
       i.esize = sz ? 4 : 2;
       i.index = i.q;
       return;
+    case 0b0110110:  // BFCVTN / BFCVTN2
+      if (i.scalar || sz) return;
+      i.op = Op::BfCvtn;
+      i.esize = 2;
+      i.index = i.q;
+      return;
+    case 0b0011110: if (!i.scalar) fp(VecFpUn::Rint32, kZero); return;        // FRINT32Z
+    case 0b0011111: if (!i.scalar) fp(VecFpUn::Rint64, kZero); return;        // FRINT64Z
+    case 0b1011110: if (!i.scalar) fp(VecFpUn::Rint32, kNearestEven); return;  // FRINT32X
+    case 0b1011111: if (!i.scalar) fp(VecFpUn::Rint64, kNearestEven); return;  // FRINT64X
     case 0b0010111:  // FCVTL / FCVTL2: esize = destination size
       if (i.scalar) return;
       i.op = Op::VecFpUnary;
@@ -323,6 +407,7 @@ void decode_two_reg_misc(Instruction& i, uint32_t w) {
       if (size == 1 && u) int_un(VecIntUn::Rbit);
       break;
     case 0b00010: if (size != 3) int_un(VecIntUn::AddLP); break;
+    case 0b00011: if (size != 3 || i.q || i.scalar) int_un(u ? VecIntUn::UsqAdd : VecIntUn::SuqAdd); break;
     case 0b00110: if (size != 3) int_un(VecIntUn::AdaLP); break;
     case 0b00100: if (size != 3) int_un(u ? VecIntUn::Clz : VecIntUn::Cls); break;
     case 0b00111: if (size != 3 || i.q || i.scalar) int_un(u ? VecIntUn::SatNeg : VecIntUn::SatAbs); break;
@@ -357,10 +442,10 @@ void decode_across_lanes(Instruction& i, uint32_t w) {
   const bool u = bit(w, 29);
   const unsigned size = bits(w, 23, 22);
   const unsigned opcode = bits(w, 16, 12);
-  if (u && (opcode == 0b01100 || opcode == 0b01111)) {  // FMAXNMV / FMINNMV / FMAXV / FMINV (4S)
-    if ((size & 1) || !i.q) return;
+  if (opcode == 0b01100 || opcode == 0b01111) {  // FMAXNMV / FMINNMV / FMAXV / FMINV (4S, or 4H/8H if !u)
+    if ((size & 1) || (u && !i.q)) return;
     i.op = Op::VecFpAcross;
-    i.esize = 4;
+    i.esize = u ? 4 : 2;
     const bool min = size >> 1;
     i.shift = static_cast<uint8_t>(opcode == 0b01100 ? (min ? VecFp::MinNm : VecFp::MaxNm)
                                                      : (min ? VecFp::Min : VecFp::Max));
@@ -439,7 +524,7 @@ void decode_shift_immediate(Instruction& i, uint32_t w) {
       break;
     case 0b11100:  // SCVTF / UCVTF (fixed point)
     case 0b11111:  // FCVTZS / FCVTZU (fixed point)
-      if (i.esize < 4 || !wide_ok) return;
+      if (i.esize < 2 || !wide_ok) return;
       shift_op(opcode == 0b11100 ? VecShiftKind::FixedToFp : VecShiftKind::FpToFixed, 2 * ebits - immhb);
       break;
     case 0b10100:  // SSHLL / USHLL (esize = source element size)
@@ -458,7 +543,14 @@ void decode_three_different(Instruction& i, uint32_t w) {
   const bool u = bit(w, 29);
   const unsigned size = bits(w, 23, 22);
   const unsigned opcode = bits(w, 15, 12);
-  if (size == 3) return;  // (PMULL 1Q needs the crypto extension)
+  if (size == 3) {
+    if (opcode == 0b1110 && !u) {  // PMULL / PMULL2 Vd.1Q
+      i.op = Op::Crypto;
+      i.shift = static_cast<uint8_t>(CryptoOp::Pmull64);
+      i.index = i.q;
+    }
+    return;
+  }
   i.esize = static_cast<uint8_t>(1u << size);
   i.index = i.q;
   i.mem_signed = !u;
@@ -483,17 +575,63 @@ void decode_by_element(Instruction& i, uint32_t w) {
   const unsigned size = bits(w, 23, 22);
   const unsigned opcode = bits(w, 15, 12);
   const unsigned l = bit(w, 21), m = bit(w, 20), h = bit(w, 11);
-  const bool fp = (opcode == 0b0001 || opcode == 0b0101 || opcode == 0b1001) && size >= 2;
+  auto extra = [&](VecExtraKind k, uint8_t esize, uint8_t amount, uint8_t index2, uint8_t rm) {
+    i.op = Op::VecExtra;
+    i.shift = static_cast<uint8_t>(k);
+    i.esize = esize;
+    i.amount = amount;
+    i.imm_form = true;
+    i.index2 = index2;
+    i.rm = rm;
+  };
+  const uint8_t rm5 = static_cast<uint8_t>((m << 4) | bits(w, 19, 16)), rm4 = static_cast<uint8_t>(bits(w, 19, 16));
+  const uint8_t hl = static_cast<uint8_t>((h << 1) | l), hlm = static_cast<uint8_t>((h << 2) | (l << 1) | m);
+  if (!i.scalar) {
+    if (opcode == 0b1110 && size == 2) {  // SDOT / UDOT
+      extra(VecExtraKind::Dot, 1, u ? 0 : 3, hl, rm5);
+      return;
+    }
+    if (opcode == 0b1111 && !u) {
+      switch (size) {
+        case 0: extra(VecExtraKind::Dot, 1, 1, hl, rm5); return;  // SUDOT
+        case 2: extra(VecExtraKind::Dot, 1, 2, hl, rm5); return;  // USDOT
+        case 1: extra(VecExtraKind::BfDot, 2, 0, hl, rm5); return;
+        default:
+          extra(VecExtraKind::BfMlal, 2, 0, hlm, rm4);
+          i.index = i.q;
+          return;
+      }
+    }
+    if (u && (opcode & 0b1001) == 0b0001 && (size == 1 || (size == 2 && !l))) {  // FCMLA (by element)
+      extra(VecExtraKind::Fcmla, size == 1 ? 2 : 4, (opcode >> 1) & 3, size == 1 ? hl : static_cast<uint8_t>(h), rm5);
+      if (size == 2 && !i.q) i.op = Op::Unsupported;
+      return;
+    }
+    if (size == 2 && ((!u && (opcode == 0b0000 || opcode == 0b0100)) || (u && (opcode == 0b1000 || opcode == 0b1100)))) {
+      extra((opcode & 0b0100) ? VecExtraKind::Fmlsl : VecExtraKind::Fmlal, 2, 0, hlm, rm4);
+      i.index = u;  // FMLAL2 / FMLSL2
+      return;
+    }
+  }
+  if (u && (opcode == 0b1101 || opcode == 0b1111) && (size == 1 || size == 2)) {  // SQRDMLAH / SQRDMLSH
+    extra(opcode == 0b1101 ? VecExtraKind::SqRdmlah : VecExtraKind::SqRdmlsh, static_cast<uint8_t>(1u << size), 0,
+          size == 1 ? hlm : hl, size == 1 ? rm4 : rm5);
+    return;
+  }
+  const bool fp = (opcode == 0b0001 || opcode == 0b0101 || opcode == 0b1001) && (size >= 2 || size == 0);
   if (fp) {
     if (opcode != 0b1001 && u) return;
-    i.esize = (size & 1) ? 8 : 4;
-    if (i.esize == 8) {
+    i.esize = size == 0 ? 2 : (size & 1) ? 8 : 4;
+    if (i.esize == 2) {
+      i.index2 = hlm;
+      i.rm = rm4;
+    } else if (i.esize == 8) {
       if (l || (!i.q && !i.scalar)) return;
       i.index2 = static_cast<uint8_t>(h);
     } else {
       i.index2 = static_cast<uint8_t>((h << 1) | l);
     }
-    i.rm = static_cast<uint8_t>((m << 4) | bits(w, 19, 16));
+    if (i.esize != 2) i.rm = static_cast<uint8_t>((m << 4) | bits(w, 19, 16));
     i.op = Op::VecElemOp;
     i.shift = static_cast<uint8_t>(opcode == 0b0001 ? VecElemKind::FMla
                                    : opcode == 0b0101 ? VecElemKind::FMls
@@ -552,9 +690,134 @@ void decode_fp_fixed_conversion(Instruction& i, uint32_t w) {
   }
 }
 
+// Advanced SIMD three same (extra) and its scalar form: SQRDMLAH/SH, dot
+// products, matrix multiplies, BFloat16 and complex arithmetic.
+void decode_three_same_extra(Instruction& i, uint32_t w) {
+  const bool u = bit(w, 29);
+  const unsigned size = bits(w, 23, 22);
+  const unsigned opcode = bits(w, 14, 11);
+  auto extra = [&](VecExtraKind k, uint8_t esize, uint8_t amount = 0) {
+    i.op = Op::VecExtra;
+    i.shift = static_cast<uint8_t>(k);
+    i.esize = esize;
+    i.amount = amount;
+  };
+  if (opcode <= 1) {  // SQRDMLAH / SQRDMLSH (also scalar)
+    if (u && (size == 1 || size == 2))
+      extra(opcode ? VecExtraKind::SqRdmlsh : VecExtraKind::SqRdmlah, static_cast<uint8_t>(1u << size));
+    return;
+  }
+  if (i.scalar) return;
+  const uint8_t complex_size = size == 1 ? 2 : size == 2 ? 4 : (size == 3 && i.q) ? 8 : 0;
+  switch (opcode) {
+    case 0b0010: if (size == 2) extra(VecExtraKind::Dot, 1, u ? 0 : 3); break;   // SDOT / UDOT
+    case 0b0011: if (size == 2 && !u) extra(VecExtraKind::Dot, 1, 2); break;     // USDOT
+    case 0b0100: if (size == 2 && i.q) extra(VecExtraKind::Mmla, 1, u ? 0 : 3); break;  // SMMLA / UMMLA
+    case 0b0101: if (size == 2 && i.q && !u) extra(VecExtraKind::Mmla, 1, 2); break;    // USMMLA
+    case 0b1101: if (u && size == 1 && i.q) extra(VecExtraKind::BfMmla, 2); break;
+    case 0b1111:
+      if (u && size == 1) {
+        extra(VecExtraKind::BfDot, 2);
+      } else if (u && size == 3) {  // BFMLALB / BFMLALT (always 4S)
+        extra(VecExtraKind::BfMlal, 2);
+        i.index = i.q;
+      }
+      break;
+    case 0b1000: case 0b1001: case 0b1010: case 0b1011:
+      if (u && complex_size) extra(VecExtraKind::Fcmla, complex_size, opcode & 3);
+      break;
+    case 0b1100: case 0b1110:
+      if (u && complex_size) extra(VecExtraKind::Fcadd, complex_size, opcode == 0b1100 ? 1 : 3);
+      break;
+    default: break;
+  }
+}
+
+// The cryptographic extensions: AES, SHA-1, SHA-256, SHA-512 and SHA-3.
+// Returns false if `w` is not in one of their encoding groups.
+bool decode_crypto(Instruction& i, uint32_t w) {
+  auto crypto = [&](CryptoOp k) {
+    i.op = Op::Crypto;
+    i.shift = static_cast<uint8_t>(k);
+  };
+  if ((w & 0xFFFE0C00u) == 0x4E280800u) {  // AES
+    switch (bits(w, 16, 12)) {
+      case 0b00100: crypto(CryptoOp::AesE); break;
+      case 0b00101: crypto(CryptoOp::AesD); break;
+      case 0b00110: crypto(CryptoOp::AesMc); break;
+      case 0b00111: crypto(CryptoOp::AesImc); break;
+      default: break;
+    }
+    return true;
+  }
+  if ((w & 0xFFE08C00u) == 0x5E000000u) {  // SHA three register
+    static constexpr CryptoOp ops[7] = {CryptoOp::Sha1C,   CryptoOp::Sha1P,    CryptoOp::Sha1M,    CryptoOp::Sha1Su0,
+                                        CryptoOp::Sha256H, CryptoOp::Sha256H2, CryptoOp::Sha256Su1};
+    const unsigned opcode = bits(w, 14, 12);
+    if (opcode < 7) crypto(ops[opcode]);
+    return true;
+  }
+  if ((w & 0xFFFE0C00u) == 0x5E280800u) {  // SHA two register
+    switch (bits(w, 16, 12)) {
+      case 0b00000: crypto(CryptoOp::Sha1H); break;
+      case 0b00001: crypto(CryptoOp::Sha1Su1); break;
+      case 0b00010: crypto(CryptoOp::Sha256Su0); break;
+      default: break;
+    }
+    return true;
+  }
+  if ((w & 0xFFE0F000u) == 0xCE608000u) {  // SHA512 three register
+    static constexpr CryptoOp ops[4] = {CryptoOp::Sha512H, CryptoOp::Sha512H2, CryptoOp::Sha512Su1, CryptoOp::Rax1};
+    crypto(ops[bits(w, 11, 10)]);
+    return true;
+  }
+  if ((w & 0xFFFFF800u) == 0xCEC08000u) {  // SHA512SU0 / SM4E
+    crypto(bit(w, 10) ? CryptoOp::Sm4E : CryptoOp::Sha512Su0);
+    return true;
+  }
+  if ((w & 0xFF808000u) == 0xCE000000u) {  // four register: EOR3, BCAX, SM3SS1
+    const unsigned op0 = bits(w, 22, 21);
+    i.ra = bits(w, 14, 10);
+    if (op0 == 0) crypto(CryptoOp::Eor3);
+    else if (op0 == 1) crypto(CryptoOp::Bcax);
+    else if (op0 == 2) crypto(CryptoOp::Sm3Ss1);
+    return true;
+  }
+  if ((w & 0xFFE0C000u) == 0xCE408000u) {  // SM3TT1A / SM3TT1B / SM3TT2A / SM3TT2B
+    static constexpr CryptoOp ops[4] = {CryptoOp::Sm3Tt1a, CryptoOp::Sm3Tt1b, CryptoOp::Sm3Tt2a, CryptoOp::Sm3Tt2b};
+    crypto(ops[bits(w, 11, 10)]);
+    i.index = bits(w, 13, 12);
+    return true;
+  }
+  if ((w & 0xFFE0F000u) == 0xCE60C000u) {  // SM3PARTW1 / SM3PARTW2 / SM4EKEY
+    const unsigned opcode = bits(w, 11, 10);
+    if (opcode < 3) crypto(opcode == 0 ? CryptoOp::Sm3PartW1 : opcode == 1 ? CryptoOp::Sm3PartW2 : CryptoOp::Sm4EKey);
+    return true;
+  }
+  if ((w & 0xFFE00000u) == 0xCE800000u) {  // XAR
+    crypto(CryptoOp::Xar);
+    i.imm = bits(w, 15, 10);
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 bool decode_simd_structure(Instruction& i, uint32_t w) {
+  if ((w & 0xBFBFFC00u) == 0x0D018400u) {  // LDAP1 / STL1 {Vt.D}[index]
+    i.q = bit(w, 30);
+    i.rd = bits(w, 4, 0);
+    i.rn = bits(w, 9, 5);
+    i.vector = true;
+    i.op = bit(w, 22) ? Op::VLdLane : Op::VStLane;
+    i.release = !bit(w, 22);
+    i.esize = 8;
+    i.index = i.q;
+    i.amount = 1;
+    i.imm = 8;
+    return true;
+  }
   const bool multi_post = (w & 0xBFA00000u) == 0x0C800000u;
   const bool multi = (w & 0xBFBF0000u) == 0x0C000000u || multi_post;
   const bool single_post = (w & 0xBF800000u) == 0x0D800000u;
@@ -665,6 +928,7 @@ void decode_simd_fp(Instruction& i, uint32_t w) {
   }
 
   // --- Advanced SIMD ---
+  if (decode_crypto(i, w)) return;
   if ((w & 0xFFE0FC00u) == 0x5E000400u) {  // scalar copy: DUP Vd, Vn.T[i] (MOV scalar)
     unsigned imm5 = bits(w, 20, 16);
     if ((imm5 & 0xF) == 0) return;
@@ -681,9 +945,9 @@ void decode_simd_fp(Instruction& i, uint32_t w) {
   }
   if ((w & 0xDF3E0C00u) == 0x5E300800u) {  // scalar pairwise, floating point: FADDP / FMAXP / ... (2 lanes)
     const unsigned opcode = bits(w, 16, 12), size = bits(w, 23, 22);
-    if (!bit(w, 29)) return;  // (half precision forms)
+    if (!bit(w, 29) && (size & 1)) return;
     i.scalar = true;
-    i.esize = (size & 1) ? 8 : 4;
+    i.esize = !bit(w, 29) ? 2 : (size & 1) ? 8 : 4;  // U = 0: half precision
     const bool min = size >> 1;
     VecFp f;
     switch (opcode) {
@@ -694,6 +958,33 @@ void decode_simd_fp(Instruction& i, uint32_t w) {
     }
     i.op = Op::VecFpOp;
     i.shift = static_cast<uint8_t>(f);
+    return;
+  }
+  if ((w & 0xDF60C400u) == 0x5E400400u) {  // scalar three same (FP16)
+    i.scalar = true;
+    i.q = false;
+    i.esize = 2;
+    decode_fp_three_same_key(i, (bit(w, 29) << 6) | (bit(w, 23) << 5) | 0x18 | bits(w, 13, 11));
+    return;
+  }
+  if ((w & 0xDF7E0C00u) == 0x5E780800u) {  // scalar two-register miscellaneous (FP16)
+    i.scalar = true;
+    i.q = false;
+    decode_two_reg_misc_fp(i, w, true);
+    return;
+  }
+  if ((w & 0xDF200C00u) == 0x5E200000u) {  // scalar three different: SQDMLAL / SQDMLSL / SQDMULL
+    const unsigned opcode = bits(w, 15, 12);
+    if (bit(w, 29) || (opcode != 0b1001 && opcode != 0b1011 && opcode != 0b1101)) return;
+    i.scalar = true;
+    i.q = false;
+    decode_three_different(i, w);
+    return;
+  }
+  if ((w & 0xDF208400u) == 0x5E008400u) {  // scalar three same (extra)
+    i.scalar = true;
+    i.q = false;
+    decode_three_same_extra(i, w);
     return;
   }
   if ((w & 0xDF200400u) == 0x5E200400u) {  // scalar three same
@@ -740,7 +1031,13 @@ void decode_simd_fp(Instruction& i, uint32_t w) {
     unsigned op = bit(w, 29);
     unsigned cmode = bits(w, 15, 12);
     unsigned imm8 = (bits(w, 18, 16) << 5) | bits(w, 9, 5);
-    if (bit(w, 11)) return;  // FMOV (half precision)
+    if (bit(w, 11)) {  // FMOV Vd.4H/8H, #imm
+      if (op || cmode != 0b1111) return;
+      const uint64_t h = expand_fp16_immediate(imm8);
+      i.op = Op::VMovImm;
+      i.imm = static_cast<int64_t>(h * 0x0001000100010001ull);
+      return;
+    }
     if (op == 1 && cmode == 0b1111 && !i.q) { i.op = Op::Invalid; return; }
     uint64_t value = expand_simd_immediate(op, cmode, imm8);
     bool is_orr_bic = (cmode & 1) && cmode < 0b1100;
@@ -802,8 +1099,21 @@ void decode_simd_fp(Instruction& i, uint32_t w) {
     }
   }
 
+  if ((w & 0x9F60C400u) == 0x0E400400u) {  // three same (FP16)
+    i.esize = 2;
+    decode_fp_three_same_key(i, (bit(w, 29) << 6) | (bit(w, 23) << 5) | 0x18 | bits(w, 13, 11));
+    return;
+  }
+  if ((w & 0x9F7E0C00u) == 0x0E780800u) {  // two-register miscellaneous (FP16)
+    decode_two_reg_misc_fp(i, w, true);
+    return;
+  }
   if ((w & 0x9F200400u) == 0x0E200400u) {  // three same
     decode_three_same(i, w);
+    return;
+  }
+  if ((w & 0x9F208400u) == 0x0E008400u) {  // three same (extra)
+    decode_three_same_extra(i, w);
     return;
   }
   if ((w & 0x9F3E0C00u) == 0x0E200800u) {  // two-register miscellaneous

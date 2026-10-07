@@ -82,6 +82,9 @@ bool has_side_effects(Opcode op) {
     case Opcode::AtomicRmw:
     case Opcode::AtomicCas:
     case Opcode::AtomicCasPair:
+    case Opcode::AtomicRmwPair:
+    case Opcode::MemOp:
+    case Opcode::StateOp:
     case Opcode::Counter:  // not removable: each read must see the time it runs at
       return true;
     default:
@@ -97,6 +100,9 @@ bool is_pure(Opcode op) {
     case Opcode::AtomicRmw:
     case Opcode::AtomicCas:
     case Opcode::AtomicCasPair:
+    case Opcode::AtomicRmwPair:
+    case Opcode::MemOp:
+    case Opcode::StateOp:
     case Opcode::Nop:
     case Opcode::GetReg:
     case Opcode::SetReg:
@@ -114,6 +120,7 @@ bool is_pure(Opcode op) {
 bool has_result(Opcode op) {
   switch (op) {
     case Opcode::Fence:
+    case Opcode::StateOp:
     case Opcode::Nop:
     case Opcode::SetReg:
     case Opcode::Store:
@@ -139,6 +146,7 @@ unsigned arg_count(Opcode op) {
     case Opcode::StateAddr:
     case Opcode::Fence:
     case Opcode::Counter:
+    case Opcode::StateOp:
     case Opcode::Count_:
       return 0;
     case Opcode::SetReg:
@@ -167,6 +175,7 @@ unsigned arg_count(Opcode op) {
     case Opcode::FMadd:
     case Opcode::VLane:
     case Opcode::AtomicCas:
+    case Opcode::MemOp:
     case Opcode::Select:
     case Opcode::Adc:
     case Opcode::Sbc:
@@ -223,7 +232,10 @@ const char* opcode_name(Opcode op) {
     case Opcode::AtomicRmw: return "atomic.rmw";
     case Opcode::AtomicCas: return "atomic.cas";
     case Opcode::AtomicCasPair: return "atomic.cas_pair";
+    case Opcode::AtomicRmwPair: return "atomic.rmw_pair";
+    case Opcode::MemOp: return "mem_op";
     case Opcode::Counter: return "counter";
+    case Opcode::StateOp: return "state_op";
     case Opcode::VAdd: return "v.add";
     case Opcode::VSub: return "v.sub";
     case Opcode::VMul: return "v.mul";
@@ -266,7 +278,9 @@ const char* opcode_name(Opcode op) {
 
 namespace {
 
-uint64_t mask_to(uint64_t v, unsigned size) { return size == 4 ? (v & 0xFFFF'FFFFu) : v; }
+uint64_t mask_to(uint64_t v, unsigned size) {
+  return size == 4 ? (v & 0xFFFF'FFFFu) : size == 2 ? (v & 0xFFFF) : size == 1 ? (v & 0xFF) : v;
+}
 
 uint64_t umulh(uint64_t a, uint64_t b) {
   uint64_t a_lo = a & 0xFFFF'FFFFu, a_hi = a >> 32;
@@ -414,6 +428,7 @@ uint64_t evaluate(const Inst& in, uint64_t a, uint64_t b, uint64_t c) {
     }
     case Opcode::CondHolds: return condition_holds(in.aux, a) ? 1 : 0;
     default:
+      if (in.op == Opcode::FCmp) return evaluate_simd(in, a, b, c);  // packed flags; size is the operands'
       if (is_vector_or_fp(in.op)) return mask_to(evaluate_simd(in, a, b, c), size);
       return 0;
   }
@@ -456,6 +471,10 @@ std::string to_string(const Block& block, const SlotNamer& namer) {
         break;
       case Opcode::StoreFromState:
         line += std::format(" [{}], {}, {} bytes", val(in.args[0]), slot(in.imm), in.size);
+        break;
+      case Opcode::StateOp:
+        line += std::format(".{} {}, {}, {}, aux {}", in.imm & 0xFF, slot((in.imm >> 8) & 0xFF),
+                            slot((in.imm >> 16) & 0xFF), slot((in.imm >> 24) & 0xFF), in.aux);
         break;
       default: {
         line += in.size == 4 ? "32" : "";

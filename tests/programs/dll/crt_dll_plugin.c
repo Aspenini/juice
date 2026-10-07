@@ -16,9 +16,14 @@ EXPORT const char* plugin_name(void) { return "juice plugin"; }
 /* Forwarded to the program's other DLL. */
 #pragma comment(linker, "/export:plugin_add=crt_dll_lib.lib_add")
 
+static void write_line(const char* text) {
+  DWORD written;
+  WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, lstrlenA(text), &written, NULL);
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void* reserved) {
-  (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) DisableThreadLibraryCalls(instance);
+  if (reason == DLL_PROCESS_DETACH) write_line(reserved ? "plugin: process detach (exit)\n" : "plugin: process detach\n");
   if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) InterlockedIncrement(&plugin_thread_notifications);
   return TRUE;
 }

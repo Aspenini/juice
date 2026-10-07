@@ -147,7 +147,9 @@ target("juice-guest-tests")
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
                "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings", "vector")
     -- C runtime programs, built /MT and /MD.
-    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_seh.c", "crt_eh.cpp")
+    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_threadctl.c", "crt_seh.c", "crt_eh.cpp", "crt_crypto.c",
+               "crt_simdext.c", "crt_fp16.c", "crt_newops.c",
+               "crt_newops2.c", "crt_abi.cpp")
 
     on_load(function (target)
         import("lib.detect.find_program")
@@ -182,12 +184,33 @@ target("juice-guest-tests")
         local function exe_name(name, variant, arch)
             return path.join(outdir, name .. "-" .. variant .. "." .. arch .. ".exe")
         end
+        -- Extra compiler flags for one architecture's build of a program (optional ARM64 extensions).
+        local arch_flags = {
+            crt_crypto = {arm64 = {"/clang:-march=armv8.2-a+crypto+sha3"}},
+            crt_simdext = {arm64 = {"/clang:-march=armv8.6-a+fp16fml"}},
+            crt_fp16 = {arm64 = {"/clang:-march=armv8.2-a+fp16"}},
+            crt_newops = {arm64 = {"/clang:-march=armv8.9-a+lse128+mops+cssc+rcpc3+wfxt"}},
+            crt_newops2 = {arm64 = {"/clang:-march=armv8.9-a+sm4+cmpbr+cpa+lsui+fprcvt+faminmax"}},
+        }
+        -- The x64 reference of crt_fp16 uses _Float16, whose conversions are compiler-rt builtins.
+        local builtins = os.files(path.join(path.directory(path.directory(cc)), "lib", "clang", "*", "lib", "windows",
+                                            "clang_rt.builtins-x86_64.lib"))
+        local arch_libs = {}
+        if #builtins > 0 then
+            arch_libs.crt_fp16 = {x64 = {builtins[1]}}
+        end
+        local abi_libs = {"gdiplus.lib", "d2d1.lib", "dwrite.lib", "windowscodecs.lib", "ole32.lib", "oleaut32.lib"}
+        arch_libs.crt_abi = {x64 = abi_libs, arm64 = abi_libs}
         local function add_job(name, variant, src, deps, flags, ldflags)
             for _, a in ipairs(arches) do
                 local exe = exe_name(name, variant, a[1])
-                local argv = table.join({"--target=" .. a[2]}, flags, {"/" .. variant, src,
+                local extra = (arch_flags[name] or {})[a[1]] or {}
+                local libs = (arch_libs[name] or {})[a[1]]
+                local link = ldflags
+                if libs then link = table.join(#ldflags > 0 and ldflags or {"/link"}, libs) end
+                local argv = table.join({"--target=" .. a[2]}, flags, extra, {"/" .. variant, src,
                                         "/Fo" .. path.join(outdir, name .. "-" .. variant .. "." .. a[1] .. ".obj"),
-                                        "/Fe" .. exe}, ldflags)
+                                        "/Fe" .. exe}, link)
                 table.insert(jobs, {name = name .. " (" .. a[1] .. ", /" .. variant .. ")", exe = exe,
                                     steps = {argv}, files = table.join({src}, deps)})
             end
@@ -276,7 +299,7 @@ target("juice-guest-tests")
             -- A program with DLLs of its own (programs/dll), each architecture and
             -- runtime in a directory of its own so that the DLLs sit next to the program.
             local dll_src = path.join(scriptdir, "programs", "dll")
-            local dll_files = os.files(path.join(dll_src, "*.c"))
+            local dll_files = os.files(path.join(dll_src, "*.[ch]"))
             for _, rt in ipairs({"MT", "MD"}) do
                 local exes = {}
                 for _, a in ipairs(arches) do
@@ -288,11 +311,18 @@ target("juice-guest-tests")
                     local lib = path.join(dir, "crt_dll_lib")
                     local exe = path.join(dir, "crt_dll.exe")
                     exes[a[1]] = exe
+                    local sub = path.join(dir, "sub")
+                    local deplib = path.join(sub, "crt_dll_deplib")
                     table.insert(jobs, {name = "crt_dll (" .. a[1] .. ", /" .. rt .. ")", exe = exe, dir = dir,
-                                        files = dll_files, steps = {
+                                        subdirs = {sub}, files = dll_files, steps = {
                         compile(path.join(dll_src, "crt_dll_lib.c"), lib .. ".dll", {"/LD"}),
                         compile(path.join(dll_src, "crt_dll_plugin.c"), path.join(dir, "crt_dll_plugin.dll"),
                                 {"/LD", "/link", lib .. ".lib"}),
+                        compile(path.join(dll_src, "crt_dll_deplib.c"), deplib .. ".dll", {"/LD"}),
+                        compile(path.join(dll_src, "crt_dll_dep.c"), path.join(sub, "crt_dll_dep.dll"),
+                                {"/LD", "/link", deplib .. ".lib"}),
+                        compile(path.join(dll_src, "crt_dll_com.c"), path.join(dir, "crt_dll_com.dll"),
+                                {"/LD", "/link", "ole32.lib", "uuid.lib"}),
                         compile(path.join(dll_src, "crt_dll.c"), exe, {"/link", lib .. ".lib"})}})
                 end
                 for _, mode in ipairs({"jit", "interp"}) do
@@ -320,6 +350,7 @@ target("juice-guest-tests")
         runjobs("guest_programs", function (index)
             local job = jobs[index]
             if job.dir then os.mkdir(job.dir) end
+            for _, dir in ipairs(job.subdirs or {}) do os.mkdir(dir) end
             depend.on_changed(function ()
                 progress.show(opt.progress, "${color.build.object}compiling.guest %s", job.name)
                 for _, argv in ipairs(job.steps) do

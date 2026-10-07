@@ -54,9 +54,19 @@ enum class Opcode : uint8_t {
   Fence,           // full memory barrier
   AtomicRmw,       // a = address, b = operand; size = 1/2/4/8; aux = AtomicOp -> old value (zero-extended)
   AtomicCas,       // a = address, b = expected, c = desired; size    -> old value (zero-extended)
-  Counter,         // the virtual counter (CNTVCT_EL0): nanoseconds of a monotonic clock
+  Counter,         // the virtual counter (CNTVCT_EL0): nanoseconds of a monotonic clock; aux = 1: a
+                   //   random number instead (RNDR)
   AtomicCasPair,   // a = address, b = pointer to {expected lo, hi, desired lo, hi}
                    //   (128-bit compare-and-swap)                    -> 0 if swapped, 1 if not
+  AtomicRmwPair,   // a = address, b = pointer to the 128-bit operand {lo, hi}, which receives the
+                   //   old value; aux = AtomicOp (Clr, Set or Swap)
+  MemOp,           // a = destination, b = source (or the byte value), c = byte count; aux =
+                   //   0 memmove, 1 forward byte-by-byte copy, 2 memset
+
+  // --- Operations on 128-bit values held in pairs of state slots (lo, hi) ---------
+  StateOp,         // imm = StateOpKind | d << 8 | n << 16 | m << 24, the first slots of the
+                   //   destination and source pairs; aux as the kind describes. Reads and
+                   //   writes guest state directly (see state_ops.cpp)
 
   // --- Vector lane operations on 64-bit vector halves --------------------------
   // Low nibble of aux = element size in bytes (1, 2, 4, 8). size is always 8.
@@ -82,7 +92,7 @@ enum class Opcode : uint8_t {
   FCvt,            // convert from aux (source size) to size
   FToInt,          // size = integer size; aux = FpRound | signed << 3 | (source is double) << 4
   IntToF,          // size = fp size; aux = signed | (source is 64-bit) << 1
-  FRint,           // round to integral; aux = FpRound
+  FRint,           // round to integral; aux = FpRound | 8 (int32 range) / 16 (int64 range): FRINT32/64
   FCmp,            // packed NZCV of the comparison a ? b
 
   Count_
@@ -121,6 +131,15 @@ enum class VecOp : uint8_t {
   TblPart,               // bytes: index b in [8k, 8k+8), k = aux, selects a byte of c; else a's byte
   Clz, Cls, Rbit,        // per lane (Rbit: bytes)
   SatAbs, SatNeg,        // signed saturating
+  Crc32,                 // scalar: CRC-32 of the low aux & 0xF bytes of b into the accumulator a
+                         //   (bit-reflected, no inversion); aux bit 4 = Castagnoli polynomial
+  Dot,                   // 32-bit lanes of c plus the dot products of the 4 bytes of a and b in each
+                         //   lane; aux bit 4 = a signed, bit 5 = b signed
+  SatRdmAcc,             // SQRDMLAH / SQRDMLSH: c + (2 * a * b + rounding) >> bits, saturated;
+                         //   aux bit 5 = subtract the product
+  SatAccMixed,           // SUQADD (aux bit 4 clear): signed a + unsigned b, saturated signed;
+                         //   USQADD (bit 4 set): unsigned a + signed b, saturated unsigned
+  URecpe, URsqrte,       // unsigned reciprocal (square root) estimates of 32-bit lanes
   // --- floating point: element size 4 or 8 (2: half precision, conversions only) ---
   FAdd, FSub, FMul, FDiv, FMax, FMin, FMaxNm, FMinNm,
   FAbd,                  // |a - b|
@@ -138,7 +157,38 @@ enum class VecOp : uint8_t {
                          //   the element size (from half to single, or single to double)
   FCvtDown,              // lanes of a and b (twice the element size) -> the element size; a's in
                          //   the low 32 bits, b's in the high
+  FRint32, FRint64,      // FRINT32* / FRINT64*: as FRint, out of range gives the most negative integer
+  FCmla,                 // complex pairs: c + a * b rotated by aux bits 4-5 (x 90 degrees), fused
+  FCadd,                 // complex pairs: a + b rotated by 90 (aux bits 4-5 = 1) or 270 (3) degrees
+  FJcvt,                 // scalar FJCVTZS of the double a: the 32-bit result (aux bit 4 clear) or
+                         //   the packed flags (Z = exact) (aux bit 4 set)
+  // --- BFloat16 ---
+  BfDot,                 // 32-bit float lanes of c plus the dot products of the bf16 pairs of a, b
+                         //   (round to odd, denormals flushed: Arm's BFDOT)
+  BfMlal,                // float lanes of c + bf16 even (aux bit 4 clear) or odd elements of a * b
+  BfCvt,                 // float lanes of a (and b) -> bf16, a's in the low 32 bits, b's next
   Count_
+};
+
+// Operations of StateOp (each 128-bit operand is a slot pair).
+enum class StateOpKind : uint8_t {
+  AesE, AesD,            // d = SubBytes(ShiftRows(d ^ n)) / inverse
+  AesMc, AesImc,         // d = MixColumns(n) / inverse
+  Sha1C, Sha1P, Sha1M,   // four SHA-1 rounds: d = hash d (abcd), low 32 bits of n (e), m (w + k)
+  Sha1Su0, Sha1Su1,      // SHA-1 message schedule
+  Sha256H, Sha256H2,     // four SHA-256 rounds on d with the other half of the state in n, w + k in m
+  Sha256Su0, Sha256Su1,  // SHA-256 message schedule
+  Sha512H, Sha512H2,     // two SHA-512 rounds (Arm's SHA512H / SHA512H2)
+  Sha512Su0, Sha512Su1,  // SHA-512 message schedule
+  PMull64,               // d = 128-bit carry-less product of the 64-bit halves (aux) of n and m
+  Mmla,                  // d (2x2 32-bit) += n (2x8 bytes) * m (2x8 bytes) transposed; aux bit 0 =
+                         //   n signed, bit 1 = m signed
+  BfMmla,                // d (2x2 float) += n (2x4 bf16) * m (2x4 bf16) transposed
+  Sm3Ss1,                // d = SM3SS1(n, m, a), aux = first slot of a
+  Sm3Tt1a, Sm3Tt1b, Sm3Tt2a, Sm3Tt2b,  // aux = word index of m
+  Sm3PartW1, Sm3PartW2,
+  Sm4E,                  // four SM4 rounds of the data d with the round keys n
+  Sm4EKey,               // four SM4 round keys from the key words n and constants m
 };
 
 // Floating point rounding modes for FToInt / FRint.
@@ -265,6 +315,9 @@ uint64_t flags_add(uint64_t a, uint64_t b, uint64_t carry_in, unsigned size);
 // Execute an atomic opcode (AtomicRmw, AtomicCas, AtomicCasPair) on host memory,
 // or read the counter (Counter).
 uint64_t execute_atomic(const Inst& inst, uint64_t a, uint64_t b, uint64_t c);
+
+// Execute a StateOp against guest state (an array of slots).
+void execute_state_op(const Inst& inst, uint64_t* state);
 
 // --- Debugging -----------------------------------------------------------------
 

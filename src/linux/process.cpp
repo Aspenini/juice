@@ -216,7 +216,7 @@ std::expected<void, std::string> LinuxProcess::load(const std::string& path, con
       {kAtGid, ::getgid()},
       {kAtEgid, ::getegid()},
       {kAtHwcap, kHwcaps},
-      {kAtHwcap2, 0},
+      {kAtHwcap2, kHwcaps2},
       {kAtClktck, static_cast<uint64_t>(::sysconf(_SC_CLK_TCK))},
       {kAtSecure, 0},
       {kAtMinsigstksz, 8192},

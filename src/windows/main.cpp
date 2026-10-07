@@ -162,7 +162,7 @@ int wmain(int argc, wchar_t** argv) {
     }
   }
 
-  // ARM64 DLLs: the program's directory (always searched first), --dll-path,
+  // ARM64 DLLs: after the program's directory and SetDllDirectory's (see guest_modules.cpp), --dll-path,
   // JUICE_DLL_PATH, then Visual Studio's ARM64 C++ runtime if installed.
   if (const wchar_t* env = _wgetenv(L"JUICE_DLL_PATH")) {
     std::wstring list = env;

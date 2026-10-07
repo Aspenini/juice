@@ -58,6 +58,25 @@ class Lifter {
   void lift_vector(const Instruction& i);
   void lift_fp(const Instruction& i);
   void lift_vector_ext(const Instruction& i);
+  void lift_crypto(const Instruction& i);
+  void lift_vec_extra(const Instruction& i);
+  void lift_flag_ops(const Instruction& i);
+  void state_op(ir::StateOpKind kind, unsigned d, unsigned n, unsigned m, unsigned aux = 0) {
+    const uint64_t imm = static_cast<uint64_t>(kind) | (uint64_t{slot::VLo(d)} << 8) | (uint64_t{slot::VLo(n)} << 16) |
+                         (uint64_t{slot::VLo(m)} << 24);
+    b_.emit(Opcode::StateOp, 8, ir::kNoValue, ir::kNoValue, ir::kNoValue, imm, static_cast<uint8_t>(aux));
+  }
+  V vlane(ir::VecOp o, V a, V b, V cc, unsigned aux, uint8_t size = 8) {
+    return b_.emit(Opcode::VLane, size, a, b, cc, static_cast<uint64_t>(o), static_cast<uint8_t>(aux));
+  }
+  // The element `index` of register `reg`, replicated across a 64-bit half.
+  V replicated(unsigned reg, unsigned index, unsigned esize) {
+    static constexpr uint64_t kReplicate[9] = {0, 0x0101010101010101ull, 0x0001000100010001ull, 0,
+                                               0x0000000100000001ull, 0, 0, 0, 1};
+    V v = vector_element(reg, index, esize);
+    if (esize < 8) v = b_.and_(v, c(low_mask(esize * 8)));
+    return esize == 8 ? v : b_.binary(Opcode::Mul, v, c(kReplicate[esize]), 8);
+  }
 
   // Vector helpers: lane ops on 64-bit halves (see ir::Opcode::VAdd and friends).
   V vop(Opcode o, V a, V b, unsigned esize, unsigned high = 0) {
@@ -335,11 +354,55 @@ bool Lifter::lift_mrs(const Instruction& i) {
     case sysreg::MIDR_EL1: v = c(0x410FD0C0); break;     // generic Arm Cortex
     case sysreg::CurrentEL: v = c(0); break;             // user mode (EL0)
     case sysreg::CNTFRQ_EL0: v = c(1'000'000'000); break;  // the counter runs at 1 GHz:
-    case sysreg::CNTVCT_EL0: v = b_.emit(Opcode::Counter, 8); break;  // nanoseconds
+    case sysreg::CNTVCT_EL0:
+    case sysreg::CNTPCT_EL0:
+    case sysreg::CNTVCTSS_EL0:
+    case sysreg::CNTPCTSS_EL0: v = b_.emit(Opcode::Counter, 8); break;  // nanoseconds
+    case sysreg::RNDR:
+    case sysreg::RNDRRS:
+      v = b_.emit(Opcode::Counter, 8, ir::kNoValue, ir::kNoValue, ir::kNoValue, 0, 1);
+      set_flags(c(0));  // success
+      break;
+    case sysreg::DIT: case sysreg::SSBS: case sysreg::TCO: v = c(0); break;
     default:
-      // ID_* feature registers (op0=3, op1=0, CRn=0): report no optional features.
+      // ID_* feature registers (op0=3, op1=0, CRn=0): the features JUICE translates.
       if ((i.sysreg >> 7) == (sysreg::make(3, 0, 0, 0, 0) >> 7)) {
-        v = c(0);
+        uint64_t value = 0;
+        if (i.sysreg == sysreg::make(3, 0, 0, 6, 0)) {  // ID_AA64ISAR0_EL1
+          value = (2ull << 4)      // AES + PMULL
+                  | (1ull << 8)    // SHA1
+                  | (2ull << 12)   // SHA256 + SHA512
+                  | (1ull << 16)   // CRC32
+                  | (3ull << 20)   // LSE + LSE128
+                  | (1ull << 28)   // RDM
+                  | (1ull << 32)   // SHA3
+                  | (1ull << 36)   // SM3
+                  | (1ull << 40)   // SM4
+                  | (1ull << 44)   // dot product
+                  | (1ull << 48)   // FHM (FMLAL)
+                  | (2ull << 52)   // FlagM + FlagM2
+                  | (1ull << 60);  // RNDR
+        } else if (i.sysreg == sysreg::make(3, 0, 0, 6, 1)) {  // ID_AA64ISAR1_EL1
+          value = (1ull << 12)     // JSCVT
+                  | (1ull << 16)   // FCMA
+                  | (3ull << 20)   // LRCPC3
+                  | (1ull << 32)   // FRINTTS
+                  | (1ull << 36)   // SB
+                  | (1ull << 44)   // BF16
+                  | (1ull << 52);  // I8MM
+        } else if (i.sysreg == sysreg::make(3, 0, 0, 6, 2)) {  // ID_AA64ISAR2_EL1
+          value = (2ull << 0)      // WFET / WFIT
+                  | (1ull << 16)   // MOPS
+                  | (1ull << 20)   // BC.cond
+                  | (1ull << 28)   // CLRBHB
+                  | (1ull << 52);  // CSSC
+        } else if (i.sysreg == sysreg::make(3, 0, 0, 4, 0)) {  // ID_AA64PFR0_EL1
+          value = (1ull << 0) | (1ull << 4)  // EL0, EL1: AArch64
+                  | (1ull << 16)             // FP with half precision
+                  | (1ull << 20)             // AdvSIMD with half precision
+                  | (1ull << 48);            // DIT
+        }
+        v = c(value);
         break;
       }
       return unsupported(i);
@@ -354,6 +417,7 @@ bool Lifter::lift_msr(const Instruction& i) {
     case sysreg::FPCR: b_.set(slot::FPCR, x(i.rd)); break;
     case sysreg::FPSR: b_.set(slot::FPSR, x(i.rd)); break;
     case sysreg::TPIDR_EL0: b_.set(slot::TPIDR_EL0, x(i.rd)); break;
+    case sysreg::DIT: case sysreg::SSBS: case sysreg::TCO: break;  // no effect on a translator
     default: return unsupported(i);
   }
   return false;
@@ -388,7 +452,7 @@ void Lifter::lift_simd(const Instruction& i) {
   switch (i.op) {
     case Op::FmovToGp: {
       V v = b_.get(i.index ? slot::VHi(i.rn) : slot::VLo(i.rn));
-      if (i.mem_size == 4) v = b_.zext(v, 32);
+      if (i.mem_size < 8) v = b_.zext(v, static_cast<uint8_t>(i.mem_size * 8));
       set_x(i.rd, v);
       break;
     }
@@ -397,7 +461,7 @@ void Lifter::lift_simd(const Instruction& i) {
         b_.set(slot::VHi(i.rd), x(i.rn));
       } else {
         V v = x(i.rn);
-        if (i.mem_size == 4) v = b_.zext(v, 32);
+        if (i.mem_size < 8) v = b_.zext(v, static_cast<uint8_t>(i.mem_size * 8));
         b_.set(slot::VLo(i.rd), v);
         b_.set(slot::VHi(i.rd), c(0));
       }
@@ -723,9 +787,12 @@ void Lifter::lift_vector(const Instruction& i) {
 }
 
 void Lifter::lift_fp(const Instruction& i) {
-  const uint8_t fs = i.mem_size;
-  const uint64_t sign_bit = fs == 8 ? 0x8000'0000'0000'0000ull : 0x8000'0000ull;
-  auto negate = [&](V v) { return b_.xor_(v, c(sign_bit), fs); };
+  const uint8_t fs = i.mem_size;  // 2, 4 or 8
+  const uint64_t sign_bit = uint64_t{1} << (fs * 8 - 1);
+  const uint8_t isz = fs == 8 ? 8 : 4;  // width for the integer operations on the bits
+  // Half precision results are zero-extended to 16 bits.
+  auto clean = [&](V v) { return fs == 2 ? b_.and_(v, c(0xFFFF)) : v; };
+  auto negate = [&](V v) { return clean(b_.xor_(v, c(sign_bit), isz)); };
   auto fp = [&](Opcode o, V a, V b = ir::kNoValue, V cc = ir::kNoValue, uint8_t aux = 0) {
     return b_.emit(o, fs, a, b, cc, 0, aux);
   };
@@ -743,7 +810,7 @@ void Lifter::lift_fp(const Instruction& i) {
       V n = vlo(i.rn);
       V r;
       switch (static_cast<FpUnaryOp>(i.shift)) {
-        case FpUnaryOp::Abs: r = b_.and_(n, c(~sign_bit), fs); break;
+        case FpUnaryOp::Abs: r = clean(b_.and_(n, c(~sign_bit), isz)); break;
         case FpUnaryOp::Neg: r = negate(n); break;
         default: r = fp(Opcode::FSqrt, n); break;
       }
@@ -753,9 +820,11 @@ void Lifter::lift_fp(const Instruction& i) {
     case Op::FpCvt:
       set_v(i.rd, fp(Opcode::FCvt, vlo(i.rn), ir::kNoValue, ir::kNoValue, i.esize), c(0));
       break;
-    case Op::FpRint:
-      set_v(i.rd, fp(Opcode::FRint, vlo(i.rn), ir::kNoValue, ir::kNoValue, i.shift), c(0));
+    case Op::FpRint: {
+      const auto aux = static_cast<uint8_t>(i.shift | (i.amount == 1 ? 8 : i.amount == 2 ? 16 : 0));
+      set_v(i.rd, fp(Opcode::FRint, vlo(i.rn), ir::kNoValue, ir::kNoValue, aux), c(0));
       break;
+    }
     case Op::FpFma: {
       // FMADD: n*m + a, FMSUB: -n*m + a, FNMADD: -n*m - a, FNMSUB: n*m - a
       V n = vlo(i.rn), m = vlo(i.rm), a = vlo(i.ra);
@@ -774,7 +843,7 @@ void Lifter::lift_fp(const Instruction& i) {
       break;
     }
     case Op::FpCsel: {
-      V r = b_.select(b_.cond_holds(flags(), i.cond), vlo(i.rn), vlo(i.rm), fs == 8 ? 8 : 4);
+      V r = clean(b_.select(b_.cond_holds(flags(), i.cond), vlo(i.rn), vlo(i.rm), isz));
       set_v(i.rd, r, c(0));
       break;
     }
@@ -782,13 +851,15 @@ void Lifter::lift_fp(const Instruction& i) {
       set_v(i.rd, c(static_cast<uint64_t>(i.imm)), c(0));
       break;
     case Op::FpToInt: {
-      const auto aux = static_cast<uint8_t>(i.shift | (i.mem_signed ? 8 : 0) | (fs == 8 ? 16 : 0));
-      set_x(i.rd, b_.emit(Opcode::FToInt, i.sf ? 8 : 4, vlo(i.rn), ir::kNoValue, ir::kNoValue, 0, aux));
+      const auto aux = static_cast<uint8_t>(i.shift | (i.mem_signed ? 8 : 0) | (fs == 8 ? 16 : fs == 2 ? 32 : 0));
+      V r = b_.emit(Opcode::FToInt, i.sf ? 8 : 4, vlo(i.rn), ir::kNoValue, ir::kNoValue, 0, aux);
+      if (i.vector) set_v(i.rd, r, c(0));  // FPRCVT: into Sd / Dd
+      else set_x(i.rd, r);
       break;
     }
     case Op::IntToFp: {
       const auto aux = static_cast<uint8_t>((i.mem_signed ? 1 : 0) | (i.sf ? 2 : 0));
-      set_v(i.rd, fp(Opcode::IntToF, x(i.rn), ir::kNoValue, ir::kNoValue, aux), c(0));
+      set_v(i.rd, fp(Opcode::IntToF, i.vector ? vlo(i.rn) : x(i.rn), ir::kNoValue, ir::kNoValue, aux), c(0));
       break;
     }
     default:
@@ -893,12 +964,20 @@ void Lifter::lift_vector_ext(const Instruction& i) {
                                        VecOp::FMaxNm, VecOp::FMinNm, VecOp::FAbd, VecOp::FMulX, VecOp::FMla, VecOp::FMls,
                                        VecOp::FCmEq, VecOp::FCmGe, VecOp::FCmGt, VecOp::FAcGe, VecOp::FAcGt,
                                        VecOp::FRecps, VecOp::FRsqrts};
+      if (k == VecFp::AMax || k == VecFp::AMin) {  // of the absolute values
+        const uint64_t magnitude = e == 8 ? ~(1ull << 63) : ~((1ull << (e * 8 - 1)) * kReplicate[e]);
+        const VecOp o = k == VecFp::AMax ? VecOp::FMax : VecOp::FMin;
+        write([&](unsigned h) {
+          return lane(o, b_.and_(half(i.rn, h), c(magnitude)), b_.and_(half(i.rm, h), c(magnitude)), none, e);
+        });
+        break;
+      }
       if (k >= VecFp::AddP) {  // pairwise: adjacent lanes of Vm:Vn (scalar: of Vn's two lanes)
         static constexpr VecOp kPair[] = {VecOp::FAdd, VecOp::FMax, VecOp::FMin, VecOp::FMaxNm, VecOp::FMinNm};
         const VecOp o = kPair[static_cast<unsigned>(k) - static_cast<unsigned>(VecFp::AddP)];
         if (i.scalar) {
-          V r = e == 8 ? lane(o, vlo(i.rn), vhi(i.rn), none, e) : lane(o, vlo(i.rn), b_.lshr(vlo(i.rn), c(32)), none, e);
-          set_v(i.rd, e == 8 ? r : b_.and_(r, c(0xFFFF'FFFFu)), c(0));
+          V r = e == 8 ? lane(o, vlo(i.rn), vhi(i.rn), none, e) : lane(o, vlo(i.rn), b_.lshr(vlo(i.rn), c(e * 8)), none, e);
+          set_v(i.rd, e == 8 ? r : b_.and_(r, c(low_mask(e * 8))), c(0));
           break;
         }
         V nlo = vlo(i.rn), mlo = vlo(i.rm);
@@ -921,14 +1000,17 @@ void Lifter::lift_vector_ext(const Instruction& i) {
       break;
     }
 
-    case Op::VecFpAcross: {  // 4 single lanes: op(op(l0, l1), op(l2, l3))
+    case Op::VecFpAcross: {  // a pairwise tree: op(op(l0, l1), op(l2, l3)), ...
       static constexpr VecOp kOps[] = {VecOp::FAdd, VecOp::FSub, VecOp::FMul, VecOp::FDiv, VecOp::FMax, VecOp::FMin,
                                        VecOp::FMaxNm, VecOp::FMinNm};
       const VecOp o = kOps[i.shift];
-      V lo = vlo(i.rn), hi = vhi(i.rn);
-      V a = lane(o, lo, b_.lshr(lo, c(32)), none, 4);
-      V b = lane(o, hi, b_.lshr(hi, c(32)), none, 4);
-      set_v(i.rd, b_.and_(lane(o, a, b, none, 4), c(0xFFFF'FFFFu)), c(0));
+      auto reduce_half = [&](V v) {  // to lane 0
+        if (e == 2) v = lane(o, v, b_.lshr(v, c(16)), none, 2);  // lanes 0 and 2: op(l0, l1), op(l2, l3)
+        return lane(o, v, b_.lshr(v, c(32)), none, e);
+      };
+      V r = reduce_half(vlo(i.rn));
+      if (i.q) r = lane(o, r, reduce_half(vhi(i.rn)), none, e);
+      set_v(i.rd, b_.and_(r, c(low_mask(e * 8))), c(0));
       break;
     }
 
@@ -941,6 +1023,14 @@ void Lifter::lift_vector_ext(const Instruction& i) {
         case VecIntUn::Rbit: write([&](unsigned h) { return lane(VecOp::Rbit, half(i.rn, h), none, none, 1); }); break;
         case VecIntUn::SatAbs: write([&](unsigned h) { return lane(VecOp::SatAbs, half(i.rn, h), none, none, aux); }); break;
         case VecIntUn::SatNeg: write([&](unsigned h) { return lane(VecOp::SatNeg, half(i.rn, h), none, none, aux); }); break;
+        case VecIntUn::SuqAdd:
+        case VecIntUn::UsqAdd: {
+          const unsigned a = e | (k == VecIntUn::UsqAdd ? 16u : 0u);
+          write([&](unsigned h) { return lane(VecOp::SatAccMixed, half(i.rd, h), half(i.rn, h), none, a); });
+          break;
+        }
+        case VecIntUn::URecpe: write([&](unsigned h) { return lane(VecOp::URecpe, half(i.rn, h), none, none, 4); }); break;
+        case VecIntUn::URsqrte: write([&](unsigned h) { return lane(VecOp::URsqrte, half(i.rn, h), none, none, 4); }); break;
         case VecIntUn::AddLP: write([&](unsigned h) { return lane(VecOp::AddLongPairwise, half(i.rn, h), none, none, aux); }); break;
         case VecIntUn::AdaLP:
           write([&](unsigned h) {
@@ -979,6 +1069,12 @@ void Lifter::lift_vector_ext(const Instruction& i) {
         case VecFpUn::Rint:
           write([&](unsigned h) { return lane(VecOp::FRint, half(i.rn, h), none, none, e | (i.amount << 4)); });
           break;
+        case VecFpUn::Rint32:
+        case VecFpUn::Rint64: {
+          const VecOp o = k == VecFpUn::Rint32 ? VecOp::FRint32 : VecOp::FRint64;
+          write([&](unsigned h) { return lane(o, half(i.rn, h), none, none, e | (i.amount << 4)); });
+          break;
+        }
         case VecFpUn::ToInt:
           write([&](unsigned h) { return lane(VecOp::FToInt, half(i.rn, h), c(0), none, e | (i.amount << 4) | (sign << 7)); });
           break;
@@ -1019,6 +1115,10 @@ void Lifter::lift_vector_ext(const Instruction& i) {
       auto wn = [&](unsigned p) { return widen(n_src, p, e, sign); };
       auto wm = [&](unsigned p) { return widen(m_src, p, e, sign); };
       auto both = [&](auto f) {
+        if (i.scalar) {  // one wide element
+          set_v(i.rd, b_.and_(f(0u), c(low_mask(w2 * 8))), c(0));
+          return;
+        }
         V lo = f(0u), hi = f(1u);
         set_v(i.rd, lo, hi);
       };
@@ -1212,6 +1312,10 @@ void Lifter::lift_vector_ext(const Instruction& i) {
     case Op::FpFixedToFp: {  // integer register / 2^fbits
       const uint8_t fs = i.mem_size;
       const auto aux = static_cast<uint8_t>((i.mem_signed ? 1 : 0) | (i.sf ? 2 : 0));
+      if (fs == 2) {  // one rounding: imm = fraction bits
+        set_v(i.rd, b_.emit(Opcode::IntToF, 2, x(i.rn), ir::kNoValue, ir::kNoValue, static_cast<uint64_t>(i.imm), aux), c(0));
+        break;
+      }
       V v = b_.emit(Opcode::IntToF, fs, x(i.rn), ir::kNoValue, ir::kNoValue, 0, aux);
       const int fbits = static_cast<int>(i.imm);
       const uint64_t scale = fs == 8 ? std::bit_cast<uint64_t>(std::ldexp(1.0, -fbits))
@@ -1222,6 +1326,11 @@ void Lifter::lift_vector_ext(const Instruction& i) {
     case Op::FpToFixed: {  // truncate(value * 2^fbits)
       const uint8_t fs = i.mem_size;
       const int fbits = static_cast<int>(i.imm);
+      if (fs == 2) {  // imm = fraction bits
+        const auto aux = static_cast<uint8_t>(static_cast<unsigned>(ir::FpRound::Zero) | (i.mem_signed ? 8 : 0) | 32);
+        set_x(i.rd, b_.emit(Opcode::FToInt, i.sf ? 8 : 4, vlo(i.rn), ir::kNoValue, ir::kNoValue, static_cast<uint64_t>(fbits), aux));
+        break;
+      }
       const uint64_t scale = fs == 8 ? std::bit_cast<uint64_t>(std::ldexp(1.0, fbits))
                                      : std::bit_cast<uint32_t>(std::ldexp(1.0f, fbits));
       V scaled = b_.emit(Opcode::FMul, fs, vlo(i.rn), c(scale));
@@ -1231,6 +1340,214 @@ void Lifter::lift_vector_ext(const Instruction& i) {
       break;
     }
     default:
+      break;
+  }
+}
+
+// Dot products, matrix multiplies, SQRDMLAH/SH, BFloat16, complex arithmetic
+// and FMLAL/FMLSL (the vector and by-element forms).
+void Lifter::lift_vec_extra(const Instruction& i) {
+  using ir::VecOp;
+  const auto k = static_cast<VecExtraKind>(i.shift);
+  const unsigned e = i.esize;
+  const bool q = i.q && !i.scalar;
+  const V none = ir::kNoValue;
+  auto half = [&](unsigned reg, unsigned h) { return h ? vhi(reg) : vlo(reg); };
+  // Write both result halves after computing them (rd may be a source).
+  auto write = [&](auto f) {
+    V lo = f(0u);
+    V hi = q ? f(1u) : c(0);
+    set_v(i.rd, lo, hi);
+  };
+  // The second operand: Vm's half, or the selected group of `bytes` replicated.
+  auto second = [&](unsigned bytes) {
+    V el = i.imm_form ? replicated(i.rm, i.index2, bytes) : none;
+    return [this, &i, el](unsigned h) { return el != ir::kNoValue ? el : (h ? vhi(i.rm) : vlo(i.rm)); };
+  };
+
+  switch (k) {
+    case VecExtraKind::Dot: {
+      const auto m = second(4);
+      const unsigned aux = 4 | ((i.amount & 1u) << 4) | ((i.amount & 2u) << 4);
+      write([&](unsigned h) { return vlane(VecOp::Dot, half(i.rn, h), m(h), half(i.rd, h), aux); });
+      break;
+    }
+    case VecExtraKind::Mmla: state_op(ir::StateOpKind::Mmla, i.rd, i.rn, i.rm, i.amount); break;
+    case VecExtraKind::BfMmla: state_op(ir::StateOpKind::BfMmla, i.rd, i.rn, i.rm); break;
+    case VecExtraKind::SqRdmlah:
+    case VecExtraKind::SqRdmlsh: {
+      const auto m = second(e);
+      const unsigned aux = e | (k == VecExtraKind::SqRdmlsh ? 32u : 0u);
+      if (i.scalar) {
+        V r = vlane(VecOp::SatRdmAcc, vlo(i.rn), m(0), vlo(i.rd), aux);
+        set_v(i.rd, b_.and_(r, c(low_mask(e * 8))), c(0));
+      } else {
+        write([&](unsigned h) { return vlane(VecOp::SatRdmAcc, half(i.rn, h), m(h), half(i.rd, h), aux); });
+      }
+      break;
+    }
+    case VecExtraKind::BfDot: {
+      const auto m = second(4);
+      write([&](unsigned h) { return vlane(VecOp::BfDot, half(i.rn, h), m(h), half(i.rd, h), 4); });
+      break;
+    }
+    case VecExtraKind::BfMlal: {  // always 4 single lanes
+      const auto m = second(2);
+      const unsigned aux = 4 | (i.index ? 16u : 0u);
+      V lo = vlane(VecOp::BfMlal, vlo(i.rn), m(0), vlo(i.rd), aux);
+      V hi = vlane(VecOp::BfMlal, vhi(i.rn), m(1), vhi(i.rd), aux);
+      set_v(i.rd, lo, hi);
+      break;
+    }
+    case VecExtraKind::Fcmla:
+    case VecExtraKind::Fcadd: {
+      const unsigned rot = i.amount;
+      if (e == 8) {  // one pair of doubles across the register
+        const uint64_t sign = 1ull << 63;
+        V nre = vlo(i.rn), nim = vhi(i.rn), mre = vlo(i.rm), mim = vhi(i.rm);
+        auto neg = [&](V v) { return b_.xor_(v, c(sign)); };
+        V re, im;
+        if (k == VecExtraKind::Fcadd) {
+          re = b_.emit(Opcode::FAdd, 8, nre, rot == 1 ? neg(mim) : mim);
+          im = b_.emit(Opcode::FAdd, 8, nim, rot == 1 ? mre : neg(mre));
+        } else {
+          V e1, e2, e3;
+          switch (rot) {
+            case 0: e1 = mre, e2 = nre, e3 = mim; break;
+            case 1: e1 = neg(mim), e2 = nim, e3 = mre; break;
+            case 2: e1 = neg(mre), e2 = nre, e3 = neg(mim); break;
+            default: e1 = mim, e2 = nim, e3 = neg(mre); break;
+          }
+          re = b_.emit(Opcode::FMadd, 8, e2, e1, vlo(i.rd));
+          im = b_.emit(Opcode::FMadd, 8, e2, e3, vhi(i.rd));
+        }
+        set_v(i.rd, re, im);
+        break;
+      }
+      const auto m = second(2 * e);  // by element: a complex pair
+      const unsigned aux = e | (rot << 4);
+      if (k == VecExtraKind::Fcadd) {
+        write([&](unsigned h) { return vlane(VecOp::FCadd, half(i.rn, h), m(h), none, aux); });
+      } else {
+        write([&](unsigned h) { return vlane(VecOp::FCmla, half(i.rn, h), m(h), half(i.rd, h), aux); });
+      }
+      break;
+    }
+    case VecExtraKind::Fmlal:
+    case VecExtraKind::Fmlsl: {
+      // Widen half precision elements (the low or high half of the source
+      // elements) to single precision, then fused multiply-add.
+      const uint64_t negate = k == VecExtraKind::Fmlsl ? 0x8000'8000'8000'8000ull : 0;
+      V n = i.q ? (i.index ? vhi(i.rn) : vlo(i.rn)) : vlo(i.rn);
+      V m = i.imm_form ? replicated(i.rm, i.index2, 2) : (i.q ? (i.index ? vhi(i.rm) : vlo(i.rm)) : vlo(i.rm));
+      if (negate) n = b_.xor_(n, c(negate));
+      auto widened = [&](V v, unsigned part) { return vlane(VecOp::FCvtUp, v, none, none, 4 | (part << 4)); };
+      if (i.q) {
+        V lo = vlane(VecOp::FMla, widened(n, 0), widened(m, 0), vlo(i.rd), 4);
+        V hi = vlane(VecOp::FMla, widened(n, 1), widened(m, 1), vhi(i.rd), 4);
+        set_v(i.rd, lo, hi);
+      } else {
+        const unsigned part = i.index;
+        set_v(i.rd, vlane(VecOp::FMla, widened(n, part), widened(m, i.imm_form ? 0 : part), vlo(i.rd), 4), c(0));
+      }
+      break;
+    }
+  }
+}
+
+// FlagM: CFINV, AXFLAG, XAFLAG, RMIF, SETF8, SETF16.
+void Lifter::lift_flag_ops(const Instruction& i) {
+  V f = flags();
+  auto bit = [&](V v, unsigned n) { return b_.and_(b_.lshr(v, c(n)), c(1)); };
+  auto pack = [&](V n, V z, V cc, V v) {
+    return b_.or_(b_.or_(b_.shl(n, c(31)), b_.shl(z, c(30))), b_.or_(b_.shl(cc, c(29)), b_.shl(v, c(28))));
+  };
+  switch (i.op) {
+    case Op::Cfinv:
+      set_flags(b_.xor_(f, c(ir::kFlagC)));
+      break;
+    case Op::Axflag: {  // Z = Z | V, C = C & !V, N = V = 0
+      V z = bit(f, 30), cc = bit(f, 29), v = bit(f, 28);
+      set_flags(pack(c(0), b_.or_(z, v), b_.and_(cc, b_.xor_(v, c(1))), c(0)));
+      break;
+    }
+    case Op::Xaflag: {  // N = !C & !Z, Z = Z & C, C = C | Z, V = !C & Z
+      V z = bit(f, 30), cc = bit(f, 29);
+      V not_c = b_.xor_(cc, c(1));
+      set_flags(pack(b_.and_(not_c, b_.xor_(z, c(1))), b_.and_(z, cc), b_.or_(cc, z), b_.and_(not_c, z)));
+      break;
+    }
+    case Op::Rmif: {
+      const uint64_t mask = uint64_t{i.nzcv} << 28;
+      V rotated = op(Opcode::Ror, x(i.rn), c(static_cast<uint64_t>(i.imm)), 8);
+      set_flags(b_.or_(b_.and_(f, c(~mask & 0xF000'0000u)), b_.and_(b_.shl(rotated, c(28)), c(mask))));
+      break;
+    }
+    default: {  // SETF8 / SETF16: N, Z, V from the low byte / halfword; C unchanged
+      const unsigned top = i.mem_size * 8 - 1;
+      V v = x(i.rn);
+      V n = bit(v, top);
+      V z = b_.cmp(Predicate::Eq, b_.and_(v, c(low_mask(top + 1))), c(0));
+      V ov = b_.xor_(bit(v, top + 1), n);
+      set_flags(b_.or_(pack(n, z, c(0), ov), b_.and_(f, c(ir::kFlagC))));
+      break;
+    }
+  }
+}
+
+void Lifter::lift_crypto(const Instruction& i) {
+  const auto k = static_cast<CryptoOp>(i.shift);
+  auto state_op = [&](ir::StateOpKind kind, unsigned aux = 0) { this->state_op(kind, i.rd, i.rn, i.rm, aux); };
+  auto halves = [&](auto f) {  // per 64-bit half, sources read before the destination is written
+    V lo = f(0u), hi = f(1u);
+    set_v(i.rd, lo, hi);
+  };
+  auto half = [&](unsigned reg, unsigned h) { return h ? vhi(reg) : vlo(reg); };
+  using ir::StateOpKind;
+  switch (k) {
+    case CryptoOp::AesE: state_op(StateOpKind::AesE); break;
+    case CryptoOp::AesD: state_op(StateOpKind::AesD); break;
+    case CryptoOp::AesMc: state_op(StateOpKind::AesMc); break;
+    case CryptoOp::AesImc: state_op(StateOpKind::AesImc); break;
+    case CryptoOp::Sha1C: state_op(StateOpKind::Sha1C); break;
+    case CryptoOp::Sha1P: state_op(StateOpKind::Sha1P); break;
+    case CryptoOp::Sha1M: state_op(StateOpKind::Sha1M); break;
+    case CryptoOp::Sha1Su0: state_op(StateOpKind::Sha1Su0); break;
+    case CryptoOp::Sha1Su1: state_op(StateOpKind::Sha1Su1); break;
+    case CryptoOp::Sha256H: state_op(StateOpKind::Sha256H); break;
+    case CryptoOp::Sha256H2: state_op(StateOpKind::Sha256H2); break;
+    case CryptoOp::Sha256Su0: state_op(StateOpKind::Sha256Su0); break;
+    case CryptoOp::Sha256Su1: state_op(StateOpKind::Sha256Su1); break;
+    case CryptoOp::Sha512H: state_op(StateOpKind::Sha512H); break;
+    case CryptoOp::Sha512H2: state_op(StateOpKind::Sha512H2); break;
+    case CryptoOp::Sha512Su0: state_op(StateOpKind::Sha512Su0); break;
+    case CryptoOp::Sha512Su1: state_op(StateOpKind::Sha512Su1); break;
+    case CryptoOp::Pmull64: state_op(StateOpKind::PMull64, i.index); break;
+    case CryptoOp::Sm3Ss1: state_op(StateOpKind::Sm3Ss1, slot::VLo(i.ra)); break;
+    case CryptoOp::Sm3Tt1a: state_op(StateOpKind::Sm3Tt1a, i.index); break;
+    case CryptoOp::Sm3Tt1b: state_op(StateOpKind::Sm3Tt1b, i.index); break;
+    case CryptoOp::Sm3Tt2a: state_op(StateOpKind::Sm3Tt2a, i.index); break;
+    case CryptoOp::Sm3Tt2b: state_op(StateOpKind::Sm3Tt2b, i.index); break;
+    case CryptoOp::Sm3PartW1: state_op(StateOpKind::Sm3PartW1); break;
+    case CryptoOp::Sm3PartW2: state_op(StateOpKind::Sm3PartW2); break;
+    case CryptoOp::Sm4E: state_op(StateOpKind::Sm4E); break;
+    case CryptoOp::Sm4EKey: state_op(StateOpKind::Sm4EKey); break;
+    case CryptoOp::Sha1H:  // Sd = ROL(Sn, 30)
+      set_v(i.rd, b_.emit(Opcode::Ror, 4, vlo(i.rn), c(2)), c(0));
+      break;
+    case CryptoOp::Eor3:
+      halves([&](unsigned h) { return b_.xor_(b_.xor_(half(i.rn, h), half(i.rm, h)), half(i.ra, h)); });
+      break;
+    case CryptoOp::Bcax:
+      halves([&](unsigned h) { return b_.xor_(half(i.rn, h), b_.and_(half(i.rm, h), b_.not_(half(i.ra, h)))); });
+      break;
+    case CryptoOp::Rax1:
+      halves([&](unsigned h) { return b_.xor_(half(i.rn, h), op(Opcode::Ror, half(i.rm, h), c(63), 8)); });
+      break;
+    case CryptoOp::Xar:
+      halves([&](unsigned h) {
+        return op(Opcode::Ror, b_.xor_(half(i.rn, h), half(i.rm, h)), c(static_cast<uint64_t>(i.imm)), 8);
+      });
       break;
   }
 }
@@ -1547,6 +1864,104 @@ bool Lifter::lift(const Instruction& i) {
     case Op::FpCcmp: case Op::FpCsel: case Op::FpMovImm: case Op::FpToInt: case Op::IntToFp:
       lift_fp(i);
       return false;
+
+    case Op::Crc32: {
+      const auto aux = static_cast<uint8_t>(i.mem_size | (i.mem_signed ? 16 : 0));
+      set_x(i.rd, b_.emit(Opcode::VLane, 4, x(i.rn), x(i.rm), ir::kNoValue, static_cast<uint64_t>(ir::VecOp::Crc32), aux));
+      return false;
+    }
+    case Op::Crypto:
+      lift_crypto(i);
+      return false;
+    case Op::VecExtra:
+      lift_vec_extra(i);
+      return false;
+    case Op::BfCvt:
+      set_v(i.rd, b_.and_(vlane(ir::VecOp::BfCvt, vlo(i.rn), c(0), ir::kNoValue, 0), c(0xFFFF)), c(0));
+      return false;
+    case Op::BfCvtn: {
+      V narrow = vlane(ir::VecOp::BfCvt, vlo(i.rn), vhi(i.rn), ir::kNoValue, 0);
+      if (i.index) b_.set(slot::VHi(i.rd), narrow);
+      else set_v(i.rd, narrow, c(0));
+      return false;
+    }
+    case Op::FJcvtzs: {
+      V d = vlo(i.rn);
+      set_x(i.rd, vlane(ir::VecOp::FJcvt, d, ir::kNoValue, ir::kNoValue, 0, 4));
+      set_flags(vlane(ir::VecOp::FJcvt, d, ir::kNoValue, ir::kNoValue, 16));
+      return false;
+    }
+    case Op::Cfinv: case Op::Axflag: case Op::Xaflag: case Op::Rmif: case Op::Setf:
+      lift_flag_ops(i);
+      return false;
+
+    case Op::AtomicPair: {  // LSE128: the pair Rt (low) : Rt2 (high), staged in guest state
+      b_.set(slot::ExclNew, x(i.rd));
+      b_.set(slot::ExclNewHi, x(i.ra));
+      V operand = b_.emit(Opcode::StateAddr, 8, ir::kNoValue, ir::kNoValue, ir::kNoValue, slot::ExclNew);
+      b_.emit(Opcode::AtomicRmwPair, 16, xsp(i.rn), operand, ir::kNoValue, 0, i.shift);
+      V lo = b_.get(slot::ExclNew), hi = b_.get(slot::ExclNewHi);
+      set_x(i.rd, lo);
+      set_x(i.ra, hi);
+      return false;
+    }
+    case Op::Mops: {
+      // The prologue does all the work (Arm's "option A" register results:
+      // Xd and Xs advanced, Xn zero); the main and epilogue instructions then
+      // find nothing left, but finish any remainder they are given.
+      const auto k = static_cast<MopsOp>(i.shift);
+      const bool set = k == MopsOp::SetP || k == MopsOp::SetM || k == MopsOp::SetE;
+      const unsigned kind = set ? 2 : (k == MopsOp::CopyForwardP || k == MopsOp::CopyForwardM || k == MopsOp::CopyForwardE) ? 1 : 0;
+      V dst = x(i.rd), count = x(i.rn);
+      V src = set ? x(i.rm) : x(i.rm);
+      b_.emit(Opcode::MemOp, 8, dst, src, count, 0, static_cast<uint8_t>(kind));
+      set_x(i.rd, b_.add(dst, count));
+      if (!set) set_x(i.rm, b_.add(src, count));
+      set_x(i.rn, c(0));
+      if (k == MopsOp::SetP || k == MopsOp::CopyP || k == MopsOp::CopyForwardP) set_flags(c(0));
+      return false;
+    }
+    case Op::Abs:
+      set_x(i.rd, b_.select(b_.cmp(Predicate::Slt, x(i.rn), c(0), s), op(Opcode::Neg, x(i.rn), ir::kNoValue, s), x(i.rn), s));
+      return false;
+    case Op::Cnt:
+    case Op::Ctz: {
+      V v = x(i.rn);
+      if (i.op == Op::Ctz) v = b_.and_(b_.not_(v), b_.sub(v, c(1)));  // the trailing zeros, as ones
+      if (!i.sf) v = b_.zext(v, 32);
+      V bytes = b_.emit(Opcode::VCnt, 8, v, ir::kNoValue, ir::kNoValue, 0, 1);
+      set_x(i.rd, b_.emit(Opcode::VReduce, 8, bytes, ir::kNoValue, ir::kNoValue, 0,
+                          static_cast<uint8_t>(1 | (static_cast<unsigned>(ir::VecReduce::Add) << 4))));
+      return false;
+    }
+    case Op::MinMax: {
+      static constexpr Predicate preds[4] = {Predicate::Sgt, Predicate::Ugt, Predicate::Slt, Predicate::Ult};
+      V a = x(i.rn);
+      V b = i.imm_form ? c(i.sf ? imm : (imm & 0xFFFF'FFFFu)) : x(i.rm);
+      set_x(i.rd, b_.select(b_.cmp(preds[i.shift], a, b, s), a, b, s));
+      return false;
+    }
+    case Op::CmpBranch: {
+      const auto pred = static_cast<Predicate>(i.cond);
+      const bool sign = pred == Predicate::Sgt || pred == Predicate::Sge || pred == Predicate::Slt;
+      V a = x(i.rd);
+      V b = i.imm_form ? c(i.amount) : x(i.rm);
+      uint8_t size = s;
+      if (i.mem_size) {  // CBB / CBH: the low byte / halfword, extended per the condition
+        const auto bits = static_cast<uint8_t>(i.mem_size * 8);
+        a = sign ? b_.sext(a, bits) : b_.zext(a, bits);
+        b = sign ? b_.sext(b, bits) : b_.zext(b, bits);
+        size = 8;
+      }
+      b_.branch(b_.cmp(pred, a, b, size), imm, next);
+      return true;
+    }
+    case Op::Pacga: {  // a deterministic 32-bit "code" in the upper half (authentication is not modelled)
+      V h = b_.emit(Opcode::Mul, 8, b_.xor_(x(i.rn), b_.emit(Opcode::Mul, 8, x(i.rm), c(0x9E37'79B9'7F4A'7C15ull))),
+                    c(0xC2B2'AE3D'27D4'EB4Full));
+      set_x(i.rd, b_.shl(b_.lshr(h, c(32)), c(32)));
+      return false;
+    }
   }
   return unsupported(i);
 }

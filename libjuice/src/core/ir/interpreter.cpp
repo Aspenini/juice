@@ -68,9 +68,14 @@ void interpret(const Block& block, uint64_t* state, const StateLayout& layout) {
       case Opcode::Fence:
         std::atomic_thread_fence(std::memory_order_seq_cst);
         break;
+      case Opcode::StateOp:
+        execute_state_op(in, state);
+        break;
       case Opcode::AtomicRmw:
       case Opcode::AtomicCas:
       case Opcode::AtomicCasPair:
+      case Opcode::AtomicRmwPair:
+      case Opcode::MemOp:
       case Opcode::Counter:
         values[i] = execute_atomic(in, arg(in, 0), arg(in, 1), arg(in, 2));
         break;

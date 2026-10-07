@@ -78,10 +78,20 @@ uint32_t open_flags_to_host(uint32_t arm64_flags);
 uint32_t open_flags_to_guest(uint32_t x64_flags);
 
 // AT_HWCAP bits for AArch64 (what JUICE's translator implements).
+// AT_HWCAP: FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS, FPHP, ASIMDHP,
+// ASIMDRDM, JSCVT, FCMA, LRCPC, SHA3, SM3, SM4, ASIMDDP, SHA512, ASIMDFHM, DIT,
+// USCAT, ILRCPC, FLAGM, SB.
 inline constexpr uint64_t kHwcapFp = 1u << 0;
 inline constexpr uint64_t kHwcapAsimd = 1u << 1;
 inline constexpr uint64_t kHwcapAtomics = 1u << 8;  // LSE
-inline constexpr uint64_t kHwcaps = kHwcapFp | kHwcapAsimd | kHwcapAtomics;
+inline constexpr uint64_t kHwcaps = kHwcapFp | kHwcapAsimd | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 7) |
+                                    kHwcapAtomics | (1u << 9) | (1u << 10) | (1u << 12) | (1u << 13) | (1u << 14) |
+                                    (1u << 15) | (1u << 17) | (1u << 18) | (1u << 19) | (1u << 20) | (1u << 21) |
+                                    (1u << 23) | (1u << 24) | (1u << 25) | (1u << 26) | (1u << 27) | (1u << 29);
+// AT_HWCAP2: FLAGM2, FRINT, I8MM, BF16, RNG, WFXT, CSSC, MOPS, HBC, LRCPC3, LSE128.
+inline constexpr uint64_t kHwcaps2 = (1ull << 7) | (1ull << 8) | (1ull << 13) | (1ull << 14) | (1ull << 16) |
+                                     (1ull << 31) | (1ull << 34) | (1ull << 43) | (1ull << 44) | (1ull << 46) |
+                                     (1ull << 47);
 
 // Auxiliary vector keys (AT_*; named differently to stay clear of the host's macros).
 enum : uint64_t {

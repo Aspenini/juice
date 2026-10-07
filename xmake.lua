@@ -88,13 +88,34 @@ if is_plat("windows") then
                   "src/windows/dlls/*.cpp",
                   "src/windows/manifest.cpp",
                   "src/windows/guest_modules.cpp",
+                  "src/windows/guest_threads.cpp",
                   "src/windows/host_manifest.cpp",
                   "src/windows/guest_process.cpp")
+        add_syslinks("advapi32", {public = true})
 
     target("juice")
         set_kind("binary")
         add_deps("juice-win")
         add_files("src/windows/main.cpp")
+
+    -- Regenerates src/windows/thunk/*_generated.inc from the Windows SDK headers
+    -- (needs LLVM's libclang): xmake build juice-gen-signatures && xmake run juice-gen-signatures
+    option("llvm_dir")
+        set_default(path.join(os.getenv("ProgramFiles") or "C:/Program Files", "LLVM"))
+        set_showmenu(true)
+        set_description("LLVM installation with libclang (for juice-gen-signatures)")
+    option_end()
+    target("juice-gen-signatures")
+        set_kind("binary")
+        set_default(false)
+        add_files("tools/gen_signatures/gen_signatures.cpp")
+        add_includedirs(path.join(get_config("llvm_dir") or "", "include"))
+        add_linkdirs(path.join(get_config("llvm_dir") or "", "lib"))
+        add_links("libclang")
+        set_runargs(os.projectdir(), path.join(os.projectdir(), "src", "windows", "thunk"))
+        after_build(function (target)
+            os.cp(path.join(get_config("llvm_dir"), "bin", "libclang.dll"), target:targetdir())
+        end)
 end
 
 -- ---------------------------------------------------------------------------

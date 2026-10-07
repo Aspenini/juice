@@ -43,6 +43,14 @@ uint64_t atomic_helper(uint64_t a, uint64_t b, uint64_t c, uint64_t packed) {
   return ir::execute_atomic(in, a, b, c);
 }
 
+void state_helper(uint64_t* state, uint64_t packed) {
+  ir::Inst in;
+  in.op = Opcode::StateOp;
+  in.aux = static_cast<uint8_t>(packed >> 16);
+  in.imm = packed >> 32;
+  ir::execute_state_op(in, state);
+}
+
 constexpr Reg kState = RBX;    // guest state base
 constexpr Reg kScratch = RBP;  // IR value slots
 
@@ -215,9 +223,17 @@ class Compiler {
       case Opcode::Fence:
         a_.mfence();
         return;
+      case Opcode::StateOp:
+        a_.mov(kCallArgs[0], kState);
+        a_.mov_imm(kCallArgs[1], (uint64_t{in.aux} << 16) | ((in.imm & 0xFFFF'FFFFu) << 32));
+        a_.mov_imm(RAX, reinterpret_cast<uint64_t>(&state_helper));
+        a_.call(RAX);
+        return;
       case Opcode::AtomicRmw:
       case Opcode::AtomicCas:
       case Opcode::AtomicCasPair:
+      case Opcode::AtomicRmwPair:
+      case Opcode::MemOp:
       case Opcode::Counter:
         call_helper(v, in, &atomic_helper);
         return;

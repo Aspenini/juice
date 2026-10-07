@@ -1,3 +1,4 @@
+#include <bit>
 #include <format>
 
 #include "core/arm64/decode/instruction.hpp"
@@ -178,6 +179,25 @@ const char* mnemonic(Op op) {
     case Op::FpMovImm: return "fmov";
     case Op::FpToInt: return "fcvtz";
     case Op::IntToFp: return "cvtf";
+    case Op::Crc32: return "crc32";
+    case Op::Crypto: return "crypto";
+    case Op::VecExtra: return "vext";
+    case Op::BfCvt: return "bfcvt";
+    case Op::BfCvtn: return "bfcvtn";
+    case Op::FJcvtzs: return "fjcvtzs";
+    case Op::Cfinv: return "cfinv";
+    case Op::Axflag: return "axflag";
+    case Op::Xaflag: return "xaflag";
+    case Op::Rmif: return "rmif";
+    case Op::Setf: return "setf";
+    case Op::AtomicPair: return "atomic.pair";
+    case Op::Mops: return "mops";
+    case Op::Abs: return "abs";
+    case Op::Cnt: return "cnt";
+    case Op::Ctz: return "ctz";
+    case Op::MinMax: return "minmax";
+    case Op::Pacga: return "pacga";
+    case Op::CmpBranch: return "cb";
     case Op::Count_: break;
   }
   return "?";
@@ -485,6 +505,72 @@ std::string disassemble(const Instruction& i) {
                          fpr(i.rn, i.mem_size));
     case Op::IntToFp:
       return std::format("{}cvtf {}, {}", i.mem_signed ? 's' : 'u', fpr(i.rd, i.mem_size), gpr(i.rn, i.sf));
+    case Op::Crc32:
+      return std::format("crc32{}{} {}, {}, {}", i.mem_signed ? "c" : "", "bhwx"[std::countr_zero(unsigned{i.mem_size})],
+                         gpr(i.rd, false), gpr(i.rn, false), gpr(i.rm, i.mem_size == 8));
+    case Op::Crypto: {
+      static constexpr const char* names[] = {
+          "aese",      "aesd",     "aesmc",   "aesimc",  "sha1c",     "sha1p",     "sha1m", "sha1su0",
+          "sha1h",     "sha1su1",  "sha256h", "sha256h2", "sha256su0", "sha256su1", "sha512h", "sha512h2",
+          "sha512su0", "sha512su1", "eor3",   "bcax",    "rax1",      "xar",       "pmull", "sm3ss1",
+          "sm3tt1a", "sm3tt1b", "sm3tt2a", "sm3tt2b", "sm3partw1", "sm3partw2", "sm4e", "sm4ekey"};
+      const auto k = static_cast<CryptoOp>(i.shift);
+      std::string name = names[i.shift];
+      if (k == CryptoOp::Pmull64 && i.index) name += "2";
+      std::string out = std::format("{} v{}, v{}", name, i.rd, i.rn);
+      switch (k) {
+        case CryptoOp::AesE: case CryptoOp::AesD: case CryptoOp::AesMc: case CryptoOp::AesImc:
+        case CryptoOp::Sha1H: case CryptoOp::Sha1Su1: case CryptoOp::Sha256Su0: case CryptoOp::Sha512Su0:
+        case CryptoOp::Sm4E:
+          return out;
+        case CryptoOp::Sm3Tt1a: case CryptoOp::Sm3Tt1b: case CryptoOp::Sm3Tt2a: case CryptoOp::Sm3Tt2b:
+          return std::format("{}, v{}.s[{}]", out, i.rm, i.index);
+        case CryptoOp::Eor3: case CryptoOp::Bcax: case CryptoOp::Sm3Ss1:
+          return std::format("{}, v{}, v{}", out, i.rm, i.ra);
+        case CryptoOp::Xar:
+          return std::format("{}, v{}, #{}", out, i.rm, i.imm);
+        default:
+          return std::format("{}, v{}", out, i.rm);
+      }
+    }
+    case Op::VecExtra: {
+      static constexpr const char* names[] = {"dot", "mmla", "sqrdmlah", "sqrdmlsh", "bfdot", "bfmmla", "bfmlal",
+                                              "fcmla", "fcadd", "fmlal", "fmlsl"};
+      std::string out = std::format("{}{} v{}, v{}, v{}", names[i.shift], i.index ? "2" : "", i.rd, i.rn, i.rm);
+      if (i.imm_form) out += std::format("[{}]", i.index2);
+      if (static_cast<VecExtraKind>(i.shift) == VecExtraKind::Fcmla || static_cast<VecExtraKind>(i.shift) == VecExtraKind::Fcadd)
+        out += std::format(", #{}", i.amount * 90);
+      return out;
+    }
+    case Op::Cfinv: case Op::Axflag: case Op::Xaflag: return m;
+    case Op::AtomicPair: {
+      static constexpr const char* names[9] = {"", "ldclrp", "", "ldsetp", "", "", "", "", "swpp"};
+      return std::format("{} x{}, x{}, [{}]", names[i.shift % 9], i.rd, i.ra, gpr(i.rn, true, true));
+    }
+    case Op::Mops: {
+      static constexpr const char* names[9] = {"cpyp", "cpym", "cpye", "cpyfp", "cpyfm", "cpyfe", "setp", "setm", "sete"};
+      if (i.shift >= 6) return std::format("{} [x{}]!, x{}!, x{}", names[i.shift], i.rd, i.rn, i.rm);
+      return std::format("{} [x{}]!, [x{}]!, x{}!", names[i.shift], i.rd, i.rm, i.rn);
+    }
+    case Op::Abs: case Op::Cnt: case Op::Ctz:
+      return std::format("{} {}, {}", m, rd(), rn());
+    case Op::MinMax: {
+      static constexpr const char* names[4] = {"smax", "umax", "smin", "umin"};
+      if (i.imm_form) return std::format("{} {}, {}, #{}", names[i.shift], rd(), rn(), i.imm);
+      return std::format("{} {}, {}, {}", names[i.shift], rd(), rn(), rm());
+    }
+    case Op::Pacga: return std::format("pacga {}, {}, {}", rd(), rn(), rm());
+    case Op::CmpBranch: {
+      static constexpr const char* conds[10] = {"eq", "ne", "lo", "ls", "hi", "hs", "lt", "le", "gt", "ge"};
+      const char* width = i.mem_size == 1 ? "b" : i.mem_size == 2 ? "h" : "";
+      if (i.imm_form) return std::format("cb{} {}, #{}, 0x{:x}", conds[i.cond % 10], rd(), i.amount, static_cast<uint64_t>(i.imm));
+      return std::format("cb{}{} {}, {}, 0x{:x}", width, conds[i.cond % 10], rd(), rm(), static_cast<uint64_t>(i.imm));
+    }
+    case Op::BfCvt: return std::format("bfcvt h{}, s{}", i.rd, i.rn);
+    case Op::BfCvtn: return std::format("bfcvtn{} v{}, v{}.4s", i.index ? "2" : "", i.rd, i.rn);
+    case Op::FJcvtzs: return std::format("fjcvtzs w{}, d{}", i.rd, i.rn);
+    case Op::Rmif: return std::format("rmif x{}, #{}, #{}", i.rn, i.imm, i.nzcv);
+    case Op::Setf: return std::format("setf{} w{}", i.mem_size * 8, i.rn);
     case Op::Count_:
       break;
   }

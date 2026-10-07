@@ -24,6 +24,9 @@ std::span<const BuiltinExport> kernel32_builtins();
 std::span<const BuiltinExport> exception_builtins();  // kernel32/ntdll exception handling
 std::span<const BuiltinExport> process_builtins();    // kernel32 process creation
 std::span<const BuiltinExport> resource_builtins();   // kernel32 resource functions
+std::span<const BuiltinExport> thread_builtins();       // kernel32 thread control and fibers
+std::span<const BuiltinExport> module_list_builtins();  // psapi (K32*) and toolhelp module enumeration
+std::span<const BuiltinExport> ole32_builtins();       // COM activation of ARM64 in-process servers
 std::span<const BuiltinExport> user32_builtins();
 std::span<const BuiltinExport> vcruntime_builtins();
 

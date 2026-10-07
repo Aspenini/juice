@@ -34,6 +34,12 @@ uint64_t ThunkTable::add_locked(Thunk thunk) {
   return addr;
 }
 
+Thunk* ThunkTable::find_native(void* fn) {
+  std::lock_guard lock(mutex_);
+  auto it = by_native_.find(fn);
+  return it == by_native_.end() ? nullptr : &thunks_[(it->second - begin()) / kStride];
+}
+
 uint64_t ThunkTable::add_native(void* fn, std::string dll, std::string name, const char* signature) {
   std::lock_guard lock(mutex_);
   auto it = by_native_.find(fn);

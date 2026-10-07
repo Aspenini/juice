@@ -108,14 +108,35 @@ enum class Op : uint16_t {
   FpBinary,            // shift = FpBinaryOp
   FpUnary,             // shift = FpUnaryOp
   FpCvt,               // FCVT: mem_size = destination, esize = source
-  FpRint,              // shift = ir::FpRound
+  FpRint,              // shift = ir::FpRound; amount = 1 / 2 for FRINT32* / FRINT64*
   FpFma,               // shift = 0 FMADD, 1 FMSUB, 2 FNMADD, 3 FNMSUB
   FpCmp,               // imm_form = compare with zero
   FpCcmp,              // cond, nzcv
   FpCsel,              // cond
   FpMovImm,            // imm = bits
-  FpToInt,             // shift = ir::FpRound, mem_signed, sf = 64-bit result
-  IntToFp,             // mem_signed, sf = 64-bit source
+  FpToInt,             // shift = ir::FpRound, mem_signed, sf = 64-bit result; vector = result in Vd (FPRCVT)
+  IntToFp,             // mem_signed, sf = 64-bit source; vector = source in Vn (FPRCVT)
+
+  // Optional extensions
+  Crc32,               // CRC32B/H/W/X: mem_size = data bytes; mem_signed = CRC32C (Castagnoli)
+  Crypto,              // shift = CryptoOp; ra = fourth register (EOR3/BCAX); imm = XAR rotation;
+                       //   index = 1 for PMULL2
+  VecExtra,            // shift = VecExtraKind; esize = source element size; imm_form = by element
+                       //   (index2 = element); amount = signedness (bit 0 n, bit 1 m) or rotation;
+                       //   index = upper part (FMLAL2, BFMLALT); scalar for SQRDMLAH/SH
+  BfCvt,               // BFCVT Hd, Sn
+  BfCvtn,              // BFCVTN / BFCVTN2 (index = 1)
+  FJcvtzs,             // FJCVTZS Wd, Dn
+  Cfinv, Axflag, Xaflag,
+  Rmif,                // RMIF Xn, #imm (rotation), #nzcv (mask)
+  Setf,                // SETF8 / SETF16: mem_size = 1 or 2
+  AtomicPair,          // LSE128 LDCLRP / LDSETP / SWPP: shift = ir::AtomicOp; rd = Rt (low), ra = Rt2 (high)
+  Mops,                // CPYF* / CPY* / SET*: shift = MopsOp; rd = Xd, rm = Xs (source / value), rn = Xn (size)
+  Abs, Cnt, Ctz,       // CSSC
+  MinMax,              // CSSC SMAX/UMAX/SMIN/UMIN: shift = 0 smax, 1 umax, 2 smin, 3 umin; imm_form = immediate
+  Pacga,
+  CmpBranch,           // CB<cc> (FEAT_CMPBR): cond = ir::Predicate; rd = Rt, rm = Rm or amount = imm6
+                       //   (imm_form); mem_size = 1 / 2 for CBB / CBH, else 0; imm = target
 
   Count_
 };
@@ -127,10 +148,18 @@ enum class VecInt : uint8_t {
 };
 enum class VecFp : uint8_t {
   Add, Sub, Mul, Div, Max, Min, MaxNm, MinNm, Abd, MulX, Mla, Mls, CmEq, CmGe, CmGt, AcGe, AcGt, Recps, Rsqrts,
-  AddP, MaxP, MinP, MaxNmP, MinNmP
+  AddP, MaxP, MinP, MaxNmP, MinNmP,
+  AMax, AMin,          // FAMAX / FAMIN: of the absolute values
 };
-enum class VecIntUn : uint8_t { Clz, Cls, Rbit, AddLP, AdaLP, SatAbs, SatNeg, SatXtn, Shll };
-enum class VecFpUn : uint8_t { Abs, Neg, Sqrt, Rint, ToInt, FromInt, CmpZero, Recpe, Rsqrte, CvtLong, CvtNarrow };
+enum class VecIntUn : uint8_t {
+  Clz, Cls, Rbit, AddLP, AdaLP, SatAbs, SatNeg, SatXtn, Shll,
+  SuqAdd, UsqAdd,      // saturating accumulate of the other signedness (reads Vd)
+  URecpe, URsqrte,     // unsigned reciprocal (square root) estimates, 32-bit lanes
+};
+enum class VecFpUn : uint8_t {
+  Abs, Neg, Sqrt, Rint, ToInt, FromInt, CmpZero, Recpe, Rsqrte, CvtLong, CvtNarrow,
+  Rint32, Rint64,      // FRINT32Z/X, FRINT64Z/X (amount = rounding)
+};
 enum class VecLongKind : uint8_t {
   AddL, AddW, SubL, SubW, AddHN, RAddHN, SubHN, RSubHN, AbaL, AbdL, MlaL, MlsL, MulL, PMulL, SqDMulL, SqDMlaL,
   SqDMlsL
@@ -139,6 +168,28 @@ enum class VecShiftKind : uint8_t { Sra, RShr, RSra, Sri, Sli, SatShl, Rshrn, Sa
 enum class VecElemKind : uint8_t {
   Mul, Mla, Mls, MulL, MlaL, MlsL, FMul, FMla, FMls, FMulX, SqDMulH, SqRDMulH, SqDMulL, SqDMlaL, SqDMlsL
 };
+enum class CryptoOp : uint8_t {
+  AesE, AesD, AesMc, AesImc,
+  Sha1C, Sha1P, Sha1M, Sha1Su0, Sha1H, Sha1Su1,
+  Sha256H, Sha256H2, Sha256Su0, Sha256Su1,
+  Sha512H, Sha512H2, Sha512Su0, Sha512Su1,
+  Eor3, Bcax, Rax1, Xar,
+  Pmull64,             // PMULL / PMULL2 Vd.1Q, Vn.1D, Vm.1D
+  Sm3Ss1,              // ra = Va
+  Sm3Tt1a, Sm3Tt1b, Sm3Tt2a, Sm3Tt2b,  // index = imm2
+  Sm3PartW1, Sm3PartW2,
+  Sm4E, Sm4EKey,
+};
+enum class VecExtraKind : uint8_t {
+  Dot,                 // SDOT/UDOT/USDOT/SUDOT: 4 bytes into each 32-bit lane
+  Mmla,                // SMMLA/UMMLA/USMMLA
+  SqRdmlah, SqRdmlsh,
+  BfDot, BfMmla, BfMlal,
+  Fcmla,               // amount = rotation (0..3: 0, 90, 180, 270)
+  Fcadd,               // amount = 1 (90) or 3 (270)
+  Fmlal, Fmlsl,        // FMLAL/FMLSL (index = 1 for the "2" forms)
+};
+enum class MopsOp : uint8_t { CopyP, CopyM, CopyE, CopyForwardP, CopyForwardM, CopyForwardE, SetP, SetM, SetE };
 enum class FpBinaryOp : uint8_t { Mul, Div, Add, Sub, Max, Min, MaxNm, MinNm, NMul };
 enum class FpUnaryOp : uint8_t { Abs = 1, Neg = 2, Sqrt = 3 };
 
@@ -171,6 +222,14 @@ inline constexpr uint16_t MIDR_EL1 = make(3, 0, 0, 0, 0);
 inline constexpr uint16_t CurrentEL = make(3, 0, 4, 2, 2);
 inline constexpr uint16_t CNTFRQ_EL0 = make(3, 3, 14, 0, 0);
 inline constexpr uint16_t CNTVCT_EL0 = make(3, 3, 14, 0, 2);
+inline constexpr uint16_t CNTPCT_EL0 = make(3, 3, 14, 0, 1);
+inline constexpr uint16_t CNTPCTSS_EL0 = make(3, 3, 14, 0, 5);
+inline constexpr uint16_t CNTVCTSS_EL0 = make(3, 3, 14, 0, 6);
+inline constexpr uint16_t RNDR = make(3, 3, 2, 4, 0);
+inline constexpr uint16_t RNDRRS = make(3, 3, 2, 4, 1);
+inline constexpr uint16_t DIT = make(3, 3, 4, 2, 5);
+inline constexpr uint16_t SSBS = make(3, 3, 4, 2, 6);
+inline constexpr uint16_t TCO = make(3, 3, 4, 2, 7);
 }  // namespace sysreg
 
 struct Instruction {

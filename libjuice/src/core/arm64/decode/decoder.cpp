@@ -13,6 +13,9 @@
 namespace juice::arm64 {
 namespace {
 
+// ir::AtomicOp values for the LSE128 instructions (decoded into Instruction::shift).
+constexpr unsigned ir_atomic_clr = 1, ir_atomic_set = 3, ir_atomic_swap = 8;
+
 constexpr uint32_t bits(uint32_t v, unsigned hi, unsigned lo) {
   return (v >> lo) & ((hi - lo == 31) ? 0xFFFFFFFFu : ((1u << (hi - lo + 1)) - 1));
 }
@@ -86,6 +89,10 @@ void decode_dp_imm(Instruction& i, uint32_t w) {
       return;
     }
     case 0b111: {  // Extract
+      if (bits(w, 31, 22) == 0b1111001110 && bits(w, 4, 0) == 31) {  // AUTIASPPC / AUTIBSPPC <label>
+        i.op = Op::Nop;  // pointer authentication is not modelled
+        return;
+      }
       if (bits(w, 30, 29) != 0 || bit(w, 21) || bit(w, 22) != i.sf) return;
       i.rm = bits(w, 20, 16);
       i.immr = bits(w, 15, 10);
@@ -93,8 +100,19 @@ void decode_dp_imm(Instruction& i, uint32_t w) {
       i.op = Op::Extr;
       return;
     }
-    default:
+    case 0b011:
+      if (bit(w, 22) && !bit(w, 29) && !bit(w, 30) && bits(w, 21, 20) == 0) {  // SMAX/UMAX/SMIN/UMIN (immediate)
+        i.op = Op::MinMax;
+        i.shift = bits(w, 19, 18);
+        i.imm_form = true;
+        const uint64_t imm8 = bits(w, 17, 10);
+        i.imm = (i.shift & 1) ? static_cast<int64_t>(imm8) : sext(imm8, 8);
+        return;
+      }
       i.op = Op::Unsupported;  // add/sub with tags (MTE)
+      return;
+    default:
+      i.op = Op::Unsupported;
       return;
   }
 }
@@ -112,7 +130,9 @@ void decode_system(Instruction& i, uint32_t w) {
 
   if (op0 == 0) {
     if (l) return;
-    if (crn == 2 && op1 == 3 && i.rd == 31) {  // HINT: NOP, YIELD, BTI, PAC*SP, ...
+    if (crn == 1 && op1 == 3 && crm == 0 && op2 <= 1) {  // WFET / WFIT: waiting is optional
+      i.op = Op::Nop;
+    } else if (crn == 2 && op1 == 3 && i.rd == 31) {  // HINT: NOP, YIELD, BTI, PAC*SP, ...
       i.op = Op::Nop;
     } else if (crn == 3 && op1 == 3 && i.rd == 31) {  // barriers
       // x86-64 already orders loads and stores except a store followed by a
@@ -121,8 +141,9 @@ void decode_system(Instruction& i, uint32_t w) {
       if (op2 == 2) i.op = Op::Clrex;
       else if ((op2 == 4 || op2 == 5) && (crm & 3) == 3) i.op = Op::Barrier;
       else i.op = Op::Nop;
-    } else if (crn == 4 && i.rd == 31) {  // MSR (immediate) to PSTATE fields
-      i.op = Op::Nop;
+    } else if (crn == 4 && i.rd == 31) {  // MSR (immediate) to PSTATE fields; the flag manipulation instructions
+      static constexpr Op flag_ops[3] = {Op::Cfinv, Op::Xaflag, Op::Axflag};
+      i.op = (op1 == 0 && crm == 0 && op2 < 3) ? flag_ops[op2] : Op::Nop;
     }
     return;
   }
@@ -162,8 +183,8 @@ void decode_branch_reg(Instruction& i, uint32_t w) {
     case 0b0010:
       if (plain) {
         i.op = Op::Ret;
-      } else if ((op3 == 2 || op3 == 3) && i.rn == 31 && op4 == 31) {
-        i.op = Op::Ret;  // RETAA / RETAB: pointer authentication is not modelled
+      } else if ((op3 == 2 || op3 == 3) && i.rn == 31) {
+        i.op = Op::Ret;  // RETAA / RETAB / RETAASPPCR / RETABSPPCR: pointer authentication is not modelled
         i.rn = 30;
       }
       break;
@@ -206,6 +227,32 @@ void decode_branch(Instruction& i, uint32_t w) {
     else if (opc == 1 && ll == 0) i.op = Op::Brk;
     else if (opc == 2 && ll == 0) i.op = Op::Hlt;
     else if (opc == 0 && (ll == 2 || ll == 3)) i.op = Op::Unsupported;  // HVC / SMC
+  } else if ((bits(w, 30, 24) == 0b1110101 || bits(w, 30, 24) == 0b1110100)) {  // CB<cc> (FEAT_CMPBR)
+    // Conditions by encoding: immediate GT LT HI LO - - EQ NE; register GT GE HI HS - - EQ NE.
+    enum : uint8_t { kEq = 0, kNe = 1, kUlt = 2, kUgt = 4, kUge = 5, kSlt = 6, kSgt = 8, kSge = 9 };
+    static constexpr uint8_t imm_conds[8] = {kSgt, kSlt, kUgt, kUlt, 0xFF, 0xFF, kEq, kNe};
+    static constexpr uint8_t reg_conds[8] = {kSgt, kSge, kUgt, kUge, 0xFF, 0xFF, kEq, kNe};
+    const bool imm = bit(w, 24);
+    const unsigned cc = bits(w, 23, 21);
+    i.sf = bit(w, 31);
+    i.rd = bits(w, 4, 0);
+    i.imm = static_cast<int64_t>(i.pc + static_cast<uint64_t>(sext(uint64_t{bits(w, 13, 5)} << 2, 11)));
+    i.cond = imm ? imm_conds[cc] : reg_conds[cc];
+    if (i.cond == 0xFF) return;
+    if (imm) {
+      if (bit(w, 14)) return;
+      i.imm_form = true;
+      i.amount = bits(w, 20, 15);
+    } else {
+      i.rm = bits(w, 20, 16);
+      const unsigned form = bits(w, 15, 14);
+      if (form == 1 || (form >= 2 && i.sf)) return;
+      i.mem_size = form == 2 ? 1 : form == 3 ? 2 : 0;
+    }
+    i.op = Op::CmpBranch;
+  } else if (bits(w, 31, 22) == 0b0101010100 && bits(w, 4, 0) == 31) {  // RETAASPPC / RETABSPPC <label>
+    i.op = Op::Ret;  // pointer authentication is not modelled
+    i.rn = 30;
   } else if (bits(w, 31, 22) == 0b1101010100) {
     decode_system(i, w);
   } else if (bits(w, 31, 25) == 0b1101011) {
@@ -261,7 +308,7 @@ void decode_exclusive(Instruction& i, uint32_t w) {
     i.op = l ? Op::Ldxr : Op::Stxr;
   } else if (!o2 && o1) {
     if (size < 2) {  // CASP / CASPA / CASPL / CASPAL: size<0> selects 64-bit register pairs
-      if (i.ra != 31 || (i.rm & 1) || (bits(w, 4, 0) & 1)) return;
+      if ((i.rm & 1) || (bits(w, 4, 0) & 1)) return;
       i.op = Op::Casp;
       i.sf = size == 1;
       i.mem_size = size == 1 ? 16 : 8;
@@ -274,8 +321,7 @@ void decode_exclusive(Instruction& i, uint32_t w) {
     i.imm = 0;
     i.release = !l;
   } else {
-    if (i.ra != 31) return;
-    i.op = Op::Cas;
+    i.op = Op::Cas;  // (Rt2 should be all ones; like hardware, ignore it)
   }
 }
 
@@ -310,6 +356,25 @@ void decode_ldst(Instruction& i, uint32_t w) {
     decode_exclusive(i, w);
     return;
   }
+  if (bits(w, 29, 24) == 0b001001 && !v) {  // FEAT_LSUI: LDTXR / STTXR / CAST / CASPT (ordinary at EL0)
+    const bool o2 = bit(w, 23), o1 = bit(w, 21);
+    i.rm = bits(w, 20, 16);
+    i.ra = bits(w, 14, 10);
+    i.mem_size = static_cast<uint8_t>(1u << size);
+    i.sf = size == 3;
+    if (!o2 && !o1 && size >= 2) {
+      i.op = bit(w, 22) ? Op::Ldxr : Op::Stxr;
+    } else if (o2 && !o1) {
+      if (size >= 2) {
+        i.op = Op::Cas;
+      } else if (size == 1 && !(i.rm & 1) && !(i.rd & 1)) {
+        i.op = Op::Casp;
+        i.sf = true;
+        i.mem_size = 16;
+      }
+    }
+    return;
+  }
 
   if (detail::decode_simd_structure(i, w)) return;
 
@@ -339,8 +404,9 @@ void decode_ldst(Instruction& i, uint32_t w) {
     i.ra = bits(w, 14, 10);
     i.vector = v;
     if (v) {
-      if (opc == 3) return;
-      i.mem_size = static_cast<uint8_t>(4u << opc);
+      i.mem_size = static_cast<uint8_t>(opc == 3 ? 16 : 4u << opc);  // opc 3: LDTP / STTP Q (FEAT_LSUI)
+    } else if (opc == 3) {  // LDTP / STTP / LDTNP / STTNP (unprivileged: ordinary accesses at EL0)
+      i.mem_size = 8;
     } else if (opc == 0) {
       i.mem_size = 4;
       i.sf = false;
@@ -351,8 +417,6 @@ void decode_ldst(Instruction& i, uint32_t w) {
       i.sf = true;
     } else if (opc == 2) {
       i.mem_size = 8;
-    } else {
-      return;
     }
     i.mode = m == 1 ? AddrMode::PostIndex : m == 3 ? AddrMode::PreIndex : AddrMode::Offset;
     i.imm = sext(bits(w, 21, 15), 7) * i.mem_size;
@@ -360,6 +424,99 @@ void decode_ldst(Instruction& i, uint32_t w) {
     return;
   }
 
+  if ((w & 0x3B200C00u) == 0x19000400u && bits(w, 31, 30) == 0) {  // memory copy and set (MOPS)
+    const unsigned op1 = bits(w, 23, 22), op2 = bits(w, 15, 12);
+    i.rd = bits(w, 4, 0);
+    i.rn = bits(w, 9, 5);
+    i.rm = bits(w, 20, 16);
+    if (op1 == 3) {  // SETP / SETM / SETE (the SETG forms are MTE)
+      if (v || (op2 & 3) == 3) return;
+      static constexpr MopsOp set_ops[3] = {MopsOp::SetP, MopsOp::SetM, MopsOp::SetE};
+      i.op = Op::Mops;
+      i.shift = static_cast<uint8_t>(set_ops[op2 & 3]);
+      return;
+    }
+    static constexpr MopsOp copy_ops[2][3] = {{MopsOp::CopyForwardP, MopsOp::CopyForwardM, MopsOp::CopyForwardE},
+                                              {MopsOp::CopyP, MopsOp::CopyM, MopsOp::CopyE}};
+    i.op = Op::Mops;
+    i.shift = static_cast<uint8_t>(copy_ops[v][op1]);
+    return;
+  }
+  if ((w & 0xBF200C00u) == 0x19200400u) {  // FEAT_LSUI: LDTADD / LDTCLR / LDTSET / SWPT
+    const unsigned o3 = bit(w, 15), opc = bits(w, 14, 12);
+    i.rm = bits(w, 20, 16);
+    i.mem_size = bit(w, 30) ? 8 : 4;
+    i.sf = bit(w, 30);
+    if (!o3 && opc == 0) i.op = Op::Ldadd;
+    else if (!o3 && opc == 1) i.op = Op::Ldclr;
+    else if (!o3 && opc == 3) i.op = Op::Ldset;
+    else if (o3 && opc == 0) i.op = Op::Swp;
+    return;
+  }
+  if ((w & 0xFF200C00u) == 0x19200000u) {  // LSE128: LDCLRP / LDSETP / SWPP (with acquire / release)
+    const unsigned o3 = bit(w, 15), opc = bits(w, 14, 12);
+    i.ra = bits(w, 20, 16);
+    i.mem_size = 16;
+    if (!o3 && opc == 1) i.shift = static_cast<uint8_t>(ir_atomic_clr);
+    else if (!o3 && opc == 3) i.shift = static_cast<uint8_t>(ir_atomic_set);
+    else if (o3 && opc == 0) i.shift = static_cast<uint8_t>(ir_atomic_swap);
+    else return;
+    i.op = Op::AtomicPair;
+    return;
+  }
+  if (bits(w, 29, 24) == 0b011001 && bits(w, 11, 10) == 0b10 && !v && bit(w, 31)) {  // RCPC3 (general registers)
+    const unsigned opc2 = bits(w, 15, 12);
+    const bool wide = bit(w, 30);
+    i.mem_size = wide ? 8 : 4;
+    i.sf = wide;
+    if (!bit(w, 23) && !bit(w, 21) && (opc2 == 5 || opc2 == 7)) {  // LDAPP / STLP (no offset)
+      const bool load = bit(w, 22);
+      i.ra = bits(w, 20, 16);
+      i.op = load ? Op::Ldp : Op::Stp;
+      i.release = !load;
+      i.mode = AddrMode::Offset;
+      i.imm = 0;
+      return;
+    }
+    if (!bit(w, 23) && !bit(w, 21) && opc2 <= 1) {  // LDIAPP / STILP
+      const bool load = bit(w, 22);
+      i.ra = bits(w, 20, 16);
+      i.op = load ? Op::Ldp : Op::Stp;
+      i.release = !load;
+      if (opc2 == 1) {
+        i.mode = AddrMode::Offset;
+        i.imm = 0;
+      } else {  // LDIAPP: post-index by the pair size; STILP: pre-index by minus it
+        i.mode = load ? AddrMode::PostIndex : AddrMode::PreIndex;
+        i.imm = load ? 2 * i.mem_size : -2 * static_cast<int64_t>(i.mem_size);
+      }
+      return;
+    }
+    if (bit(w, 23) && bits(w, 21, 12) == 0) {  // LDAPR post-index / STLR pre-index
+      const bool load = bit(w, 22);
+      i.op = load ? Op::Ldr : Op::Str;
+      i.release = !load;
+      i.mode = load ? AddrMode::PostIndex : AddrMode::PreIndex;
+      i.imm = load ? i.mem_size : -static_cast<int64_t>(i.mem_size);
+      return;
+    }
+    return;
+  }
+  if (bits(w, 29, 24) == 0b011101 && !bit(w, 21) && bits(w, 11, 10) == 0b10) {  // LDAPUR / STLUR (SIMD&FP)
+    if (!set_single_reg(i, size, true, bits(w, 23, 22))) { i.op = Op::Invalid; return; }
+    i.mode = AddrMode::Offset;
+    i.imm = sext(bits(w, 20, 12), 9);
+    i.release = i.op == Op::Str;
+    return;
+  }
+  if (size == 3 && !v && bits(w, 29, 24) == 0b111000 && bit(w, 21) && bit(w, 10)) {  // LDRAA / LDRAB
+    i.op = Op::Ldr;
+    i.mem_size = 8;
+    i.sf = true;
+    i.imm = sext((uint64_t{bit(w, 22)} << 9) | bits(w, 20, 12), 10) * 8;
+    i.mode = bit(w, 11) ? AddrMode::PreIndex : AddrMode::Offset;
+    return;
+  }
   if (bits(w, 29, 24) == 0b011001 && !bit(w, 21) && bits(w, 11, 10) == 0 && !v) {
     // LDAPUR / STLUR family: unscaled offset with release/acquire semantics.
     if (!set_single_reg(i, size, false, bits(w, 23, 22))) { i.op = Op::Invalid; return; }
@@ -455,7 +612,24 @@ void decode_dp_reg(Instruction& i, uint32_t w) {
   }
 
   switch (op2) {
-    case 0b0000:  // add/subtract with carry
+    case 0b0000:  // add/subtract with carry; RMIF, SETF8, SETF16
+      if (bits(w, 14, 10) == 0b00001 && i.sf && !op0 && bit(w, 29) && !bit(w, 4)) {
+        i.op = Op::Rmif;
+        i.imm = bits(w, 20, 15);
+        i.nzcv = bits(w, 3, 0);
+        return;
+      }
+      if (bits(w, 13, 10) == 0b0010 && !i.sf && !op0 && bit(w, 29) && bits(w, 20, 15) == 0 && bits(w, 4, 0) == 0b01101) {
+        i.op = Op::Setf;
+        i.mem_size = bit(w, 14) ? 2 : 1;
+        return;
+      }
+      if (bits(w, 15, 13) == 0b001 && i.sf && !bit(w, 29)) {  // ADDPT / SUBPT (FEAT_CPA): checked pointer arithmetic
+        i.op = op0 ? Op::SubExt : Op::AddExt;
+        i.shift = static_cast<uint8_t>(Extend::Uxtx);
+        i.amount = bits(w, 12, 10);
+        return;
+      }
       if (bits(w, 15, 10) != 0) return;
       i.set_flags = bit(w, 29);
       i.op = op0 ? Op::Sbc : Op::Adc;
@@ -488,9 +662,29 @@ void decode_dp_reg(Instruction& i, uint32_t w) {
           case 0b001001: i.op = Op::Lsrv; break;
           case 0b001010: i.op = Op::Asrv; break;
           case 0b001011: i.op = Op::Rorv; break;
-          default: i.op = Op::Unsupported; break;  // CRC32, PAC, ...
+          case 0b010000: case 0b010001: case 0b010010: case 0b010011:    // CRC32B/H/W/X
+          case 0b010100: case 0b010101: case 0b010110: case 0b010111: {  // CRC32CB/CH/CW/CX
+            const unsigned sz = opcode & 3;
+            if (i.sf != (sz == 3)) return;
+            i.op = Op::Crc32;
+            i.mem_size = static_cast<uint8_t>(1u << sz);
+            i.mem_signed = opcode & 4;
+            break;
+          }
+          case 0b011000: case 0b011001: case 0b011010: case 0b011011:  // SMAX / UMAX / SMIN / UMIN
+            i.op = Op::MinMax;
+            i.shift = opcode & 3;
+            break;
+          case 0b001100:
+            if (i.sf) i.op = Op::Pacga;
+            break;
+          default: i.op = Op::Unsupported; break;
         }
       } else {  // data processing (1 source)
+        if (i.rm == 1 && i.sf) {  // pointer authentication: signing and authenticating are not modelled
+          if (opcode <= 0b010001 || opcode >= 0b100000) i.op = Op::Nop;  // (PAuth_LR: the 1xxxxx forms)
+          return;
+        }
         if (i.rm != 0) { i.op = Op::Unsupported; return; }
         switch (opcode) {
           case 0b000000: i.op = Op::Rbit; break;
@@ -499,6 +693,9 @@ void decode_dp_reg(Instruction& i, uint32_t w) {
           case 0b000011: if (i.sf) i.op = Op::Rev; break;
           case 0b000100: i.op = Op::Clz; break;
           case 0b000101: i.op = Op::Cls; break;
+          case 0b000110: i.op = Op::Ctz; break;  // CSSC
+          case 0b000111: i.op = Op::Cnt; break;
+          case 0b001000: i.op = Op::Abs; break;
           default: i.op = Op::Unsupported; break;
         }
       }
@@ -515,6 +712,7 @@ void decode_dp_reg(Instruction& i, uint32_t w) {
     i.ra = bits(w, 14, 10);
     switch (op31) {
       case 0b000: i.op = o0 ? Op::Msub : Op::Madd; break;
+      case 0b011: if (i.sf) i.op = o0 ? Op::Msub : Op::Madd; break;  // MADDPT / MSUBPT (FEAT_CPA)
       case 0b001: if (i.sf) i.op = o0 ? Op::Smsubl : Op::Smaddl; break;
       case 0b010: if (i.sf && !o0) i.op = Op::Smulh; break;
       case 0b101: if (i.sf) i.op = o0 ? Op::Umsubl : Op::Umaddl; break;
@@ -605,7 +803,7 @@ Instruction decode(uint32_t w, uint64_t pc) {
 bool is_block_terminator(const Instruction& insn) {
   switch (insn.op) {
     case Op::B: case Op::Bl: case Op::BCond: case Op::Cbz: case Op::Cbnz:
-    case Op::Tbz: case Op::Tbnz: case Op::Br: case Op::Blr: case Op::Ret:
+    case Op::Tbz: case Op::Tbnz: case Op::Br: case Op::Blr: case Op::Ret: case Op::CmpBranch:
     case Op::Svc: case Op::Brk: case Op::Hlt: case Op::Udf:
     case Op::Invalid: case Op::Unsupported:
       return true;

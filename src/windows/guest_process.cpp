@@ -28,7 +28,8 @@ constexpr uint32_t kStatusDllInitFailed = 0xC0000142;
 constexpr size_t kTebPeb = 0x60;
 
 // The guest context of the calling host thread.
-thread_local GuestThread* t_thread = nullptr;
+thread_local GuestThread* t_thread = nullptr;   // the context running on this thread
+thread_local GuestThread* t_primary = nullptr;  // this thread's own context (fibers aside)
 
 // The process whose threads release_thread() cleans up (one per juice process).
 GuestProcess* g_process = nullptr;
@@ -84,6 +85,7 @@ uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
 }  // namespace
 
 GuestThread* GuestProcess::t_current() { return t_thread; }
+GuestThread* GuestProcess::t_own() { return t_primary; }
 
 GuestProcess::GuestProcess(ProcessOptions options) : options_(std::move(options)) { g_process = this; }
 
@@ -147,6 +149,7 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
   options_.engine.tls_vector_offset = 0x58;  // TEB->ThreadLocalStoragePointer: guest TLS gets a vector of its own
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
   install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), this});
+  set_guest_code_predicate([](uint64_t addr) { return g_process && g_process->is_guest_address(addr); });
   return {};
 }
 
@@ -198,7 +201,9 @@ GuestThread& GuestProcess::attach_thread(uint64_t stack_size) {
   reclaim_threads();
   GuestThread* t = allocate_thread(stack_size);
   DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->host_thread, SYNCHRONIZE, FALSE, 0);
+  t->thread_id = GetCurrentThreadId();
   t_thread = t;
+  t_primary = t;
   {
     std::lock_guard lock(threads_mutex_);
     live_threads_.push_back(t);
@@ -221,7 +226,7 @@ void WINAPI GuestProcess::release_thread(void* p) {
   auto* t = static_cast<GuestThread*>(p);
   // Threads created natively (thread pool, the native UCRT's _beginthreadex)
   // get their guest thread-detach notifications here.
-  if (t == t_thread && !t->main && !t->detached) g_process->notify_thread(DLL_THREAD_DETACH);
+  if (t == t_primary && !t->main && !t->detached) g_process->notify_thread(DLL_THREAD_DETACH);
   {
     std::lock_guard lock(g_process->threads_mutex_);
     std::erase(g_process->live_threads_, t);
@@ -268,9 +273,31 @@ DWORD WINAPI GuestProcess::thread_main(void* p) {
 }
 
 void GuestProcess::exit_thread(uint32_t code) {
-  if (t_thread && !t_thread->main) notify_thread(DLL_THREAD_DETACH);
+  if (t_primary && !t_primary->main) notify_thread(DLL_THREAD_DETACH);
   std::fflush(stdout);
   ExitThread(code);
+}
+
+// A fiber's context takes over this thread (when the fiber starts, and when
+// SwitchToFiber returns to it, possibly on another thread than before): it
+// uses this thread's TEB and implicit-TLS vector.
+void GuestProcess::enter_fiber(GuestThread& context) {
+  GuestThread* own = t_primary ? t_primary : &attach_thread();
+  t_thread = &context;
+  context.teb = teb();
+  context.state.x[18] = reinterpret_cast<uint64_t>(context.teb);
+  context.state.tls_vector = own->state.tls_vector;
+  context.thread_id = GetCurrentThreadId();
+  own->active.store(&context == own ? nullptr : &context, std::memory_order_release);
+}
+
+// Start routine of the native fiber behind a guest CreateFiber: runs the
+// guest's start routine on the fiber's context. Returning from it ends the thread.
+void WINAPI GuestProcess::fiber_main(void* p) {
+  auto* context = static_cast<GuestThread*>(p);
+  g_process->enter_fiber(*context);
+  const auto code = static_cast<uint32_t>(g_process->call_guest(context->fiber_start, {context->fiber_param}));
+  g_process->exit_thread(code);
 }
 
 // --- running guest code ------------------------------------------------------------
@@ -278,7 +305,9 @@ void GuestProcess::exit_thread(uint32_t code) {
 int GuestProcess::run() {
   GuestThread* main = allocate_thread(0);
   main->main = true;
+  main->thread_id = GetCurrentThreadId();
   t_thread = main;
+  t_primary = main;
   {
     std::lock_guard lock(threads_mutex_);
     live_threads_.push_back(main);
@@ -310,16 +339,28 @@ NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& a
   const arm64::CpuState saved = state;
   for (int i = 0; i < 8; ++i) state.x[i] = args.gpr[i];
   for (int i = 0; i < 4; ++i) state.v[i] = {args.fpr[i], 0};
+  if (how.extra_fpr)
+    for (int i = 0; i < 4; ++i) state.v[4 + i] = {how.extra_fpr[i], 0};
   if (how.sp) state.sp = how.sp;
+  if (!how.stack_args.empty()) {  // stacked arguments below the caller's frame, 16-byte aligned
+    const uint64_t sp = (state.sp - 8 * how.stack_args.size()) & ~uint64_t{15};
+    std::memcpy(reinterpret_cast<void*>(sp), how.stack_args.data(), 8 * how.stack_args.size());
+    state.sp = sp;
+  }
   if (how.nonvolatile) std::memcpy(&state.x[19], how.nonvolatile, 10 * sizeof(uint64_t));
   state.x[30] = thunks_.return_sentinel();
   state.pc = fn;
 
   t.levels.push_back({state.sp, how.native_frames, how.link});
+  const bool was_in_host = t.in_host.exchange(false, std::memory_order_acq_rel);
   struct LevelScope {
     GuestThread& t;
-    ~LevelScope() { t.levels.pop_back(); }
-  } scope{t};
+    bool in_host;
+    ~LevelScope() {
+      t.levels.pop_back();
+      t.in_host.store(in_host, std::memory_order_release);
+    }
+  } scope{t, was_in_host};
   // Exception handling continues guest execution in the call level that owns
   // the target frame (a Resume thrown by unwind/restore_context); outer
   // levels rethrow it on.
@@ -362,6 +403,23 @@ bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& r
     return true;
   }
 
+  // A callback (or a method of the guest's object) whose arguments need converting per its signature.
+  if (args.x64_stack) {
+    if (const char* signature = guest_callback_signature(target, args.gpr[0])) {
+      Args converted{};
+      std::vector<uint64_t> stack_words;
+      uint64_t v[8] = {};
+      if (convert_native_args(signature, args.gpr, args.fpr, args.x64_stack, converted.gpr, v, stack_words)) {
+        for (int k = 0; k < 4; ++k) converted.fpr[k] = v[k];
+        GuestCall how;
+        how.extra_fpr = v + 4;
+        how.stack_args = stack_words;
+        result = call_guest(target, converted, how);
+        return true;
+      }
+    }
+  }
+
   if (options_.trace_calls) {
     std::fprintf(stderr, "[juice] callback 0x%llx(0x%llx, 0x%llx, 0x%llx, 0x%llx) from native code on thread %lu\n",
                  static_cast<unsigned long long>(target), static_cast<unsigned long long>(args.gpr[0]),
@@ -397,7 +455,8 @@ bool GuestProcess::is_host_code(uint64_t pc) {
   return mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE && (mbi.Protect & kExecute);
 }
 
-Thunk* GuestProcess::native_code_thunk(uint64_t pc) {
+Thunk* GuestProcess::native_code_thunk(uint64_t pc, uint64_t self) {
+  if (Thunk* known = thunks_.find_native(reinterpret_cast<void*>(pc))) return known;
   HMODULE module = nullptr;
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                      reinterpret_cast<LPCWSTR>(pc), &module);
@@ -405,14 +464,17 @@ Thunk* GuestProcess::native_code_thunk(uint64_t pc) {
   if (module) GetModuleFileNameA(module, path, MAX_PATH);
   std::string dll = path;
   if (size_t slash = dll.find_last_of("\\/"); slash != std::string::npos) dll = dll.substr(slash + 1);
-  const std::string name = std::format("0x{:x}", pc - reinterpret_cast<uint64_t>(module));
-  return thunks_.find(thunks_.add_native(reinterpret_cast<void*>(pc), std::move(dll), name));
+  // A method of a COM object the generic bridge would get wrong: its signature (and name).
+  std::string method;
+  const char* signature = com_method_signature(pc, self, &method);
+  std::string name = method.empty() ? std::format("0x{:x}", pc - reinterpret_cast<uint64_t>(module)) : method;
+  return thunks_.find(thunks_.add_native(reinterpret_cast<void*>(pc), std::move(dll), std::move(name), signature));
 }
 
 runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   const uint64_t pc = s.pc;
   const bool in_thunks = pc >= thunks_.begin() && pc < thunks_.end();
-  Thunk* thunk = in_thunks ? thunks_.find(pc) : native_code_thunk(pc);
+  Thunk* thunk = in_thunks ? thunks_.find(pc) : native_code_thunk(pc, s.x[0]);
   if (!thunk) fatal(std::format("guest jumped into the API thunk region at 0x{:x}", pc), kStatusAccessViolation);
   std::atomic_ref<uint64_t>(thunk->calls).fetch_add(1, std::memory_order_relaxed);
   const uint64_t lr = s.x[30];
@@ -430,14 +492,43 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
                  static_cast<unsigned long long>(lr));
   }
 
+  // While in host code the guest state is exact (for SuspendThread and
+  // GetThreadContext from other threads). A fiber switch inside the call
+  // comes back to this context (`t`) before the call returns.
+  GuestThread* const t = t_thread;
+  struct HostScope {
+    GuestThread* t;
+    explicit HostScope(GuestThread* t) : t(t) {
+      if (t) t->in_host.store(true, std::memory_order_release);
+    }
+    ~HostScope() {
+      if (t) t->in_host.store(false, std::memory_order_release);
+    }
+  };
   uint64_t result;
   if (thunk->kind == Thunk::Kind::Native) {
-    const NativeResult r = call_native(thunk->native, s, thunk->signature);
+    NativeResult r;
+    {
+      HostScope host(t);
+      r = call_native(thunk->native, s, thunk->signature);
+    }
+    if (t && t->context_set) {  // SetThreadContext from another thread: continue there
+      t->context_set = false;
+      return runtime::Action::Continue;
+    }
     result = r.rax;
     s.v[0] = {r.xmm0, 0};  // the return type is unknown: provide both X0 and D0
     if (r.has_x1) s.x[1] = r.x1;
+    for (unsigned k = 0; k < r.v_count; ++k) s.v[k] = {r.v[k], 0};  // a returned floating point aggregate
   } else {
-    result = thunk->builtin(*this, s);
+    {
+      HostScope host(t);
+      result = thunk->builtin(*this, s);
+    }
+    if (t && t->context_set) {
+      t->context_set = false;
+      return runtime::Action::Continue;
+    }
     if (t_thread && t_thread->state_replaced) {
       // The builtin continues somewhere else (exception handling), not at the caller.
       t_thread->state_replaced = false;
@@ -512,8 +603,9 @@ uint64_t GuestProcess::get_proc_address(uint64_t module, const char* name) {
   }
   FARPROC f = GetProcAddress(mod, name);
   if (!f) return 0;
-  return guest_value_for_native_export(reinterpret_cast<void*>(f), thunks_, dll,
-                                       by_ordinal ? std::format("#{}", ordinal) : std::string(name));
+  std::string export_name = by_ordinal ? export_name_for_ordinal(mod, ordinal) : std::string(name);
+  if (export_name.empty()) export_name = std::format("#{}", ordinal);
+  return guest_value_for_native_export(reinterpret_cast<void*>(f), thunks_, dll, std::move(export_name));
 }
 
 // --- exit and diagnostics -------------------------------------------------------------

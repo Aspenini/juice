@@ -2,6 +2,8 @@
 
 // Binds a guest image's imports to builtins or native x64 DLL exports.
 
+#include <windows.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -24,6 +26,10 @@ struct ImportStats {
 // True if `addr` is inside an executable section of a loaded native module
 // (or other executable host memory).
 bool is_native_code(const void* addr);
+
+// The name a native DLL exports `ordinal` under (empty if none): native
+// signatures are looked up by name.
+std::string export_name_for_ordinal(HMODULE mod, uint32_t ordinal);
 
 // Guest-visible value for a native export: a thunk address for functions, or
 // the export's own address for data (which the guest may access directly

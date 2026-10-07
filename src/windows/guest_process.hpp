@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <unordered_map>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <span>
 #include <vector>
 
 #include "core/arm64/state/cpu_state.hpp"
@@ -45,8 +47,17 @@ struct GuestModule {
   uint32_t tls_slot = 0;     // index in the guest's implicit-TLS vectors (if image.tls)
   std::vector<GuestModule*> dependencies;  // guest DLLs it imports
   State state = State::Loaded;
+  int refs = 0;              // LoadLibrary / GetModuleHandleEx counts plus importers; unloaded at 0
+  bool pinned = false;       // never unloaded (GET_MODULE_HANDLE_EX_FLAG_PIN)
+  std::atomic<bool> unloaded{false};  // FreeLibrary unmapped it: lookups skip it
+  std::wstring dependency_dir;  // searched first for its imports (LOAD_WITH_ALTERED_SEARCH_PATH)
 
   uint64_t base() const { return image.address(); }
+  // The file name as on disk (GetModuleBaseName, toolhelp).
+  std::wstring display_name() const {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+  }
 };
 
 // Guest execution context of one host thread: ARM64 CPU state and stack.
@@ -63,6 +74,26 @@ struct GuestThread {
   bool detached = false;         // DLL_THREAD_DETACH notifications have run
   std::vector<GuestCallLevel> levels;  // nested call_guest() runs, innermost last
   bool state_replaced = false;   // a builtin set the whole CPU state (exception handling)
+  DWORD thread_id = 0;           // the host thread (for a fiber: the one it last ran on)
+
+  // Thread control (SuspendThread, Get/SetThreadContext from other threads).
+  // The state in memory is exact while the thread is in host code (an API
+  // call: `in_host`) or parked between blocks (`parked`, on request).
+  std::atomic<bool> in_host{false};
+  std::atomic<bool> parked{false};
+  std::atomic<bool> park_request{false};
+  std::atomic<bool> park_release{false};
+  bool context_set = false;      // SetThreadContext replaced the state during an API call: keep it
+
+  // Fibers. A thread's own context runs its first fiber; CreateFiber makes a
+  // context (and guest stack) per fiber, and `active` names the one running.
+  std::atomic<GuestThread*> active{nullptr};  // on a thread's own context: the fiber running (nullptr: itself)
+  bool fiber = false;            // a CreateFiber context
+  uint64_t fiber_start = 0;
+  uint64_t fiber_param = 0;
+  void* host_fiber = nullptr;
+
+  bool exact() const { return in_host.load(std::memory_order_acquire) || parked.load(std::memory_order_acquire); }
 };
 
 // How call_guest() runs a guest function.
@@ -71,6 +102,8 @@ struct GuestCall {
   const arm64eh::Context* link = nullptr;  // see GuestCallLevel
   uint64_t sp = 0;                         // stack pointer for the callee (0: below the current one)
   const uint64_t* nonvolatile = nullptr;   // x19-x28 for the callee (exception funclets share the parent's)
+  const uint64_t* extra_fpr = nullptr;     // V4-V7 (converted callback arguments)
+  std::span<const uint64_t> stack_args;    // arguments passed on the guest stack
 };
 
 struct ProcessOptions {
@@ -122,10 +155,21 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   GuestModule* module_at(uint64_t addr) const;
   GuestModule* module_by_handle(uint64_t handle) const;
   GuestModule* find_loaded_module(std::wstring_view name) const;
-  // LoadLibrary for guest DLLs: returns the module handle, or 0 with `guest`
+  // LoadLibraryEx for guest DLLs: returns the module handle, or 0 with `guest`
   // false if `name` is not an ARM64 DLL JUICE can find (load it natively then).
-  uint64_t load_library(std::wstring_view name, bool& guest);
+  uint64_t load_library(std::wstring_view name, uint32_t flags, bool& guest);
+  // FreeLibrary for a guest module: false if `handle` is not one.
+  bool free_library(uint64_t handle);
+  // GetModuleHandleEx's reference (unless GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT) and pin.
+  void reference_module(GuestModule& module, bool pin);
   bool disable_thread_library_calls(uint64_t handle);
+  // The loaded guest modules, the program first.
+  std::vector<GuestModule*> loaded_modules() const;
+  // DLL search directories (SetDllDirectory, AddDllDirectory, SetDefaultDllDirectories).
+  void set_dll_directory(const wchar_t* dir);
+  void add_dll_directory(uint64_t cookie, std::wstring dir);
+  void remove_dll_directory(uint64_t cookie);
+  void set_default_dll_directories(uint32_t flags);
   // Guest-visible address of an export of a guest module (0 if none).
   uint64_t guest_export(GuestModule& module, const char* name_or_ordinal);
   ThunkTable& thunks() { return thunks_; }
@@ -144,6 +188,21 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
                        uint32_t flags, DWORD* thread_id);
   // Guest thread exit (ExitThread): runs thread-detach notifications, then ends the host thread.
   [[noreturn]] void exit_thread(uint32_t code);
+
+  // --- Thread control and fibers (guest_threads.cpp) ---------------------------------
+  // SuspendThread of a guest thread, which stops where its state is exact;
+  // nullopt if `thread` is not a guest thread (suspend it natively).
+  std::optional<DWORD> suspend_thread(HANDLE thread);
+  // Get/SetThreadContext with the ARM64 CONTEXT; false if `thread` is unknown.
+  bool get_thread_context(HANDLE thread, arm64eh::Context& context);
+  bool set_thread_context(HANDLE thread, const arm64eh::Context& context);
+  // The guest stack of the calling thread (or fiber): [low, high).
+  std::pair<uint64_t, uint64_t> stack_limits();
+  void* create_fiber(uint64_t stack_size, uint64_t start, uint64_t param, uint32_t flags);
+  void* convert_thread_to_fiber(uint64_t param, uint32_t flags);
+  bool convert_fiber_to_thread();
+  void switch_to_fiber(void* fiber);
+  void delete_fiber(void* fiber);
 
   // Call a guest function with integer arguments and run it to completion.
   // The calling host thread becomes a guest thread if it isn't one yet.
@@ -195,10 +254,23 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   void reclaim_threads();  // free contexts of host threads that have terminated
   void dump_state(std::FILE* out) const;
   static GuestThread* t_current();  // the calling thread's guest context, if any
+  static GuestThread* t_own();      // the calling thread's own context (not a fiber's), if any
+  runtime::Action on_interrupt(arm64::CpuState& state) override;
+  GuestThread* find_thread(DWORD thread_id);  // the context running on a guest thread
+  void enter_fiber(GuestThread& context);     // `context` runs on this thread now
+  static void WINAPI fiber_main(void* context);
   // Guest modules (guest_modules.cpp).
   GuestModule* register_module(std::unique_ptr<GuestModule> module);
-  GuestModule* load_guest_dll(std::wstring_view name);
-  std::optional<std::wstring> find_guest_dll(std::wstring_view name) const;
+  // Where to look for a DLL: LoadLibraryEx's search flags and the directory
+  // of the module whose imports are being loaded (if it asked for that).
+  struct DllSearch {
+    uint32_t flags = 0;
+    std::wstring load_dir;
+  };
+  GuestModule* load_guest_dll(std::wstring_view name, const DllSearch& search);
+  GuestModule* load_guest_dll(std::wstring_view name) { return load_guest_dll(name, DllSearch{}); }
+  std::optional<std::wstring> find_guest_dll(std::wstring_view name, const DllSearch& search) const;
+  void unload_module(GuestModule& module);
   std::optional<uint64_t> bind_guest_import(const pe::Import& import, GuestModule* importer);
   uint64_t bind_forwarder(const std::string& target, int depth);
   void bind_module_imports(GuestModule& module);
@@ -210,7 +282,7 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   void detach_modules();  // DLL_PROCESS_DETACH at exit
 
   // Thunk for native code the guest reached directly (is_host_code), named module+offset.
-  Thunk* native_code_thunk(uint64_t pc);
+  Thunk* native_code_thunk(uint64_t pc, uint64_t self);
   struct Resume;  // thrown to continue guest execution in an outer call level
   void resume(Resume& r);
   [[noreturn]] void unhandled_exception(EXCEPTION_RECORD& record, arm64eh::Context& context, const char* why);
@@ -225,9 +297,14 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   std::vector<std::unique_ptr<GuestModule>> module_storage_;
   std::recursive_mutex loader_mutex_;        // like the native loader lock
   std::vector<GuestModule*> init_order_;     // initialized DLLs
+  std::wstring dll_directory_;               // SetDllDirectory
+  std::vector<std::pair<uint64_t, std::wstring>> user_dll_dirs_;  // AddDllDirectory: (cookie, directory)
+  uint32_t default_search_flags_ = 0;        // SetDefaultDllDirectories
   uint32_t tls_modules_ = 0;
   std::mutex threads_mutex_;
   std::vector<GuestThread*> live_threads_;  // attached, not yet reclaimed
+  std::mutex fibers_mutex_;
+  std::unordered_map<void*, GuestThread*> fibers_;  // native fiber -> the guest context it runs
   ManifestState manifest_;
   std::unique_ptr<runtime::Engine> engine_;
 

@@ -29,6 +29,12 @@ bool is_vcruntime_family(std::string_view dll) {
   return d.starts_with("vcruntime140") || d == "msvcrt.dll" || d == "msvcrt";
 }
 
+std::string base_name(std::string_view dll) {
+  std::string d = lower(dll);
+  if (d.size() > 4 && d.ends_with(".dll")) d.resize(d.size() - 4);
+  return d;
+}
+
 BuiltinFn find_in(std::span<const BuiltinExport> exports, std::string_view name) {
   for (const BuiltinExport& e : exports)
     if (e.name == name) return e.fn;
@@ -42,8 +48,15 @@ BuiltinFn find_builtin(std::string_view dll, std::string_view name) {
     if (BuiltinFn fn = find_in(exception_builtins(), name)) return fn;
     if (BuiltinFn fn = find_in(process_builtins(), name)) return fn;
     if (BuiltinFn fn = find_in(resource_builtins(), name)) return fn;
+    if (BuiltinFn fn = find_in(module_list_builtins(), name)) return fn;
+    if (BuiltinFn fn = find_in(thread_builtins(), name)) return fn;
+    if (BuiltinFn fn = find_in(ole32_builtins(), name)) return fn;  // api-ms-win-core-com-*
     return find_in(kernel32_builtins(), name);
   }
+  const std::string d = base_name(dll);
+  // psapi.dll exports the kernel32 K32* functions under their plain names.
+  if (d == "psapi") return find_in(module_list_builtins(), "K32" + std::string(name));
+  if (d == "ole32" || d == "combase") return find_in(ole32_builtins(), name);
   if (is_vcruntime_family(dll)) return find_in(vcruntime_builtins(), name);
   if (lower(dll) == "user32.dll" || lower(dll) == "user32") return find_in(user32_builtins(), name);
   return nullptr;

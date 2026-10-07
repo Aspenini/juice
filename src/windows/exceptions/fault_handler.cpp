@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "runtime/engine.hpp"
@@ -32,9 +33,16 @@ void dump_guest(const arm64::CpuState& s) {
                  static_cast<unsigned long long>(s.x[i + 2]));
 }
 
+void print_location(const char* prefix, uint64_t address);
+
 LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
   const EXCEPTION_RECORD* rec = info->ExceptionRecord;
   const DWORD code = rec->ExceptionCode;
+  static const bool trace = std::getenv("JUICE_TRACE_EXCEPTIONS") != nullptr;
+  if (trace) {  // every host exception, handled or not (debugging aid)
+    std::fprintf(stderr, "[juice] exception 0x%08lx on thread %lu ", code, GetCurrentThreadId());
+    print_location("at ", info->ContextRecord->Rip);
+  }
   if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
       code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION)
     return EXCEPTION_CONTINUE_SEARCH;
@@ -55,6 +63,7 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     NativeCallbackTarget::Args args = {
         {ctx->Rcx, ctx->Rdx, ctx->R8, ctx->R9, stack[5], stack[6], stack[7], stack[8]},
         {ctx->Xmm0.Low, ctx->Xmm1.Low, ctx->Xmm2.Low, ctx->Xmm3.Low},
+        stack + 5,
     };
     NativeCallbackTarget::Result result{};
     if (g_regions.callbacks->call_from_native(rip, args, result)) {

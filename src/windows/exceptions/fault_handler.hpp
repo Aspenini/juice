@@ -29,6 +29,7 @@ class NativeCallbackTarget {
   struct Args {
     uint64_t gpr[8];   // first eight integer arguments
     uint64_t fpr[4];   // XMM0-XMM3 (low 64 bits)
+    const uint64_t* x64_stack = nullptr;  // a native caller's stack arguments (the fifth on), if any
   };
   struct Result {
     uint64_t x0;

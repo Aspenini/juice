@@ -24,8 +24,16 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
   Microsoft C runtime, in both C and C++. Covers `printf` with floating point, math, strings,
   `qsort`, heap, thread-local storage, global constructors and destructors, `atexit`, virtual
   calls and STL containers.
+* The whole ARMv9.4 A64 instruction set apart from SVE and SME: base integer, floating point and
+  Advanced SIMD, plus the optional extensions Windows ARM64 compilers target. These include
+  crypto (AES, SHA-1/2/3, SHA-512, SM3, SM4, PMULL), CRC32, dot product and matrix multiply, FP16
+  and BF16 arithmetic, complex numbers, JSCVT, the flag-manipulation instructions, LSE and LSE128
+  atomics, RCPC/RCPC3, MOPS (`memcpy`/`memset` instructions), CSSC, compare-and-branch, `RNDR`
+  and pointer authentication (as no-ops).
 * Windows API calls to `kernel32`, `ntdll`, `user32`, `advapi32`, the UCRT and anything else that
-  exists as an x64 DLL.
+  exists as an x64 DLL. Calls whose x64 arguments differ from ARM64's (mixed integer and
+  floating point, small structures and floating point aggregates by value, structure returns)
+  use signatures generated from the Windows SDK headers, for functions and COM methods alike.
 * **Callbacks** from native code into the program (window procedures, `qsort` comparators,
   `InitOnceExecuteOnce`, FLS destructors, CRT `_initterm`/`atexit` tables).
 * **Win32 GUI and COM**: window classes and procedures, controls, dialogs, resources, GDI, and COM
@@ -35,11 +43,14 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
   OS versions.
 * **Threads**: `CreateThread`, `std::thread` (static and dynamic CRT), thread-pool callbacks,
   `thread_local` objects with constructors and destructors, and guest atomics that are really
-  atomic across threads.
-* **DLLs**: the program's own ARM64 DLLs, imported or loaded with `LoadLibrary`, with
+  atomic across threads. Fibers, `SuspendThread`, and `GetThreadContext`/`SetThreadContext` with
+  the ARM64 `CONTEXT`, including redirecting another thread.
+* **DLLs**: the program's own ARM64 DLLs, imported or loaded with `LoadLibrary(Ex)`, with
   `DllMain`, exports (by name, by ordinal and forwarded), thread-local data and the module
-  functions. JUICE also loads the ARM64 C++ runtime DLLs (`vcruntime140`, `msvcp140`) as guest
-  code when it can find them.
+  functions. Windows' DLL search order and its `LoadLibraryEx` flags, `FreeLibrary` that really
+  unloads, module enumeration (psapi, toolhelp), and ARM64 in-process COM servers. JUICE also
+  loads the ARM64 C++ runtime DLLs (`vcruntime140`, `msvcp140`) as guest code when it can find
+  them.
 * **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
   `RaiseException`, vectored handlers) and C++ exceptions, with the static and dynamic CRT.
   C++ exceptions with the dynamic CRT need the ARM64 C++ runtime DLLs.
@@ -85,6 +96,16 @@ linked tests.
 To use the translator from another project, link the `libjuice` target and include
 `<juice/juice.hpp>`. It documents the `Environment` interface a front end implements.
 
+The native call signatures in `src/windows/thunk/*_generated.inc` are generated from the Windows
+SDK headers listed in `tools/gen_signatures/sdk_headers.h`, with LLVM's libclang. To regenerate
+them (after adding a header there, for example):
+
+```bash
+xmake f --llvm_dir="C:/Program Files/LLVM"   # only if LLVM is installed elsewhere
+xmake build juice-gen-signatures
+xmake run juice-gen-signatures
+```
+
 ## Usage
 
 ```text
@@ -106,6 +127,10 @@ juice [options] program.exe [arguments...]
 
 `--scan` statically decodes a program's code sections. It shows how close the program is to
 running before you try it.
+
+Environment variables: `JUICE_DLL_PATH` adds directories to search for ARM64 DLLs (separated
+by `;`, like `--dll-path`). `JUICE_TRACE_EXCEPTIONS=1` logs every host exception with its
+location, including the ones JUICE handles itself (calls from native code into the guest).
 
 On Linux:
 
@@ -162,8 +187,12 @@ exits, calls to host code and asynchronous interrupts.
     including fixed-point and half precision, and Arm's exact reciprocal and square-root
     estimates.
 
-  What's still missing is the optional extensions (crypto, CRC32, dot product, FP16
-  arithmetic, SVE).
+  The optional extensions up to Armv9.4 are covered as well: crypto, CRC32, dot product and
+  `I8MM`/`BF16` matrix multiplies, FP16 arithmetic (`FEAT_FP16`, `FHM`), complex numbers,
+  `FRINT32/64`, `FAMAX`, `FPRCVT`, LSE128, RCPC3, MOPS, CSSC, CMPBR, LSUI and `RNDR`. Most of
+  them have no IR op of their own: they are `VLane` lane operations, or a `StateOp` that
+  computes a whole instruction (an AES round, a SHA or SM3 step, a matrix multiply) on its
+  register slots. Missing: SVE, SME, MTE, FP8 and the Armv9.6 floating-point atomics.
 * **IR.** Most Advanced SIMD lane operations are a single `VLane` op, whose immediate selects
   the operation. Values are 64-bit; ALU ops have a 32- or 64-bit width with zero-extended results. Guest
   state is addressed as slots and guest memory through host pointers, since guest and host share
@@ -181,7 +210,7 @@ exits, calls to host code and asynchronous interrupts.
   Like other translators, this accepts an A-B-A change as unchanged. `STLR` is a locked store, and
   full `DMB`/`DSB` barriers become `MFENCE`. x86-64's stronger ordering covers the other variants.
 * **Self-modifying code.** `IC IVAU`, which code generators run after writing code, drops the
-  translations of its cache line. The Linux layer also drops translations on `munmap`, `mremap`,
+  translations of its cache line. Unloading a guest DLL drops the translations of its image. The Linux layer also drops translations on `munmap`, `mremap`,
   fixed `mmap` and `mprotect` to executable.
 * **Block cache.** Each block is translated once and shared by all threads. Each thread looks
   blocks up through its own direct-mapped table, so dispatch takes no lock; the shared map is
@@ -192,30 +221,49 @@ exits, calls to host code and asynchronous interrupts.
 
 * **Loader.** Maps the image read/write but *not executable*, applies relocations and parses
   imports, exports and TLS. X18 points to the TEB and implicit TLS gets its own slot.
-* **DLLs.** For each DLL the program imports or loads, JUICE first looks for an ARM64 copy, in
-  this order:
-  1. the program's directory;
-  2. any `--dll-path` directories;
-  3. the directories in `JUICE_DLL_PATH`;
-  4. the ARM64 C++ runtime of an installed Visual Studio (`VC\Redist\MSVC\...\arm64`).
+* **DLLs.** For each DLL the program imports or loads, JUICE first looks for an ARM64 copy,
+  following Windows' search order:
+  1. with `LOAD_WITH_ALTERED_SEARCH_PATH` or `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, the directory of
+     the DLL whose imports are being loaded;
+  2. the program's directory;
+  3. the `SetDllDirectory` directory;
+  4. JUICE's own: any `--dll-path` directories, the directories in `JUICE_DLL_PATH`, and the
+     ARM64 C++ runtime of an installed Visual Studio (`VC\Redist\MSVC\...\arm64`);
+  5. if the system directory has no DLL of that name, the current directory and `PATH`.
 
-  A DLL found there becomes a guest module, as the native loader would set it up:
+  With `LOAD_LIBRARY_SEARCH_*` flags, or after `SetDefaultDllDirectories`, only the directories
+  named are searched (`AddDllDirectory` adds user directories). A DLL found there becomes a
+  guest module, as the native loader would set it up:
   * relocation and import binding, including forwarded exports;
   * implicit TLS, also for threads that already exist when it loads;
   * TLS callbacks and `DllMain` notifications, called in dependency order, with
-    `DLL_PROCESS_DETACH` at exit.
+    `DLL_PROCESS_DETACH` at `FreeLibrary` and at exit.
 
   Any other DLL is the native x64 one. With the ARM64 `vcruntime140` and `msvcp140`, C++
   exceptions of programs built with `/MD` are handled entirely in guest code. Guest modules are
-  never unmapped (`FreeLibrary` keeps them), so translated code stays valid.
+  reference counted like native ones (`LoadLibrary`, `GetModuleHandleEx`, and each importing
+  DLL hold a reference; `GET_MODULE_HANDLE_EX_FLAG_PIN` and the program's own imports pin them).
+  When the last reference goes, the DLL is detached, its translations are dropped, its image
+  is unmapped and its own imports are released. `DONT_RESOLVE_DLL_REFERENCES` maps a DLL without
+  running `DllMain`.
+* **COM servers.** `CoCreateInstance`, `CoCreateInstanceEx` and `CoGetClassObject` look up a
+  class's `InprocServer32` in the registry. If that is an ARM64 DLL, JUICE loads it as a guest
+  module and gets the class factory from its `DllGetClassObject`. Other classes go to the native
+  COM runtime.
 * **API calls.** Each import becomes a unique address in a reserved, inaccessible region. When the
   dispatcher reaches one, it calls the native function. A generated x64 trampoline converts the
   ARM64 calling convention to x64, passing X0–X7, D0–D3 and stack arguments. It returns both RAX
   and XMM0, so integer and FP results both work. Variadic functions work too, because Windows
-  ARM64 passes variadic floats in integer registers. A small signature table covers the
-  functions the generic rules get wrong. These are UCRT functions that mix int and FP arguments
-  (`ldexp`, `frexp`, ...), and 16-byte structures passed or returned by value (`_Thrd_join`,
-  `lldiv`), which ARM64 puts in two registers and x64 passes by pointer.
+  ARM64 passes variadic floats in integer registers. Signature tables cover the functions the
+  generic rules get wrong: functions that mix int and FP arguments (`ldexp`, GDI+ and Direct2D
+  calls), small structures passed by value (which ARM64 puts in registers and x64 passes by
+  pointer), floating point aggregates (HFAs: in V registers on ARM64, in memory on x64) and
+  structure returns. The tables are generated from the Windows SDK headers (see
+  [Building](#building)), so they cover COM methods too: when the guest calls a method of a
+  native object, JUICE finds the method's vtable slot and asks the object which of the known
+  interfaces it implements. The generator also marks arguments that native code calls back
+  through, function pointers and interface pointers implemented by the guest. Those callbacks
+  get their x64 arguments converted to ARM64 by the same signatures.
 * **Manifest.** The program's embedded application manifest becomes the process default
   activation context before its imports are bound. This applies side-by-side redirection, such as
   common controls v6 and visual styles, to its imports, the controls it creates and DLLs it
@@ -246,6 +294,15 @@ exits, calls to host code and asynchronous interrupts.
   routine. Threads created natively (the thread pool, the native UCRT's `_beginthreadex`) get a
   context the first time they call into guest code. Contexts are freed only once their host
   thread has terminated, because guest code can still run during thread exit.
+* **Thread control.** A guest thread's registers are exact while it is in an API call, or
+  between two translated blocks. `SuspendThread` on a thread running translated code asks it,
+  through `CpuState::interrupt`, to park at the next block boundary and suspends it there.
+  `GetThreadContext` and `SetThreadContext` then read and write the ARM64 `CONTEXT` from its
+  guest state. A thread suspended in an API call continues at the new context once the call
+  returns. `GetCurrentThreadStackLimits` reports the guest stack.
+* **Fibers.** The native fiber functions switch host stacks. Each `CreateFiber` also gets a guest
+  context and stack of its own, and `SwitchToFiber` makes the target's context current. A fiber
+  can move to another thread and then uses that thread's TEB and thread-local data.
 * **Implicit TLS.** Compiled code finds its thread-local data through the TEB's
   `ThreadLocalStoragePointer`, and executables often assume slot 0 without reading
   `_tls_index`. The translator turns that load (`ldr Xt, [x18, #0x58]`) into a read of a
@@ -259,7 +316,10 @@ exits, calls to host code and asynchronous interrupts.
   configuration (Windows' own binaries fail fast if it has its default value).
 * **Built-ins.** These replace APIs that must know about the guest:
   * module functions: `GetModuleHandle*`, `GetModuleFileName*`, `GetProcAddress` (which
-    thunks native exports on the fly) and `LoadLibrary*`;
+    thunks native exports on the fly), `LoadLibrary*`, `FreeLibrary`, the DLL directory
+    functions, psapi's module functions (`EnumProcessModules`, `GetModuleInformation`, ...) and
+    toolhelp's `Module32First/Next`, which list guest modules in place of `juice.exe`;
+  * thread control and fibers (see above), and COM activation of ARM64 servers;
   * process information: `GetCommandLine*`, `GetSystemInfo` (reports ARM64),
     `IsProcessorFeaturePresent`, `RtlCaptureContext` (fills an ARM64 `CONTEXT`), `CreateProcess*`
     and the process-exit functions;
@@ -342,8 +402,11 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
   threads, GUI, COM, application manifests, auto-vectorized loops, exit codes) built at `-O2` and `-Od`, plus C and C++
-  C-runtime programs built `/MT` and `/MD` (threads, SEH, C++ exceptions, a program with DLLs of
-  its own). `/MD` programs run with both the ARM64 and the native C++ runtime DLLs.
+  C-runtime programs built `/MT` and `/MD` (threads, fibers and thread control, SEH, C++
+  exceptions, the instruction set extensions, by-value structure and HFA calls to GDI+ and
+  Direct2D, a program with DLLs of its own that covers unloading, the search path, module
+  enumeration and an in-process COM server). `/MD` programs run with both the ARM64 and the
+  native C++ runtime DLLs.
   Each one is compiled for ARM64 (run under JUICE) and x86-64 (run natively), and the outputs
   must match exactly.
 * `tests/linux` (Linux hosts with an AArch64 cross compiler): C and C++ programs that cover
@@ -357,26 +420,25 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
 
 These are next, roughly in the plan's order:
 
-1. **More ARM64 instructions.** The optional extensions JUICE doesn't report yet: crypto (AES,
-   SHA, PMULL 1Q), CRC32, dot product, FP16 arithmetic and LSE128/MOPS. Use `--scan` to see
-   what a program needs.
-2. **More Win32 APIs.** Signatures for more mixed int/FP functions and by-value structures, and
-   structures larger than 16 bytes returned by value through X8.
+1. **SVE and SME.** Windows doesn't use them yet; `--scan` shows whether a program does.
+2. **More Win32 APIs.** Signatures come from the headers in `tools/gen_signatures/sdk_headers.h`;
+   a library outside them needs adding there.
 3. **Windows exceptions.** Software exceptions work. Still missing:
    * Hardware faults in guest code (such as an access violation inside `__try`) are reported
      instead of being delivered to the program.
    * Exceptions can't propagate through native code, for example from a window procedure out
      through `DispatchMessage`. A C++ exception thrown by a native DLL can't be caught by the
      program either, which matters for a `/MD` program without the ARM64 `msvcp140`.
-4. **GUI applications.** Plain Win32 GUI programs, COM and manifests work. APIs with by-value
-   structures or mixed int/FP arguments (GDI+, Direct2D) need signatures. `uiAccess` in a
-   manifest is not honored.
+4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
+   in a manifest is not honored.
 5. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
    instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
    for `cmp + b.cond`, and W^X code memory.
 
-Threading caveat: `SuspendThread`/`GetThreadContext` on a guest thread see the host's x64
-context, not the guest's ARM64 one.
+Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are
+the host thread's, not the guest stack's (`GetCurrentThreadStackLimits` is right), and
+`GetThreadContext` on a thread that never ran guest code fails. A COM server, once used, stays
+loaded.
 
 The Linux front end comes next: compile and run it on a Linux host, then run the guest tests.
 Known gaps:

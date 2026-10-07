@@ -54,6 +54,8 @@ class ThunkTable {
   ThunkTable& operator=(const ThunkTable&) = delete;
 
   uint64_t add(Thunk thunk);
+  // The thunk of a native function, if one exists.
+  Thunk* find_native(void* fn);
   // Native function thunks are shared by function address.
   uint64_t add_native(void* fn, std::string dll, std::string name, const char* signature = nullptr);
 
@@ -82,19 +84,50 @@ class ThunkTable {
 struct NativeResult {
   uint64_t rax;
   uint64_t xmm0;        // low 64 bits
-  uint64_t x1 = 0;      // second half of a returned 16-byte structure
+  uint64_t x1 = 0;      // second half of a returned structure (X1)
   bool has_x1 = false;
+  uint64_t v[4] = {};   // a returned floating point aggregate (V0..V3)
+  unsigned v_count = 0;
 };
 
 // Call a native x64 function with arguments taken from guest state following
 // the Windows ARM64 calling convention. `signature` optionally describes the
-// argument kinds by position for functions the generic rules get wrong: 'i'
-// integer/pointer, 'f' floating point, 'S' 16-byte structure by value, and a
-// leading '>' for a returned 16-byte structure; see native_call.cpp.
+// arguments and result for functions the generic rules get wrong (see
+// native_call.cpp for the notation).
 NativeResult call_native(void* fn, const arm64::CpuState& state, const char* signature = nullptr);
 
-// Known signatures of native exports that mix integer and floating point
-// arguments (nullptr if none is needed).
+// The signature of a native export the generic rules get wrong (nullptr if
+// none is needed): generated from the SDK headers, by name.
 const char* native_signature(std::string_view dll, std::string_view name);
+
+// The signature of the native COM method `fn` called on the object `self`, if
+// the generic rules get it wrong; `name` receives "Interface::Method" when the
+// method is identified. Only meaningful for native code reached through a
+// vtable; see com_signatures.cpp.
+const char* com_method_signature(uint64_t fn, uint64_t self, std::string* name);
+
+// --- Native code calling the guest back (see com_signatures.cpp) -------------------------
+
+// Tells the registry which addresses are guest code.
+void set_guest_code_predicate(bool (*is_guest_code)(uint64_t addr));
+
+// An argument the guest passed to native code that native code may call back:
+// a function pointer (kind 'C', `index` into the callback signatures) or an
+// object implementing an interface (kind 'I', `index` into the interfaces).
+// Only guest functions and guest objects are recorded.
+void note_callback_argument(char kind, unsigned index, uint64_t value);
+
+// The signature of guest function `fn` called by native code with first
+// argument `first_arg` (the object, for a method), if it was recorded and the
+// generic conversion gets it wrong.
+const char* guest_callback_signature(uint64_t fn, uint64_t first_arg);
+
+// Converts the arguments of a native (x64) call to the ARM64 convention per
+// `signature`: `gpr`/`fpr` hold the first four x64 argument registers, `stack`
+// the following stack arguments. Fills X0-X7, V0-V7 and the words to pass on
+// the guest stack. Returns false if the signature is not supported (structure
+// returns).
+bool convert_native_args(const char* signature, const uint64_t gpr[4], const uint64_t fpr[4], const uint64_t* stack,
+                         uint64_t x[8], uint64_t v[8], std::vector<uint64_t>& stack_words);
 
 }  // namespace juice::win
