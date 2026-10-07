@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <optional>
+
+#include "core/jit/x64/emitter.hpp"
 #include "runtime/engine.hpp"
 #include "runtime/memory/exec_memory.hpp"
 
@@ -35,6 +38,54 @@ void dump_guest(const arm64::CpuState& s) {
 
 void print_location(const char* prefix, uint64_t address);
 
+bool in_jit_code(uint64_t address) {
+  return g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(address));
+}
+
+// A fault in a host helper that translated code called (atomics, MOPS):
+// unwind `c` to the translated code, a few frames up at most. False if it
+// isn't there (a fault in JUICE itself, or in native code the guest called).
+bool unwind_to_jit_code(CONTEXT& c) {
+  for (int depth = 0; depth < 6; ++depth) {
+    DWORD64 image_base = 0;
+    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(c.Rip, &image_base, nullptr);
+    if (!function) {
+      if (depth > 0) return false;  // only the faulting function may be a leaf
+      c.Rip = *reinterpret_cast<const DWORD64*>(c.Rsp);
+      c.Rsp += 8;
+    } else {
+      void* handler_data = nullptr;
+      DWORD64 establisher = 0;
+      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, c.Rip, function, &c, &handler_data, &establisher, nullptr);
+    }
+    if (in_jit_code(c.Rip)) return true;
+  }
+  return false;
+}
+
+// A guest memory access faulted at host_pc in a translated block whose body
+// runs with context `c`: record the fault in the guest state and return from
+// the block to the dispatcher, which hands it to the Windows layer as
+// ExitReason::MemoryFault (dispatched to the guest's exception handlers).
+bool recover_guest_fault(CONTEXT& c, uint64_t host_pc, const EXCEPTION_RECORD* rec) {
+  const std::optional<uint64_t> pc = g_regions.engine->fault_pc(host_pc);
+  if (!pc) return false;
+  auto* s = reinterpret_cast<arm64::CpuState*>(c.Rbx);  // blocks keep the state pointer in RBX
+  if (s != runtime::Engine::current_state()) return false;
+  s->pc = *pc;
+  s->exit_reason = static_cast<uint32_t>(arm64::ExitReason::MemoryFault);
+  s->exit_info = rec->NumberParameters >= 1 ? static_cast<uint32_t>(rec->ExceptionInformation[0]) : 0;
+  s->fault_address = rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0;
+  s->fault_code = rec->ExceptionCode;
+  // The block's epilogue (see x64::kBlockFrameSize).
+  const auto* frame = reinterpret_cast<const DWORD64*>(c.Rsp + x64::kBlockFrameSize);
+  c.Rbp = frame[0];
+  c.Rbx = frame[1];
+  c.Rip = frame[2];
+  c.Rsp += x64::kBlockFrameSize + 24;
+  return true;
+}
+
 LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
   const EXCEPTION_RECORD* rec = info->ExceptionRecord;
   const DWORD code = rec->ExceptionCode;
@@ -44,12 +95,26 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     print_location("at ", info->ContextRecord->Rip);
   }
   if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
-      code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION)
+      code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION &&
+      code != EXCEPTION_IN_PAGE_ERROR && code != STATUS_GUARD_PAGE_VIOLATION)
     return EXCEPTION_CONTINUE_SEARCH;
 
   CONTEXT* ctx = info->ContextRecord;
   const uint64_t rip = ctx->Rip;
-  const bool in_jit = g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(rip));
+  const bool in_jit = in_jit_code(rip);
+
+  // Guest memory faults (in translated code, or in a helper it called) go to
+  // the guest's exception handlers.
+  const bool memory_fault =
+      code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == STATUS_GUARD_PAGE_VIOLATION;
+  if (memory_fault && g_regions.engine) {
+    CONTEXT c = *ctx;
+    if (in_jit ? recover_guest_fault(c, rip, rec)
+               : unwind_to_jit_code(c) && recover_guest_fault(c, c.Rip - 1, rec)) {
+      *ctx = c;
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+  }
   const bool in_thunks = rip >= g_regions.thunks_begin && rip < g_regions.thunks_end;
   const bool in_image = g_regions.callbacks && g_regions.callbacks->is_guest_address(rip);
   if (!in_jit && !in_thunks && !in_image) return EXCEPTION_CONTINUE_SEARCH;

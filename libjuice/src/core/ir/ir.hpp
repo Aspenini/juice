@@ -229,7 +229,13 @@ struct Block {
   uint32_t guest_insns = 0;
   std::vector<Inst> insts;
   Terminator term;
+  // Index of the first IR instruction of each guest instruction (4 bytes
+  // each, from guest_pc), for finding the guest instruction that faulted.
+  std::vector<uint32_t> insn_starts;
 };
+
+// The guest pc of the instruction that IR instruction `inst` belongs to.
+uint64_t guest_pc_of(const Block& block, size_t inst);
 
 // Where the backend finds the program counter and exit fields in guest state.
 struct StateLayout {
@@ -297,6 +303,9 @@ class Builder {
 
 bool is_pure(Opcode op);           // no side effects, result depends only on args
 bool has_side_effects(Opcode op);  // must be kept even if its result is unused
+// Accesses guest memory, so may fault: guest state must be exact before it
+// (the optimizer keeps earlier guest-register stores).
+bool may_fault(Opcode op);
 bool is_vector_or_fp(Opcode op);   // the SIMD/FP opcodes above
 bool has_result(Opcode op);
 unsigned arg_count(Opcode op);
@@ -340,6 +349,7 @@ OptimizeStats optimize(Block& block);
 // Executes `block` against guest state `state` (an array of slots). Memory is
 // accessed through host pointers. Used for testing the JIT and as a fallback
 // execution mode.
-void interpret(const Block& block, uint64_t* state, const StateLayout& layout);
+// `current`, if given, tracks the instruction being executed (for faults).
+void interpret(const Block& block, uint64_t* state, const StateLayout& layout, volatile size_t* current = nullptr);
 
 }  // namespace juice::ir

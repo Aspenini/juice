@@ -16,6 +16,7 @@ const char* to_string(ExitReason reason) {
     case ExitReason::Unsupported: return "unsupported instruction";
     case ExitReason::FetchFault: return "instruction fetch fault";
     case ExitReason::CodeModified: return "code modified";
+    case ExitReason::MemoryFault: return "memory fault";
   }
   return "?";
 }

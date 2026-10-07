@@ -1,5 +1,7 @@
 #include "core/ir/ir.hpp"
 
+#include <algorithm>
+
 #include <bit>
 #include <format>
 
@@ -72,8 +74,32 @@ void Builder::exit(uint32_t reason, uint32_t info, uint64_t pc) {
 
 // --- Opcode properties --------------------------------------------------------------
 
+uint64_t guest_pc_of(const Block& block, size_t inst) {
+  const auto it = std::upper_bound(block.insn_starts.begin(), block.insn_starts.end(), static_cast<uint32_t>(inst));
+  const size_t index = it == block.insn_starts.begin() ? 0 : static_cast<size_t>(it - block.insn_starts.begin()) - 1;
+  return block.guest_pc + 4 * index;
+}
+
+bool may_fault(Opcode op) {
+  switch (op) {
+    case Opcode::Load:
+    case Opcode::Store:
+    case Opcode::LoadToState:
+    case Opcode::StoreFromState:
+    case Opcode::AtomicRmw:
+    case Opcode::AtomicCas:
+    case Opcode::AtomicCasPair:
+    case Opcode::AtomicRmwPair:
+    case Opcode::MemOp:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool has_side_effects(Opcode op) {
   switch (op) {
+    case Opcode::Load:  // it may fault (a load whose value is unused can be a deliberate probe)
     case Opcode::SetReg:
     case Opcode::Store:
     case Opcode::LoadToState:

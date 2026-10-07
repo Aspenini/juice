@@ -1990,6 +1990,7 @@ ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& opt
     }
     Instruction insn = decode(word, cur);
     ++block.guest_insns;
+    block.insn_starts.push_back(static_cast<uint32_t>(block.insts.size()));
     cur += 4;
     if (lifter.lift(insn)) break;
   }

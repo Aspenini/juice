@@ -2,7 +2,8 @@
 //
 //   1. forward pass: register-read forwarding, constant folding and algebraic
 //      simplification
-//   2. backward pass: dead guest-register store elimination
+//   2. backward pass: dead guest-register store elimination (not across an
+//      instruction that may fault, which must see exact guest state)
 //   3. backward pass: dead value elimination
 //
 // Removed instructions become Nop so that value ids stay stable.
@@ -231,6 +232,9 @@ class Optimizer {
           std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
           break;
         default:
+          // A fault here must find the guest registers of the instructions
+          // before it in guest state: keep their stores.
+          if (may_fault(in.op)) std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
           break;
       }
     }

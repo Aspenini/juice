@@ -21,7 +21,7 @@ constexpr Reg kCallArgs[4] = {RDI, RSI, RDX, RCX};
 
 // Stack space reserved by the block prologue: 32 bytes of home space for
 // helper calls (Win64) plus 8 to keep RSP 16-byte aligned at the call.
-constexpr int32_t kFrameSize = 40;
+constexpr int32_t kFrameSize = kBlockFrameSize;
 
 // Out-of-line implementation of the vector and floating point opcodes: the
 // generated code calls the IR evaluator, so the JIT and the interpreter share
@@ -72,7 +72,8 @@ Cond predicate_cond(ir::Predicate p) {
 
 class Compiler {
  public:
-  Compiler(const ir::Block& block, const ir::StateLayout& layout) : block_(block), layout_(layout) {}
+  Compiler(const ir::Block& block, const ir::StateLayout& layout, std::vector<FaultSite>* faults)
+      : block_(block), layout_(layout), faults_(faults) {}
 
   std::vector<uint8_t> run() {
     a_.push(kState);
@@ -80,7 +81,13 @@ class Compiler {
     a_.alu_imm(Alu::Sub, RSP, kFrameSize);
     a_.mov(kState, kArg0);
     a_.mov(kScratch, kArg1);
-    for (size_t i = 0; i < block_.insts.size(); ++i) emit(static_cast<ValueId>(i), block_.insts[i]);
+    for (size_t i = 0; i < block_.insts.size(); ++i) {
+      if (faults_ && ir::may_fault(block_.insts[i].op)) {
+        faults_->push_back({static_cast<uint32_t>(a_.size()),
+                            static_cast<uint32_t>(ir::guest_pc_of(block_, i) - block_.guest_pc)});
+      }
+      emit(static_cast<ValueId>(i), block_.insts[i]);
+    }
     terminator();
     return a_.code();
   }
@@ -464,14 +471,16 @@ class Compiler {
 
   const ir::Block& block_;
   const ir::StateLayout& layout_;
+  std::vector<FaultSite>* faults_;
   Assembler a_;
 };
 
 }  // namespace
 
-std::vector<uint8_t> Emitter::compile(const ir::Block& block) const {
+std::vector<uint8_t> Emitter::compile(const ir::Block& block, std::vector<FaultSite>* faults) const {
   if (block.insts.size() > kMaxBlockValues) return {};
-  return Compiler(block, layout_).run();
+  if (faults) faults->clear();
+  return Compiler(block, layout_, faults).run();
 }
 
 }  // namespace juice::x64

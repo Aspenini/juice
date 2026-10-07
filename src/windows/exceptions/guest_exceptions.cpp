@@ -19,6 +19,7 @@
 #include <cstring>
 #include <format>
 
+#include "core/arm64/decode/instruction.hpp"
 #include "windows/guest_process.hpp"
 
 namespace juice::win {
@@ -147,14 +148,23 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
         frame = *l.link;
         continue;
       }
-      if (level > 0 && l.native_frames) why = "it would propagate into the native code that called the program";
+      if (l.caller) {
+        // Native code called this level: the guest frames that called it
+        // continue at the return address of their call. (The native frames
+        // in between are unwound by C++ exception handling if a handler out
+        // there takes the exception.)
+        frame = capture_context(*l.caller);
+        continue;
+      }
       break;
     }
     const uint64_t pc = frame.pc;
     const bool unwound = frame.flags & arm64eh::kContextUnwoundToCall;
     uint64_t base = 0;
     const RuntimeFunction* f = lookup_function_entry(unwound ? pc - 4 : pc, &base);
-    if (!f && !module_at(pc)) {
+    // Outside any module: a leaf, if this is where the exception happened
+    // (a jump to a bad address); anywhere else the stack is broken.
+    if (!f && !module_at(pc) && unwound) {
       why = "the guest stack could not be unwound";
       break;
     }
@@ -209,6 +219,41 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
   unhandled_exception(record, context, why);
 }
 
+void GuestProcess::raise_hardware_exception(arm64::CpuState& s, uint32_t code,
+                                            std::initializer_list<uint64_t> params) {
+  // The record and context go on the guest stack, as for RaiseException.
+  struct Frame {
+    Context context;
+    EXCEPTION_RECORD record;
+  };
+  const uint64_t at = (s.sp - sizeof(Frame) - 0x40) & ~uint64_t{15};
+  auto* f = reinterpret_cast<Frame*>(at);
+  f->context = capture_context(s);
+  f->context.flags = arm64eh::kContextFull;  // pc is the faulting instruction, not a return address
+  f->context.pc = s.pc;
+  f->record = {};
+  f->record.ExceptionCode = code;
+  f->record.ExceptionAddress = reinterpret_cast<void*>(s.pc);
+  for (uint64_t p : params) f->record.ExceptionInformation[f->record.NumberParameters++] = p;
+  s.sp = at;  // handlers run below it
+  dispatch_exception(f->record, f->context);
+  to_state(f->context, s);  // a handler continued execution
+}
+
+void GuestProcess::raise_native_exception(arm64::CpuState& s, const EXCEPTION_RECORD& native) {
+  struct Frame {
+    Context context;
+    EXCEPTION_RECORD record;
+  };
+  const uint64_t at = (s.sp - sizeof(Frame) - 0x40) & ~uint64_t{15};
+  auto* f = reinterpret_cast<Frame*>(at);
+  f->context = capture_context(s);  // at the call: pc is its return address
+  f->record = native;
+  s.sp = at;
+  dispatch_exception(f->record, f->context);
+  to_state(f->context, s);  // a handler continued execution (after the call)
+}
+
 void GuestProcess::unhandled_exception(EXCEPTION_RECORD& record, Context& context, const char* why) {
   // Like kernelbase's UnhandledExceptionFilter: the program's top-level
   // filter (SetUnhandledExceptionFilter) gets a look first.
@@ -220,6 +265,31 @@ void GuestProcess::unhandled_exception(EXCEPTION_RECORD& record, Context& contex
   }
   std::string message = std::format("unhandled exception 0x{:08x} at 0x{:x}", record.ExceptionCode,
                                     reinterpret_cast<uint64_t>(record.ExceptionAddress));
+  const auto pc = reinterpret_cast<uint64_t>(record.ExceptionAddress);
+  switch (record.ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+      if (record.NumberParameters >= 2) {
+        const ULONG_PTR kind = record.ExceptionInformation[0];
+        message += std::format(": {} of address 0x{:x}", kind == 1 ? "write" : kind == 8 ? "execute" : "read",
+                               record.ExceptionInformation[1]);
+      }
+      break;
+    case EXCEPTION_ILLEGAL_INSTRUCTION: {
+      uint32_t word = 0;
+      if (read_code(pc, word))
+        message += std::format(": undefined instruction {:08x}  {}", word, arm64::disassemble(arm64::decode(word, pc)));
+      break;
+    }
+    case EXCEPTION_BREAKPOINT:
+      message += ": breakpoint (__debugbreak)";
+      break;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+      message += ": integer division by zero";
+      break;
+    default:
+      break;
+  }
   if (why) message += std::format(" ({})", why);
   fatal(message, record.ExceptionCode);
 }
@@ -247,19 +317,17 @@ void GuestProcess::unwind(uint64_t target_frame, uint64_t target_ip, EXCEPTION_R
   for (;;) {
     if (frame.pc == sentinel) {
       const GuestCallLevel* l = level ? &t.levels[--level] : nullptr;
-      if (!l || !l->link) {
-        fatal(std::format("unwind target frame 0x{:x} is not on the guest stack{}", target_frame,
-                          l && l->native_frames ? " (unwinding into native code is not supported)" : ""),
+      if (!l || (!l->link && !l->caller))
+        fatal(std::format("unwind target frame 0x{:x} is not on the guest stack", target_frame),
               kStatusInvalidUnwindTarget);
-      }
-      frame = *l->link;
+      frame = l->link ? *l->link : capture_context(*l->caller);
       continue;
     }
     const Context before = frame;
     const bool unwound = frame.flags & arm64eh::kContextUnwoundToCall;
     uint64_t base = 0;
     const RuntimeFunction* f = lookup_function_entry(unwound ? frame.pc - 4 : frame.pc, &base);
-    if (!f && !module_at(frame.pc)) fatal("the guest stack could not be unwound", kStatusBadStack);
+    if (!f && !module_at(frame.pc) && unwound) fatal("the guest stack could not be unwound", kStatusBadStack);
     const arm64eh::UnwindResult u = arm64eh::virtual_unwind(base, before.pc, f, frame);
     if (u.establisher_frame > target_frame)
       fatal(std::format("invalid unwind target frame 0x{:x}", target_frame), kStatusInvalidUnwindTarget);
@@ -310,14 +378,8 @@ void GuestProcess::restore_context(Context context, EXCEPTION_RECORD* record) {
   } else if (record && record->ExceptionCode == kStatusUnwindConsolidate && record->NumberParameters >= 1) {
     r.consolidate_record = addr(record);
   }
-  // Native code between this level and the one owning the target frame can't be unwound.
-  for (size_t i = t.levels.size(); i-- > 0;) {
-    const GuestCallLevel& l = t.levels[i];
-    if (context.sp < l.entry_sp) break;
-    if (l.native_frames && i > 0)
-      fatal("an exception handler in the program would unwind native code that called it; not supported yet",
-            kStatusInvalidUnwindTarget);
-  }
+  // The call_guest() level owning the target frame catches this; native code
+  // in between (which called back into the program) is unwound on the way.
   throw r;
 }
 

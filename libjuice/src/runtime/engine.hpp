@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <utility>
 #include <vector>
@@ -110,10 +111,17 @@ class Engine {
   // State of the guest currently executing on this thread (for fault reporting).
   static arm64::CpuState* current_state();
 
+  // For a host fault at `host_pc` inside translated code: the guest pc of the
+  // instruction that faulted (nullopt if `host_pc` is not translated code).
+  // A front end's fault handler then returns from the block (see
+  // x64::kBlockFrameSize) with ExitReason::MemoryFault set in the state.
+  std::optional<uint64_t> fault_pc(uint64_t host_pc) const;
+
   void print_stats(std::FILE* out, size_t hot_blocks = 10) const;
 
  private:
   TranslatedBlock* lookup(uint64_t pc);
+  void interpret(const ir::Block& block, arm64::CpuState& s);
   TranslatedBlock* translate_locked(uint64_t pc);
 
   Environment& env_;

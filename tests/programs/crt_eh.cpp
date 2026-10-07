@@ -3,6 +3,7 @@
 // unwinding, exceptions from constructors, standard library exceptions,
 // std::exception_ptr and exceptions in threads.
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -219,6 +220,31 @@ void deep_unwind() {
   }
 }
 
+// Thrown in a callback of a C runtime function (qsort: native code with /MD)
+// and caught by the caller of qsort. qsort is called through a pointer: with
+// /EHsc the compiler assumes extern "C" functions never throw.
+using SortFn = void (*)(void*, size_t, size_t, int (*)(const void*, const void*));
+SortFn volatile sort_fn = std::qsort;
+
+int compare_and_throw(const void* a, const void* b) {
+  Tracer t("comparator");
+  const int x = *static_cast<const int*>(a), y = *static_cast<const int*>(b);
+  if (x == 3 || y == 3) throw std::runtime_error("found 3");
+  return (x > y) - (x < y);
+}
+
+void through_native() {
+  std::printf("through qsort\n");
+  int values[] = {5, 1, 4, 3, 2};
+  try {
+    Tracer t("caller");
+    sort_fn(values, 5, sizeof(int), compare_and_throw);
+    std::printf("  not reached\n");
+  } catch (const std::exception& e) {
+    std::printf("  caught \"%s\", live tracers %d\n", e.what(), g_live);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -230,6 +256,7 @@ int main() {
   exception_ptr();
   threads();
   deep_unwind();
+  through_native();
   std::printf("done, live tracers %d\n", g_live);
   return 0;
 }

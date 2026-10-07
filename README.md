@@ -53,7 +53,13 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
   them.
 * **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
   `RaiseException`, vectored handlers) and C++ exceptions, with the static and dynamic CRT.
-  C++ exceptions with the dynamic CRT need the ARM64 C++ runtime DLLs.
+  Hardware exceptions reach the program's handlers too: access violations (including
+  execution of non-executable memory), `__debugbreak`, illegal instructions and MSVC's
+  division-by-zero check, and a handler can fix the cause and continue. Exceptions cross
+  native code in both directions: one raised (or a fault) in a native function reaches the
+  program's handlers, and one raised in a callback (a window procedure, a `qsort`
+  comparator) propagates out through the native code that called it, C++ exceptions
+  included. C++ exceptions with the dynamic CRT need the ARM64 C++ runtime DLLs.
 * **Real programs**: the ARM64 tools of the Windows SDK, run on real inputs, produce the same
   output and files as their x64 builds. These include `rc`, `mc`, `midl`, `mt`, `signtool`,
   `makepri`, `winmdidl`, `fxc`, and `dxc`, a large LLVM-based compiler. ARM64 programs can start
@@ -200,6 +206,8 @@ exits, calls to host code and asynchronous interrupts.
   work on 64-bit vector halves, and FP ops carry IEEE bit patterns.
 * **Optimizer.** Constant folding, algebraic simplification, guest-register read forwarding,
   dead guest-register store elimination and dead value elimination, all within a block.
+  Stores are not eliminated across an instruction that may fault, and loads are never removed,
+  so the guest state is exact at every memory access.
 * **x86-64 backend.** Guest state lives behind RBX and IR values in a scratch array behind RBP. The
   vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter share one
   definition of their semantics. That code includes ARM NaN propagation, the default NaN and
@@ -209,6 +217,10 @@ exits, calls to host code and asynchronous interrupts.
   with a compare-and-swap against it (`CMPXCHG16B` for 128-bit pairs), failing if memory changed.
   Like other translators, this accepts an A-B-A change as unchanged. `STLR` is a locked store, and
   full `DMB`/`DSB` barriers become `MFENCE`. x86-64's stronger ordering covers the other variants.
+* **Faults.** Each block records which host instructions may fault and the guest instruction
+  they belong to. When a guest memory access faults, in the block or in a helper it called,
+  the front end's fault handler looks up the guest pc and returns from the block (whose frame
+  layout is fixed) with `ExitReason::MemoryFault`. The interpreter catches its own faults.
 * **Self-modifying code.** `IC IVAU`, which code generators run after writing code, drops the
   translations of its cache line. Unloading a guest DLL drops the translations of its image. The Linux layer also drops translations on `munmap`, `mremap`,
   fixed `mmap` and `mprotect` to executable.
@@ -341,6 +353,22 @@ exits, calls to host code and asynchronous interrupts.
   stack, as they would natively. To continue at a handler, the dispatcher also unwinds JUICE's
   own nested runs of guest code, using a C++ exception that the run owning the target frame
   catches.
+
+  Hardware exceptions are dispatched the same way. A memory fault in translated code, a jump to
+  memory that isn't executable, `UDF` and `BRK` become `EXCEPTION_ACCESS_VIOLATION` (with the
+  read/write/execute kind and address), `EXCEPTION_ILLEGAL_INSTRUCTION`, `EXCEPTION_BREAKPOINT`
+  or `EXCEPTION_INT_DIVIDE_BY_ZERO` (`BRK #0xF004`). The context's pc is the faulting
+  instruction. `__fastfail` still ends the process, as it does natively, and so does a guest
+  stack overflow.
+
+  Native code in between is handled at both ends. An exception that leaves a native function
+  the program called (the native call runs inside `__try`) is raised again in the guest, at
+  the call. An exception raised in a callback is dispatched past the native frames: each
+  nested run of guest code records the guest state that called into native code, and the
+  dispatcher and unwinder continue from its return address. If a handler out there takes
+  the exception, the C++ exception that resumes guest execution unwinds the native frames on
+  its way (the call trampoline has unwind information), running their cleanup. Native
+  handlers in between don't see guest exceptions.
 * **Diagnostics.** Guest crashes, unsupported instructions, `__fastfail` and unimplemented
   APIs are reported with the guest register state. Crashes inside JUICE itself print a host
   stack trace as `module+offset` (for `llvm-symbolizer --obj=juice.exe`).
@@ -402,8 +430,8 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
   at once with exclusive, LSE, 128-bit and CAS increments of shared counters.
 * `tests/programs`: freestanding programs (arithmetic, control flow, memory, Win32 API, callbacks,
   threads, GUI, COM, application manifests, auto-vectorized loops, exit codes) built at `-O2` and `-Od`, plus C and C++
-  C-runtime programs built `/MT` and `/MD` (threads, fibers and thread control, SEH, C++
-  exceptions, the instruction set extensions, by-value structure and HFA calls to GDI+ and
+  C-runtime programs built `/MT` and `/MD` (threads, fibers and thread control, SEH, hardware
+  exceptions, C++ exceptions, the instruction set extensions, by-value structure and HFA calls to GDI+ and
   Direct2D, a program with DLLs of its own that covers unloading, the search path, module
   enumeration and an in-process COM server). `/MD` programs run with both the ARM64 and the
   native C++ runtime DLLs.
@@ -423,12 +451,14 @@ These are next, roughly in the plan's order:
 1. **SVE and SME.** Windows doesn't use them yet; `--scan` shows whether a program does.
 2. **More Win32 APIs.** Signatures come from the headers in `tools/gen_signatures/sdk_headers.h`;
    a library outside them needs adding there.
-3. **Windows exceptions.** Software exceptions work. Still missing:
-   * Hardware faults in guest code (such as an access violation inside `__try`) are reported
-     instead of being delivered to the program.
-   * Exceptions can't propagate through native code, for example from a window procedure out
-     through `DispatchMessage`. A C++ exception thrown by a native DLL can't be caught by the
-     program either, which matters for a `/MD` program without the ARM64 `msvcp140`.
+3. **Windows exceptions.** Software and hardware exceptions work, also across native code.
+   Still missing:
+   * A guest stack overflow ends the process instead of raising `EXCEPTION_STACK_OVERFLOW`.
+   * Native exception handlers between guest frames don't see guest exceptions, and a guest
+     handler that continues an exception raised inside a native function resumes after the
+     call rather than inside it.
+   * A C++ exception thrown by a native (x64) DLL reaches the program, but catching it by
+     type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
 5. **Performance.** Block chaining (direct jumps between translated blocks), register allocation

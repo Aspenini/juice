@@ -28,13 +28,14 @@ void store_mem(uint64_t addr, uint64_t value, unsigned size) {
 
 }  // namespace
 
-void interpret(const Block& block, uint64_t* state, const StateLayout& layout) {
+void interpret(const Block& block, uint64_t* state, const StateLayout& layout, volatile size_t* current) {
   thread_local std::vector<uint64_t> values;
   values.assign(block.insts.size(), 0);
   auto arg = [&](const Inst& in, unsigned k) { return in.args[k] == kNoValue ? 0 : values[in.args[k]]; };
 
   for (size_t i = 0; i < block.insts.size(); ++i) {
     const Inst& in = block.insts[i];
+    if (current) *current = i;
     switch (in.op) {
       case Opcode::Nop:
         break;

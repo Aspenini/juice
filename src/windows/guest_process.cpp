@@ -24,6 +24,8 @@ constexpr uint32_t kStatusEntryPointNotFound = 0xC0000139;
 constexpr uint32_t kStatusNotSupported = 0xC00000BB;
 
 constexpr uint32_t kStatusDllInitFailed = 0xC0000142;
+constexpr uint32_t kStatusStackOverflow = 0xC00000FD;
+constexpr uint32_t kStatusAssertionFailure = 0xC0000420;
 
 constexpr size_t kTebPeb = 0x60;
 
@@ -81,6 +83,33 @@ std::string narrow(const std::wstring& s) {
 }
 
 uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
+
+// The exceptions that leave a native function the guest called go to the
+// guest; JUICE's own C++ exceptions (guest exception handling continuing in
+// an outer guest call) pass through.
+int native_exception_filter(const EXCEPTION_POINTERS* info, EXCEPTION_RECORD& out) {
+  const EXCEPTION_RECORD* r = info->ExceptionRecord;
+  constexpr DWORD kCxxException = 0xE06D7363;
+  static const auto juice_base = reinterpret_cast<ULONG_PTR>(GetModuleHandleW(nullptr));
+  if (r->ExceptionCode == kCxxException && r->NumberParameters >= 4 && r->ExceptionInformation[3] == juice_base)
+    return EXCEPTION_CONTINUE_SEARCH;
+  out = *r;
+  out.ExceptionRecord = nullptr;
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// call_native, catching exceptions that leave the native function. (The
+// call must be inside __try for faults to be caught, and the function can't
+// have C++ objects to unwind.)
+bool call_native_guarded(void* fn, const arm64::CpuState& s, const char* signature, NativeResult& result,
+                         EXCEPTION_RECORD& exception) {
+  __try {
+    result = call_native(fn, s, signature);
+    return true;
+  } __except (native_exception_filter(GetExceptionInformation(), exception)) {
+    return false;
+  }
+}
 
 }  // namespace
 
@@ -148,7 +177,7 @@ std::expected<void, std::string> GuestProcess::load(const std::filesystem::path&
 
   options_.engine.tls_vector_offset = 0x58;  // TEB->ThreadLocalStoragePointer: guest TLS gets a vector of its own
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
-  install_fault_handler({&engine_->arena(), thunks_.begin(), thunks_.end(), this});
+  install_fault_handler({&engine_->arena(), engine_.get(), thunks_.begin(), thunks_.end(), this});
   set_guest_code_predicate([](uint64_t addr) { return g_process && g_process->is_guest_address(addr); });
   return {};
 }
@@ -351,7 +380,7 @@ NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& a
   state.x[30] = thunks_.return_sentinel();
   state.pc = fn;
 
-  t.levels.push_back({state.sp, how.native_frames, how.link});
+  t.levels.push_back({state.sp, how.native_frames, how.link, how.native_frames && t.levels.size() ? &saved : nullptr});
   const bool was_in_host = t.in_host.exchange(false, std::memory_order_acq_rel);
   struct LevelScope {
     GuestThread& t;
@@ -439,6 +468,9 @@ bool GuestProcess::read_code(uint64_t addr, uint32_t& word) {
   MEMORY_BASIC_INFORMATION mbi{};
   if (!VirtualQuery(reinterpret_cast<const void*>(addr), &mbi, sizeof(mbi))) return false;
   if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || mbi.Protect == 0) return false;
+  // Executable memory only, as DEP has it (a jump elsewhere is an execute fault).
+  if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+    return false;
   if (addr + 4 > reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) return false;
   std::memcpy(&word, reinterpret_cast<const void*>(addr), 4);
   return true;
@@ -508,9 +540,15 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   uint64_t result;
   if (thunk->kind == Thunk::Kind::Native) {
     NativeResult r;
+    EXCEPTION_RECORD exception;
+    bool returned;
     {
       HostScope host(t);
-      r = call_native(thunk->native, s, thunk->signature);
+      returned = call_native_guarded(thunk->native, s, thunk->signature, r, exception);
+    }
+    if (!returned) {  // an exception left the native function
+      raise_native_exception(s, exception);
+      return runtime::Action::Continue;
     }
     if (t && t->context_set) {  // SetThreadContext from another thread: continue there
       t->context_set = false;
@@ -547,11 +585,43 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
 runtime::Action GuestProcess::on_exit(arm64::CpuState& s) {
   const auto reason = static_cast<arm64::ExitReason>(s.exit_reason);
   const uint32_t info = s.exit_info;
+  // Cleared first: the guest's exception handlers may continue elsewhere
+  // without returning here.
+  s.exit_reason = 0;
+  s.exit_info = 0;
   switch (reason) {
+    case arm64::ExitReason::MemoryFault: {
+      // A guest stack overflow can't be dispatched on the guest stack.
+      if (const GuestThread* t = t_current()) {
+        const uint64_t low = reinterpret_cast<uint64_t>(t->stack_base);
+        if (s.fault_address >= low && s.fault_address < low + 0x1000)
+          fatal(std::format("guest stack overflow at 0x{:x}", s.pc), kStatusStackOverflow);
+      }
+      const auto code = static_cast<uint32_t>(s.fault_code);
+      if (code == EXCEPTION_IN_PAGE_ERROR) {
+        raise_hardware_exception(s, code, {info, s.fault_address, 0});
+      } else if (code == STATUS_GUARD_PAGE_VIOLATION) {
+        raise_hardware_exception(s, code, {info, s.fault_address});
+      } else {
+        raise_hardware_exception(s, EXCEPTION_ACCESS_VIOLATION, {info, s.fault_address});
+      }
+      return runtime::Action::Continue;
+    }
     case arm64::ExitReason::Brk:
-      if (info == 0xF003) fatal(std::format("guest called __fastfail({})", s.x[0]), kStatusStackBufferOverrun);
-      if (info == 0xF000) fatal("guest hit a breakpoint (__debugbreak)", kStatusBreakpoint);
-      fatal(std::format("guest executed BRK #0x{:x} at 0x{:x}", info, s.pc), kStatusBreakpoint);
+      // The BRK codes of Windows ARM64 compilers.
+      switch (info) {
+        case 0xF003:  // __fastfail: not an exception handlers can see
+          fatal(std::format("guest called __fastfail({})", s.x[0]), kStatusStackBufferOverrun);
+        case 0xF004:  // integer division by zero (MSVC's check)
+          raise_hardware_exception(s, EXCEPTION_INT_DIVIDE_BY_ZERO, {});
+          return runtime::Action::Continue;
+        case 0xF001:  // __assertfail
+          raise_hardware_exception(s, kStatusAssertionFailure, {});
+          return runtime::Action::Continue;
+        default:  // __debugbreak (0xF000) and others
+          raise_hardware_exception(s, EXCEPTION_BREAKPOINT, {});
+          return runtime::Action::Continue;
+      }
     case arm64::ExitReason::Hlt:
       fatal(std::format("guest executed HLT #0x{:x} at 0x{:x}", info, s.pc), kStatusBreakpoint);
     case arm64::ExitReason::Svc:
@@ -559,6 +629,8 @@ runtime::Action GuestProcess::on_exit(arm64::CpuState& s) {
                         s.pc - 4),
             kStatusNotSupported);
     case arm64::ExitReason::Undefined:
+      raise_hardware_exception(s, EXCEPTION_ILLEGAL_INSTRUCTION, {});
+      return runtime::Action::Continue;
     case arm64::ExitReason::Unsupported: {
       uint32_t word = 0;
       read_code(s.pc, word);
@@ -566,8 +638,9 @@ runtime::Action GuestProcess::on_exit(arm64::CpuState& s) {
                         arm64::disassemble(arm64::decode(word, s.pc))),
             kStatusIllegalInstruction);
     }
-    case arm64::ExitReason::FetchFault:
-      fatal(std::format("guest jumped to non-executable address 0x{:x}", s.pc), kStatusAccessViolation);
+    case arm64::ExitReason::FetchFault:  // jumped to memory that isn't guest code
+      raise_hardware_exception(s, EXCEPTION_ACCESS_VIOLATION, {8, s.pc});
+      return runtime::Action::Continue;
     case arm64::ExitReason::None:
     case arm64::ExitReason::CodeModified:  // handled by the Engine
       break;

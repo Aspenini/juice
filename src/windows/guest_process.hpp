@@ -34,6 +34,9 @@ struct GuestCallLevel {
   uint64_t entry_sp;     // guest SP when the call started; the level's frames are below it
   bool native_frames;    // native code may sit between this call and the guest code that made it
   const arm64eh::Context* link;  // for exception dispatch: the guest frames continue here
+  // With native frames: the guest state that called into host code, whose
+  // frames continue (past the native ones) at its return address.
+  const arm64::CpuState* caller = nullptr;
 };
 
 // A guest (ARM64) module: the program or one of its DLLs.
@@ -220,6 +223,13 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   // handler that catches the exception unwinds instead, and an unhandled
   // exception ends the process.
   void dispatch_exception(EXCEPTION_RECORD& record, arm64eh::Context& context);
+  // A hardware exception (memory fault, breakpoint, illegal instruction) at
+  // the guest instruction at s.pc: dispatched to the guest's handlers; if one
+  // continues execution, `s` is where it continues.
+  void raise_hardware_exception(arm64::CpuState& s, uint32_t code, std::initializer_list<uint64_t> params);
+  // An exception that left a native function the guest called (state `s`, at
+  // the call): dispatched to the guest's handlers from its call site.
+  void raise_native_exception(arm64::CpuState& s, const EXCEPTION_RECORD& record);
   // RtlUnwindEx: unwind the guest frames from `context` to `target_frame`,
   // running termination handlers, and continue at `target_ip`.
   [[noreturn]] void unwind(uint64_t target_frame, uint64_t target_ip, EXCEPTION_RECORD* record, uint64_t return_value,

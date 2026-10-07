@@ -294,6 +294,14 @@ runtime::Action LinuxProcess::on_exit(arm64::CpuState& s) {
     }
     case arm64::ExitReason::FetchFault:
       fatal(std::format("guest jumped to unmapped address 0x{:x}", s.pc), SIGSEGV);
+    case arm64::ExitReason::MemoryFault: {  // (only the Windows layer reports these so far)
+      siginfo_t info{};
+      info.si_signo = SIGSEGV;
+      info.si_code = 1;  // SEGV_MAPERR
+      info.si_addr = reinterpret_cast<void*>(s.fault_address);
+      if (deliver_signal(s, SIGSEGV, &info, t_thread->blocked) != Delivery::Unhandled) return runtime::Action::Continue;
+      fatal(std::format("guest memory fault at 0x{:x} (address 0x{:x})", s.pc, s.fault_address), SIGSEGV);
+    }
     case arm64::ExitReason::None:
     case arm64::ExitReason::CodeModified:  // handled by the Engine
       break;

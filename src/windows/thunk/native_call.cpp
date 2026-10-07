@@ -54,10 +54,15 @@ Trampoline build_trampoline() {
   using namespace juice::x64;
   constexpr int32_t kFrame = 0x80;  // 32 bytes home space + 12 stack arguments
   Assembler a;
+  // Prologue offsets, for the unwind information.
   a.push(RBX);
+  const auto after_rbx = static_cast<uint8_t>(a.size());
   a.push(RSI);
+  const auto after_rsi = static_cast<uint8_t>(a.size());
   a.push(RDI);
+  const auto after_rdi = static_cast<uint8_t>(a.size());
   a.alu_imm(Alu::Sub, RSP, kFrame);  // RSP is 16-byte aligned after the pushes and this
+  const auto after_alloc = static_cast<uint8_t>(a.size());
   a.mov(RBX, R9);                    // xmm0_out
   a.mov(RAX, RCX);                   // fn
   a.mov(RSI, RDX);                   // ints
@@ -78,9 +83,32 @@ Trampoline build_trampoline() {
   a.pop(RBX);
   a.ret();
 
-  void* mem = VirtualAlloc(nullptr, a.size(), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  // Unwind information, so that exceptions (a guest exception handled in
+  // guest code further out, JUICE's own C++ exceptions) can unwind through
+  // native code the trampoline called: UNWIND_INFO version 1 with the
+  // prologue's codes, latest first.
+  const size_t unwind_at = (a.size() + 3) & ~size_t{3};
+  constexpr uint8_t kPushNonvol = 0, kAllocSmall = 2;
+  constexpr uint8_t kRbx = 3, kRsi = 6, kRdi = 7;
+  const uint8_t unwind_info[] = {
+      1, after_alloc, 4, 0,  // version 1, no flags; prologue size; 4 codes; no frame register
+      after_alloc, static_cast<uint8_t>(kAllocSmall | ((kFrame / 8 - 1) << 4)),
+      after_rdi, static_cast<uint8_t>(kPushNonvol | (kRdi << 4)),
+      after_rsi, static_cast<uint8_t>(kPushNonvol | (kRsi << 4)),
+      after_rbx, static_cast<uint8_t>(kPushNonvol | (kRbx << 4)),
+  };
+  static_assert(kFrame / 8 - 1 < 16, "UWOP_ALLOC_SMALL covers 8 to 128 bytes");
+  const size_t total = unwind_at + sizeof(unwind_info);
+
+  void* mem = VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
   if (!mem) throw std::bad_alloc();
   std::memcpy(mem, a.code().data(), a.size());
+  std::memcpy(static_cast<uint8_t*>(mem) + unwind_at, unwind_info, sizeof(unwind_info));
+  static RUNTIME_FUNCTION function;
+  function.BeginAddress = 0;
+  function.EndAddress = static_cast<DWORD>(a.size());
+  function.UnwindData = static_cast<DWORD>(unwind_at);
+  RtlAddFunctionTable(&function, 1, reinterpret_cast<DWORD64>(mem));
   DWORD old = 0;
   VirtualProtect(mem, a.size(), PAGE_EXECUTE_READ, &old);
   FlushInstructionCache(GetCurrentProcess(), mem, a.size());

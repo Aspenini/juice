@@ -10,14 +10,16 @@
 //    resumes the native caller as if the function had returned normally.
 //    Native calls to API thunk addresses are redirected the same way.
 //
-// 2. Guest faults. Faults inside translated code are reported with the guest
-//    context. (Delivering them to the guest as structured exceptions is future
-//    work.)
+// 2. Guest faults. A memory fault in translated code (or in a helper it
+//    called) returns from the block with ExitReason::MemoryFault, which the
+//    Windows layer dispatches to the guest's exception handlers. Other faults
+//    in translated code are reported with the guest context.
 
 #include <cstdint>
 
 namespace juice::runtime {
 class CodeArena;
+class Engine;
 }
 
 namespace juice::win {
@@ -46,6 +48,7 @@ class NativeCallbackTarget {
 
 struct FaultRegions {
   const runtime::CodeArena* jit_code = nullptr;
+  const runtime::Engine* engine = nullptr;  // maps faults in translated code to guest instructions
   uint64_t thunks_begin = 0, thunks_end = 0;
   NativeCallbackTarget* callbacks = nullptr;
 };

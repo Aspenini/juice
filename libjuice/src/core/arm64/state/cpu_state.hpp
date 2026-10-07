@@ -20,6 +20,9 @@ enum class ExitReason : uint32_t {
   Unsupported,  // valid encoding JUICE cannot translate yet (exit_info = raw word)
   FetchFault,   // instruction fetch from unreadable memory
   CodeModified, // IC IVAU Xt (exit_info = t), pc = next instruction; handled by the Engine itself
+  MemoryFault,  // a guest memory access faulted on the host: pc = the faulting instruction (its
+                // effects not applied), exit_info = access (0 read, 1 write, 8 execute),
+                // fault_address, fault_code = the host's fault status (NTSTATUS / signal number)
 };
 
 const char* to_string(ExitReason reason);
@@ -58,6 +61,10 @@ struct CpuState {
   // Set asynchronously (for example by a host signal handler on this thread)
   // to make the dispatcher call Environment::on_interrupt before the next block.
   uint64_t interrupt;
+
+  // ExitReason::MemoryFault details.
+  uint64_t fault_address;
+  uint64_t fault_code;
 };
 
 // Slot numbers (byte offset / 8) used by the lifter for GetReg/SetReg.
@@ -80,7 +87,9 @@ inline constexpr uint16_t ExclNew = 106;
 inline constexpr uint16_t ExclNewHi = 107;
 inline constexpr uint16_t TlsVector = 108;
 inline constexpr uint16_t Interrupt = 109;
-inline constexpr uint16_t Count = 110;
+inline constexpr uint16_t FaultAddress = 110;
+inline constexpr uint16_t FaultCode = 111;
+inline constexpr uint16_t Count = 112;
 }  // namespace slot
 
 static_assert(offsetof(CpuState, sp) == 8 * slot::SP);
@@ -95,6 +104,7 @@ static_assert(offsetof(CpuState, exit_info) == 8 * slot::Exit + 4);
 static_assert(offsetof(CpuState, block_pc) == 8 * slot::BlockPc);
 static_assert(offsetof(CpuState, excl_value) == 8 * slot::ExclValue);
 static_assert(offsetof(CpuState, excl_new_hi) == 8 * slot::ExclNewHi);
+static_assert(offsetof(CpuState, fault_code) == 8 * slot::FaultCode);
 static_assert(sizeof(CpuState) == 8 * slot::Count);
 
 // Name of a state slot, for IR dumps ("x0", "sp", "nzcv", "v3.lo", ...).

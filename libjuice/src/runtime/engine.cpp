@@ -1,5 +1,9 @@
 #include "runtime/engine.hpp"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <format>
@@ -119,13 +123,15 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
     if (options_.interpret) {
       tb->ir = std::make_unique<ir::Block>(std::move(block));
     } else {
-      std::vector<uint8_t> code = emitter_.compile(block);
+      std::vector<x64::FaultSite> fault_sites;
+      std::vector<uint8_t> code = emitter_.compile(block, &fault_sites);
       if (code.empty()) {
         if (max_insns <= 1) throw std::runtime_error("block too large to compile");
         max_insns /= 2;
         continue;
       }
       void* entry = arena_.add(code);
+      tb->fault_sites = std::move(fault_sites);
       if (!entry) throw std::runtime_error("out of space for translated code");
       tb->code = entry;
       tb->code_size = code.size();
@@ -140,9 +146,72 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
   }
 }
 
+std::optional<uint64_t> Engine::fault_pc(uint64_t host_pc) const {
+  std::shared_lock lock(mutex_);
+  const TranslatedBlock* b = cache_.find_code(static_cast<uintptr_t>(host_pc));
+  if (!b) return std::nullopt;
+  return b->fault_pc(static_cast<size_t>(host_pc - reinterpret_cast<uint64_t>(b->code)));
+}
+
 void Engine::invalidate(uint64_t begin, uint64_t end) {
   std::unique_lock lock(mutex_);
   if (cache_.invalidate(begin, end)) generation_.fetch_add(1, std::memory_order_release);
+}
+
+#if defined(_WIN32)
+namespace {
+
+struct InterpreterFault {
+  uint64_t address = 0;
+  uint64_t access = 0;
+  uint32_t code = 0;
+};
+
+int interpreter_fault_filter(EXCEPTION_POINTERS* info, InterpreterFault& fault) {
+  const EXCEPTION_RECORD* rec = info->ExceptionRecord;
+  switch (rec->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case STATUS_GUARD_PAGE_VIOLATION:
+      fault.code = rec->ExceptionCode;
+      fault.access = rec->NumberParameters >= 1 ? rec->ExceptionInformation[0] : 0;
+      fault.address = rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0;
+      return EXCEPTION_EXECUTE_HANDLER;
+    default:
+      return EXCEPTION_CONTINUE_SEARCH;
+  }
+}
+
+// Guest memory accesses of the interpreter that fault (the JIT's are handled
+// by the front end's fault handler instead). The call must be inside __try
+// for the fault to be caught, so this function has no C++ objects to unwind.
+bool interpret_guarded(const ir::Block& block, uint64_t* state, const ir::StateLayout& layout,
+                       volatile size_t* current, InterpreterFault& fault) {
+  __try {
+    ir::interpret(block, state, layout, current);
+    return true;
+  } __except (interpreter_fault_filter(GetExceptionInformation(), fault)) {
+    return false;
+  }
+}
+
+}  // namespace
+#endif
+
+void Engine::interpret(const ir::Block& block, arm64::CpuState& s) {
+#if defined(_WIN32)
+  volatile size_t current = 0;
+  InterpreterFault fault;
+  if (!interpret_guarded(block, reinterpret_cast<uint64_t*>(&s), layout_, &current, fault)) {
+    s.pc = ir::guest_pc_of(block, current);
+    s.exit_reason = static_cast<uint32_t>(arm64::ExitReason::MemoryFault);
+    s.exit_info = static_cast<uint32_t>(fault.access);
+    s.fault_address = fault.address;
+    s.fault_code = fault.code;
+  }
+#else
+  ir::interpret(block, reinterpret_cast<uint64_t*>(&s), layout_);
+#endif
 }
 
 void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
@@ -178,7 +247,7 @@ void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
     if (block->code) {
       reinterpret_cast<x64::BlockFn>(block->code)(&s, scratch);
     } else {
-      ir::interpret(*block->ir, reinterpret_cast<uint64_t*>(&s), layout_);
+      interpret(*block->ir, s);
     }
 
     if (s.exit_reason == static_cast<uint32_t>(arm64::ExitReason::CodeModified)) {

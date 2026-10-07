@@ -147,7 +147,7 @@ target("juice-guest-tests")
     set_values("guest.freestanding", "hello", "arith", "control", "memory", "winapi", "callback",
                "exitcode", "retcode", "threads", "gui", "com", "manifest", "settings", "vector")
     -- C runtime programs, built /MT and /MD.
-    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_threadctl.c", "crt_seh.c", "crt_eh.cpp", "crt_crypto.c",
+    set_values("guest.crt", "crt_c.c", "crt_cpp.cpp", "crt_threads.cpp", "crt_threadctl.c", "crt_faults.c", "crt_seh.c", "crt_eh.cpp", "crt_crypto.c",
                "crt_simdext.c", "crt_fp16.c", "crt_newops.c",
                "crt_newops2.c", "crt_abi.cpp")
 
@@ -191,6 +191,7 @@ target("juice-guest-tests")
             crt_fp16 = {arm64 = {"/clang:-march=armv8.2-a+fp16"}},
             crt_newops = {arm64 = {"/clang:-march=armv8.9-a+lse128+mops+cssc+rcpc3+wfxt"}},
             crt_newops2 = {arm64 = {"/clang:-march=armv8.9-a+sm4+cmpbr+cpa+lsui+fprcvt+faminmax"}},
+            crt_faults = {arm64 = {"/clang:-march=armv8.8-a+mops"}},
         }
         -- The x64 reference of crt_fp16 uses _Float16, whose conversions are compiler-rt builtins.
         local builtins = os.files(path.join(path.directory(path.directory(cc)), "lib", "clang", "*", "lib", "windows",
@@ -387,6 +388,11 @@ target("juice-guest-tests")
         local ref_code, ref_out
         if opt.reference then
             ref_code, ref_out = run(opt.reference, args, "reference")
+            -- A reference that crashes (an NTSTATUS error as exit code) proves nothing.
+            if ref_code < 0 or ref_code >= 0xC0000000 then
+                opt.errors = string.format("the native reference crashed (exit code 0x%x)", ref_code & 0xFFFFFFFF)
+                return false
+            end
         else
             ref_code, ref_out = opt.expect_exit, opt.expect_output
         end
