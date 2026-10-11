@@ -28,14 +28,14 @@ TranslatedBlock* BlockCache::insert(std::unique_ptr<TranslatedBlock> block) {
   return raw;
 }
 
-size_t BlockCache::invalidate(uint64_t begin, uint64_t end) {
-  size_t removed = 0;
+std::vector<TranslatedBlock*> BlockCache::invalidate(uint64_t begin, uint64_t end) {
+  std::vector<TranslatedBlock*> removed;
   for (auto it = blocks_.begin(); it != blocks_.end();) {
     const TranslatedBlock& b = *it->second;
     if (b.guest_pc < end && b.guest_end > begin) {
+      removed.push_back(it->second.get());
       retired_.push_back(std::move(it->second));
       it = blocks_.erase(it);
-      ++removed;
     } else {
       ++it;
     }

@@ -3,6 +3,7 @@
 // Minimal x86-64 machine code assembler used by the JIT backend.
 
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 namespace juice::x64 {
@@ -85,11 +86,25 @@ class Assembler {
   void movsd_load(unsigned xmm, Mem src);   // movsd xmm, [m]
   void movsd_store(Mem dst, unsigned xmm);  // movsd [m], xmm
 
+  // An SSE instruction `prefix 0F opcode... /r` (prefix 0x66, 0xF2, 0xF3, or 0
+  // for none) on registers: `reg` is the ModRM reg operand (usually the
+  // destination), `rm` the r/m one; XMM and general registers by number.
+  // `w` sets REX.W (64-bit general register operand).
+  void sse(uint8_t prefix, std::initializer_list<uint8_t> opcode, unsigned reg, unsigned rm, bool w = false);
+  // The same with a memory r/m operand.
+  void sse(uint8_t prefix, std::initializer_list<uint8_t> opcode, unsigned reg, Mem rm, bool w = false);
+  void imm8(uint8_t v) { byte(v); }
+  void nop() { byte(0x90); }  // an immediate byte after an instruction (cmpps, ...)
+  // A VEX-encoded 0F38 instruction on XMM registers (FMA3): `dst`, `src1` (VEX.vvvv), `src2`.
+  // pp = 1 (66 prefix), L = 0.
+  void vex_0f38(uint8_t opcode, bool w, unsigned dst, unsigned src1, unsigned src2);
+
   // Control flow
   void push(Reg r);
   void pop(Reg r);
   void ret();
   void call(Reg target);   // call r64
+  void jmp(Reg target);    // jmp r64
   Label jmp();             // forward jump, patched by bind()
   Label jcc(Cond cc);      // forward conditional jump
   void bind(Label label);  // resolve to the current position

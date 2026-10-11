@@ -3,6 +3,9 @@
 #if defined(_WIN32)
 #include <windows.h>
 #endif
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -36,9 +39,32 @@ struct FastTable {
 };
 thread_local FastTable t_fast;
 
-// IR value slots for translated blocks; one per thread (blocks never run
-// concurrently on one thread, and nested runs happen between blocks).
+// IR value slots for translated blocks, after the chaining header; one per
+// thread (blocks never run concurrently on one thread, and nested runs happen
+// between blocks).
 thread_local std::vector<uint64_t> t_scratch;
+
+x64::ChainLayout chain_layout(const EngineOptions& options, void* engine, void* helper) {
+  x64::ChainLayout c;
+  if (options.interpret || options.profile) return c;  // profiling counts every block in the dispatcher
+  TranslatedBlock probe;
+  auto offset = [&](const void* field) {
+    return static_cast<int32_t>(static_cast<const char*>(field) - reinterpret_cast<const char*>(&probe));
+  };
+  c.table_mask = static_cast<uint32_t>(FastTable::kSize - 1);
+  c.entry_guest_pc = offset(&probe.guest_pc);
+  c.entry_chain_target = offset(&probe.chain_target);
+  c.interrupt_offset = static_cast<uint32_t>(offsetof(arm64::CpuState, interrupt));
+  c.block_pc_offset = static_cast<uint32_t>(offsetof(arm64::CpuState, block_pc));
+  c.link_helper = reinterpret_cast<uint64_t>(helper);
+  c.link_context = reinterpret_cast<uint64_t>(engine);
+  return c;
+}
+
+void patch(int32_t* rel32, const void* to) {
+  const auto rel = static_cast<int32_t>(reinterpret_cast<intptr_t>(to) - reinterpret_cast<intptr_t>(rel32 + 1));
+  std::atomic_ref<int32_t>(*rel32).store(rel, std::memory_order_release);
+}
 
 std::atomic<uint64_t> g_next_engine_id{1};
 
@@ -55,7 +81,7 @@ Engine::Engine(Environment& env, EngineOptions options)
     : env_(env),
       options_(options),
       layout_(arm64::state_layout()),
-      emitter_(layout_),
+      emitter_(layout_, chain_layout(options, this, reinterpret_cast<void*>(&Engine::link_helper))),
       id_(g_next_engine_id.fetch_add(1)) {
   auto [lo, hi] = env_.host_range();
   host_lo_ = lo;
@@ -124,7 +150,9 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
       tb->ir = std::make_unique<ir::Block>(std::move(block));
     } else {
       std::vector<x64::FaultSite> fault_sites;
-      std::vector<uint8_t> code = emitter_.compile(block, &fault_sites);
+      std::vector<x64::LinkSite> link_sites;
+      size_t body = 0;
+      std::vector<uint8_t> code = emitter_.compile(block, &fault_sites, &body, &link_sites);
       if (code.empty()) {
         if (max_insns <= 1) throw std::runtime_error("block too large to compile");
         max_insns /= 2;
@@ -132,6 +160,11 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
       }
       void* entry = arena_.add(code);
       tb->fault_sites = std::move(fault_sites);
+      if (entry && !options_.profile) tb->chain_target = static_cast<uint8_t*>(entry) + body;
+      for (const x64::LinkSite& l : link_sites) {
+        auto* base = static_cast<uint8_t*>(entry);
+        tb->links.push_back({reinterpret_cast<int32_t*>(base + l.rel32_offset), base + l.stub_offset, l.target_pc});
+      }
       if (!entry) throw std::runtime_error("out of space for translated code");
       tb->code = entry;
       tb->code_size = code.size();
@@ -155,7 +188,65 @@ std::optional<uint64_t> Engine::fault_pc(uint64_t host_pc) const {
 
 void Engine::invalidate(uint64_t begin, uint64_t end) {
   std::unique_lock lock(mutex_);
-  if (cache_.invalidate(begin, end)) generation_.fetch_add(1, std::memory_order_release);
+  const std::vector<TranslatedBlock*> retired = cache_.invalidate(begin, end);
+  for (TranslatedBlock* b : retired) unlink_incoming(*b);
+  if (!retired.empty()) generation_.fetch_add(1, std::memory_order_release);
+}
+
+// --- direct links --------------------------------------------------------------------
+
+#if defined(_MSC_VER)
+#define JUICE_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define JUICE_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+
+// Called by a block's link stub: the block is found by the return address.
+void* Engine::link_helper(Engine* engine, uint32_t site) {
+  const auto from = reinterpret_cast<uintptr_t>(JUICE_RETURN_ADDRESS());
+  const auto* header = reinterpret_cast<const x64::ChainHeader*>(t_scratch.data());
+  std::unique_lock lock(engine->mutex_);
+  const TranslatedBlock* block = engine->cache_.find_code(from);
+  if (!block || site >= block->links.size()) return nullptr;
+  return engine->link(*block, site, header->stop_pc);
+}
+
+// Link `from`'s site to its target if that is translated: returns the body
+// to jump to, or null for the dispatcher to take over.
+void* Engine::link(const TranslatedBlock& from, uint32_t site, uint64_t stop_pc) {
+  const uint64_t target_pc = from.links[site].target_pc;
+  if (target_pc == stop_pc) return nullptr;
+  TranslatedBlock* target = cache_.find(target_pc);
+  if (!target || !target->chain_target) return nullptr;
+  // Only current blocks are linked (a retired one may still be running, but
+  // nothing would unlink its sites).
+  auto& source = const_cast<TranslatedBlock&>(from);
+  if (links_enabled_ && cache_.find(from.guest_pc) == &source && !source.links[site].to) {
+    source.links[site].to = target;
+    target->incoming.emplace_back(&source, site);
+    patch(source.links[site].rel32, target->chain_target);
+  }
+  return target->chain_target;
+}
+
+void Engine::unlink_incoming(TranslatedBlock& block) {
+  for (const auto& [source, site] : block.incoming) {
+    TranslatedBlock::Link& l = source->links[site];
+    if (l.to != &block) continue;
+    patch(l.rel32, l.stub);
+    l.to = nullptr;
+  }
+  block.incoming.clear();
+}
+
+void Engine::disable_links() {
+  std::unique_lock lock(mutex_);
+  if (!links_enabled_) return;
+  links_enabled_ = false;
+  cache_.for_each([](const TranslatedBlock& b) {
+    for (const TranslatedBlock::Link& l : b.links)
+      if (l.to) patch(l.rel32, l.stub);
+  });
 }
 
 #if defined(_WIN32)
@@ -216,8 +307,12 @@ void Engine::interpret(const ir::Block& block, arm64::CpuState& s) {
 
 void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
   CurrentStateScope scope(&s);
-  if (t_scratch.size() < x64::kMaxBlockValues) t_scratch.assign(x64::kMaxBlockValues, 0);
-  uint64_t* const scratch = t_scratch.data();
+  // A stop at a pc blocks may be translated at: links would jump past it.
+  if (links_enabled_ && stop_pc != ~0ull && !(stop_pc - host_lo_ < host_size_)) disable_links();
+  if (t_scratch.size() < x64::kChainHeaderSlots + x64::kMaxBlockValues)
+    t_scratch.assign(x64::kChainHeaderSlots + x64::kMaxBlockValues, 0);
+  auto* const header = reinterpret_cast<x64::ChainHeader*>(t_scratch.data());
+  uint64_t* const scratch = t_scratch.data() + x64::kChainHeaderSlots;
 
   for (;;) {
     if (std::atomic_ref<uint64_t>(s.interrupt).load(std::memory_order_relaxed)) {
@@ -245,6 +340,13 @@ void Engine::run(arm64::CpuState& s, uint64_t stop_pc) {
 
     s.block_pc = pc;
     if (block->code) {
+      // For chaining: blocks continue into their successors through this
+      // thread's table while it is current (see x64::ChainHeader).
+      const FastTable& table = t_fast;
+      header->stop_pc = stop_pc;
+      header->generation = reinterpret_cast<const uint64_t*>(&generation_);
+      header->table_generation = table.generation;
+      header->table = reinterpret_cast<void* const*>(table.entries.data());
       reinterpret_cast<x64::BlockFn>(block->code)(&s, scratch);
     } else {
       interpret(*block->ir, s);

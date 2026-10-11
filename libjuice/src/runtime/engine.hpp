@@ -121,6 +121,11 @@ class Engine {
 
  private:
   TranslatedBlock* lookup(uint64_t pc);
+  // Direct links (see x64::ChainLayout): the helper the link stubs call.
+  static void* link_helper(Engine* engine, uint32_t site);
+  void* link(const TranslatedBlock& from, uint32_t site, uint64_t stop_pc);
+  void unlink_incoming(TranslatedBlock& block);  // under the unique lock
+  void disable_links();
   void interpret(const ir::Block& block, arm64::CpuState& s);
   TranslatedBlock* translate_locked(uint64_t pc);
 
@@ -138,6 +143,7 @@ class Engine {
   EngineStats stats_;
   std::atomic<uint64_t> generation_{0};  // bumped by invalidate(): per-thread tables must be cleared
   std::atomic<uint64_t> dispatches_{0};
+  std::atomic<bool> links_enabled_{true};  // false once a run stops at a translatable pc (links would skip it)
 };
 
 }  // namespace juice::runtime

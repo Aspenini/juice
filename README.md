@@ -208,10 +208,16 @@ exits, calls to host code and asynchronous interrupts.
   dead guest-register store elimination and dead value elimination, all within a block.
   Stores are not eliminated across an instruction that may fault, and loads are never removed,
   so the guest state is exact at every memory access.
-* **x86-64 backend.** Guest state lives behind RBX and IR values in a scratch array behind RBP. The
-  vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter share one
-  definition of their semantics. That code includes ARM NaN propagation, the default NaN and
-  saturating conversions.
+* **x86-64 backend.** Guest state lives behind RBX and IR values in a scratch array behind RBP.
+  Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
+  the common vector operations on 64-bit halves (integer add, subtract, multiply, compares,
+  min/max, abs, shifts, widening, `TBL`, floating point lanes) are SSE instructions. A NaN
+  result takes the slow path, where ARM's NaN rules differ from x86's. The slow path and the
+  remaining vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter
+  share one definition of their semantics: ARM NaN propagation, the default NaN and saturating
+  conversions. A condition on the flags of a compare, `CMN` or test repeats the x86 compare
+  and reads the x86 flags; the packed NZCV value is only computed if something else uses it.
+  Unit tests compare every inline path with the evaluator, NaNs and boundaries included.
 * **Atomics.** LSE atomics (`CAS`, `SWP`, `LDADD`, ...) become single atomic host operations.
   Exclusives are emulated by value: `LDXR`/`LDXP` record the loaded value, and `STXR`/`STXP` store
   with a compare-and-swap against it (`CMPXCHG16B` for 128-bit pairs), failing if memory changed.
@@ -228,6 +234,12 @@ exits, calls to host code and asynchronous interrupts.
   blocks up through its own direct-mapped table, so dispatch takes no lock; the shared map is
   locked only on a miss. Blocks and code are never freed while the process runs, so no thread
   can execute code that another thread discarded.
+* **Chaining.** Blocks continue into their successors without returning to the dispatcher. A
+  jump to a constant target is a patchable `jmp rel32`: it starts out at a stub in the block,
+  which asks the engine for the target and patches the jump to go there directly once the target
+  is translated. When a block is invalidated, the jumps into it go back to their stubs. Other
+  jumps (indirect ones, returns) look the target up in the thread's table from generated code.
+  Each transition checks `CpuState::interrupt`, and the dispatcher takes over on a miss.
 
 ### Windows layer
 
@@ -440,6 +452,10 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
 * `tests/linux` (Linux hosts with an AArch64 cross compiler): C and C++ programs that cover
   arguments and the heap, files and epoll, threads, signals, `fork`/`execve` and C++ exceptions.
   Each one is linked statically and dynamically and compared with a native x86-64 build.
+* `tests/bench`: CPU-bound benchmarks (integer, floating point, calls, memory, auto-vectorized
+  loops), run natively and under JUICE with `xmake build juice-bench` and
+  `xmake run juice-bench [--runs=N] [name...]`. Outputs must match; the table shows JUICE's
+  slowdown and the change since the previous run.
 * `tests/sdk`: inputs for the Windows SDK tools. If the SDK's ARM64 tools are installed, each
   tool runs as ARM64 under JUICE and as x64 natively, in the same directory. The exit code,
   console output and every file written must match.
@@ -461,9 +477,10 @@ These are next, roughly in the plan's order:
      type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
-5. **Performance.** Block chaining (direct jumps between translated blocks), register allocation
-   instead of spilling every value, inline atomics and SSE instead of helper calls, flag fusion
-   for `cmp + b.cond`, and W^X code memory.
+5. **Performance.** Programs run about 2 to 13 times slower than native (4.3x geometric mean on
+   `tests/bench`). Next: register allocation instead of keeping every IR value in memory, more
+   vector operations inline (pairwise, saturating, zip/unzip), inline atomics, and W^X code
+   memory.
 
 Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are
 the host thread's, not the guest stack's (`GetCurrentThreadStackLimits` is right), and

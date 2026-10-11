@@ -525,3 +525,5 @@ target("juice-sdk-tests")
         end
         return true
     end)
+
+includes("bench")

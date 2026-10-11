@@ -709,6 +709,33 @@ TEST(translate_ic_ivau) {
   }
 }
 
+// A block linked directly to its successor is unlinked when the successor's
+// code changes: the jump reaches the new translation.
+TEST(translate_invalidation_unlinks_jumps) {
+  for (const Config& cfg : configs()) {
+    // The branch at 0 and its target at 64 are in different 64-byte lines (IC IVAU's unit).
+    std::vector<uint32_t> code(20, kBrk0);
+    code[0] = 0x14000010;   // b +64
+    code[16] = 0xd2800020;  // movz x0, #1
+    code[18] = 0xd50b7521;  // ic ivau, x1
+    TestEnv env(code);
+    runtime::Engine engine(env, cfg.options);
+    CpuState s{};
+    for (int i = 0; i < 3; ++i) {  // translate both blocks, then link the branch
+      s.pc = kCodeBase;
+      engine.run(s);
+      CHECK_EQ(s.x[0], 1u);
+    }
+    env.code()[16] = 0xd2800040;  // movz x0, #2
+    s.x[1] = kCodeBase + 64;
+    s.pc = kCodeBase + 72;
+    engine.run(s);
+    s.pc = kCodeBase;
+    engine.run(s);
+    CHECK_EQ(s.x[0], 2u);
+  }
+}
+
 // Random data-processing instructions: the optimized JIT, unoptimized JIT and
 // interpreter must agree on every one of them.
 TEST(translate_random_data_processing) {

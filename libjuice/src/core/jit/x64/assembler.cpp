@@ -188,6 +188,31 @@ void Assembler::movsd_store(Mem dst, unsigned xmm) {
   op_rm({0x0F, 0x11}, xmm, dst, false);
 }
 
+void Assembler::sse(uint8_t prefix, std::initializer_list<uint8_t> opcode, unsigned reg, unsigned rm, bool w) {
+  if (prefix) byte(prefix);
+  rex(w, reg, 0, rm);
+  byte(0x0F);
+  for (uint8_t b : opcode) byte(b);
+  modrm_reg(reg, rm);
+}
+
+void Assembler::sse(uint8_t prefix, std::initializer_list<uint8_t> opcode, unsigned reg, Mem rm, bool w) {
+  if (prefix) byte(prefix);
+  rex(w, reg, 0, rm.base);
+  byte(0x0F);
+  for (uint8_t b : opcode) byte(b);
+  modrm_mem(reg, rm);
+}
+
+void Assembler::vex_0f38(uint8_t opcode, bool w, unsigned dst, unsigned src1, unsigned src2) {
+  byte(0xC4);
+  // R, X, B inverted; map 0F38.
+  byte(static_cast<uint8_t>(((dst & 8) ? 0 : 0x80) | 0x40 | ((src2 & 8) ? 0 : 0x20) | 0x02));
+  byte(static_cast<uint8_t>((w ? 0x80 : 0) | ((~src1 & 0xF) << 3) | 0x01));  // L = 0, pp = 66
+  byte(opcode);
+  modrm_reg(dst, src2);
+}
+
 // --- control flow -------------------------------------------------------------------
 
 void Assembler::push(Reg r) {
@@ -203,6 +228,12 @@ void Assembler::pop(Reg r) {
 void Assembler::ret() { byte(0xC3); }
 
 void Assembler::call(Reg target) { op_rr({0xFF}, 2, target, false); }
+
+void Assembler::jmp(Reg target) {
+  rex(false, 0, 0, target);
+  byte(0xFF);
+  modrm_reg(4, target);
+}
 
 Assembler::Label Assembler::jmp() {
   byte(0xE9);
