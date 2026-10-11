@@ -36,11 +36,22 @@ ValueId Builder::load(ValueId addr, uint8_t bytes, bool sign_extend) {
 
 void Builder::store(ValueId addr, ValueId value, uint8_t bytes) { emit(Opcode::Store, bytes, addr, value); }
 
+// Up to 8 bytes are an ordinary load and register write (or read and store),
+// which the optimizer can forward; 16 go straight between memory and state.
 void Builder::load_to_state(ValueId addr, uint16_t slot, uint8_t bytes, uint8_t zero_to) {
+  if (bytes <= 8) {
+    set(slot, load(addr, bytes, false));
+    for (unsigned k = 8; k < zero_to; k += 8) set(static_cast<uint16_t>(slot + k / 8), constant(0));
+    return;
+  }
   emit(Opcode::LoadToState, bytes, addr, kNoValue, kNoValue, slot, zero_to);
 }
 
 void Builder::store_from_state(ValueId addr, uint16_t slot, uint8_t bytes) {
+  if (bytes <= 8) {
+    store(addr, get(slot), bytes);
+    return;
+  }
   emit(Opcode::StoreFromState, bytes, addr, kNoValue, kNoValue, slot);
 }
 

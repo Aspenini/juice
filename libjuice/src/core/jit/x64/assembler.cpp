@@ -235,6 +235,11 @@ void Assembler::jmp(Reg target) {
   modrm_reg(4, target);
 }
 
+void Assembler::jmp_to(size_t offset) {
+  byte(0xE9);
+  dword(static_cast<uint32_t>(static_cast<int32_t>(offset - (code_.size() + 4))));
+}
+
 Assembler::Label Assembler::jmp() {
   byte(0xE9);
   Label l{code_.size()};

@@ -78,6 +78,10 @@ bool recover_guest_fault(CONTEXT& c, uint64_t host_pc, const EXCEPTION_RECORD* r
   s->fault_address = rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0;
   s->fault_code = rec->ExceptionCode;
   // The block's epilogue (see x64::kBlockFrameSize).
+  M128A* xmm = &c.Xmm0;
+  for (unsigned k = 0; k < x64::kBlockSavedXmmCount; ++k)
+    std::memcpy(&xmm[x64::kBlockSavedXmmFirst + k],
+                reinterpret_cast<const void*>(c.Rsp + x64::kBlockXmmSaveArea + 16 * k), 16);
   const auto* frame = reinterpret_cast<const DWORD64*>(c.Rsp + x64::kBlockFrameSize);
   constexpr size_t saved = std::size(x64::kBlockSavedRegs);
   for (size_t k = 0; k < saved; ++k) {

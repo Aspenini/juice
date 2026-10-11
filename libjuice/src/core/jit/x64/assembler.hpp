@@ -106,6 +106,7 @@ class Assembler {
   void call(Reg target);   // call r64
   void jmp(Reg target);    // jmp r64
   Label jmp();             // forward jump, patched by bind()
+  void jmp_to(size_t offset);  // jump to an earlier position
   Label jcc(Cond cc);      // forward conditional jump
   void bind(Label label);  // resolve to the current position
 

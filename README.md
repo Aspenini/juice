@@ -211,15 +211,21 @@ exits, calls to host code and asynchronous interrupts.
   Stores are not eliminated across an instruction that may fault, and loads are never removed,
   so the guest state is exact at every memory access.
 * **x86-64 backend.** Guest state lives behind RBX. IR values get the callee-saved registers
-  (RSI, RDI, R12–R15 on Windows) for their live ranges within the block, and the rest a
-  scratch array behind RBP; operations work on those registers directly. Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
+  for their live ranges within the block (RSI, RDI, R12–R15, and XMM6–XMM15 for floating point
+  and vector values, on Windows), and the rest a scratch array behind RBP; operations work on
+  those registers directly. Slow paths (NaN results and the like) go after the block's code.
+  A block that loops to itself keeps the guest registers it reads in host registers across
+  iterations: the back edge moves the new values into them and skips the reads (the stores to
+  guest state still happen, so the state in memory stays exact). Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
   the common vector operations on 64-bit halves (integer add, subtract, multiply, compares,
-  min/max, abs, shifts, widening, `TBL`, floating point lanes) are SSE instructions. A NaN
+  min/max, abs, shifts, widening, `TBL`, floating point lanes) and rounding (`FRINT*`, with
+  SSE4.1) are SSE instructions. A NaN
   result takes the slow path, where ARM's NaN rules differ from x86's. The slow path and the
   remaining vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter
   share one definition of their semantics: ARM NaN propagation, the default NaN and saturating
-  conversions. A condition on the flags of a compare, `CMN` or test repeats the x86 compare
-  and reads the x86 flags (a conditional branch becomes `cmp` + `jcc`); the packed NZCV value
+  conversions. A condition on the flags of a compare, `CMN`, test or `FCMP` repeats the x86
+  compare and reads the x86 flags (a conditional branch becomes `cmp` + `jcc`, a select
+  `cmp` + `cmov`); the packed NZCV value
   is only computed if something else uses it. NZCV is not stored at a block's end when the
   code it continues to (looking ahead up to 16 straight-line instructions) sets the flags
   before reading them, so most compares never compute it.
@@ -483,9 +489,9 @@ These are next, roughly in the plan's order:
      type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
-5. **Performance.** Programs run about 1.5 to 10 times slower than native (3.5x geometric mean
-   on `tests/bench`). Next: keeping guest registers in host registers across a block (each
-   is still loaded from and stored to guest state), more vector operations inline (pairwise,
+5. **Performance.** Programs run about 1.5 to 9 times slower than native (2.7x geometric mean
+   on `tests/bench`; integer code 1.5x to 2x). Next: guest registers in host registers across
+   chained blocks (not only within one loop), more vector operations inline (pairwise,
    saturating, zip/unzip), inline atomics, and W^X code memory.
 
 Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are

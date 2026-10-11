@@ -30,10 +30,17 @@ using BlockFn = void (*)(void* state, uint64_t* scratch);
 // them: a fault handler can return from the block by restoring them.
 #if defined(_WIN32)
 inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, RSI, RDI, R12, R13, R14, R15};
+// Callee-saved XMM registers (Win64), which hold floating point values; the
+// prologue saves them at [RSP + kBlockXmmSaveArea + 16 * k] (XMM(first + k)).
+inline constexpr unsigned kBlockSavedXmmFirst = 6;
+inline constexpr unsigned kBlockSavedXmmCount = 10;
 #else
 inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, R12, R13, R14, R15};
+inline constexpr unsigned kBlockSavedXmmFirst = 0;
+inline constexpr unsigned kBlockSavedXmmCount = 0;  // SysV has no callee-saved XMM registers
 #endif
-inline constexpr int32_t kBlockFrameSize = 40;
+inline constexpr int32_t kBlockXmmSaveArea = 40;  // above the helper calls' home space
+inline constexpr int32_t kBlockFrameSize = kBlockXmmSaveArea + 16 * kBlockSavedXmmCount;
 static_assert((8 + 8 * std::size(kBlockSavedRegs) + kBlockFrameSize) % 16 == 0, "RSP aligned for calls");
 
 // A host instruction of a block that may fault: code from host_offset on (up

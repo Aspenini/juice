@@ -393,7 +393,7 @@ void compare_vec(const std::string& name, Opcode op, uint8_t aux, uint64_t imm, 
 // when only conditions use it) agree with the evaluator, for every condition.
 TEST(jit_fuses_conditions_with_flag_operations) {
   std::mt19937_64 rng(99);
-  for (Opcode flags : {Opcode::FlagsSub, Opcode::FlagsAdd, Opcode::FlagsLogic}) {
+  for (Opcode flags : {Opcode::FlagsSub, Opcode::FlagsAdd, Opcode::FlagsLogic, Opcode::FCmp}) {
     for (uint8_t size : {uint8_t{4}, uint8_t{8}}) {
       for (uint8_t cond = 0; cond < 16; ++cond) {
         for (bool store_flags : {false, true}) {
@@ -405,6 +405,18 @@ TEST(jit_fuses_conditions_with_flag_operations) {
           b.jump(0);
           compare_backends(std::format("{}{} cond {}{}", ir::opcode_name(flags), size, cond,
                                        store_flags ? " (flags stored)" : "").c_str(),
+                           block, rng, 300);
+        }
+        // A select on the condition (the JIT selects on the x86 flags).
+        for (uint8_t select_size : {uint8_t{4}, uint8_t{8}}) {
+          ir::Block block;
+          ir::Builder b(block);
+          const ir::ValueId f = b.emit(flags, size, b.get(0), b.get(1));
+          const ir::ValueId c = b.cond_holds(f, cond);
+          b.set(10, b.select(c, b.get(2), b.get(3), select_size));
+          b.set(11, b.select(c, b.constant(0), b.get(1), select_size));
+          b.jump(0);
+          compare_backends(std::format("{}{} cond {} select{}", ir::opcode_name(flags), size, cond, select_size).c_str(),
                            block, rng, 300);
         }
       }
@@ -484,6 +496,8 @@ TEST(jit_matches_interpreter_for_scalar_fp) {
                       Opcode::FCmp})
       compare_fp(ir::opcode_name(op), op, size, 0, size, false, rng, 3000);
   }
+  for (uint8_t size : {uint8_t{4}, uint8_t{8}})
+    for (uint8_t mode = 0; mode < 5; ++mode) compare_fp("frint", Opcode::FRint, size, mode, size, false, rng, 3000);
   compare_fp("fcvt d->s", Opcode::FCvt, 4, 8, 8, false, rng, 3000);
   compare_fp("fcvt s->d", Opcode::FCvt, 8, 4, 4, false, rng, 3000);
   for (uint8_t size : {uint8_t{4}, uint8_t{8}})

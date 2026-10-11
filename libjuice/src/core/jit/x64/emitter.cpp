@@ -3,7 +3,9 @@
 #include "core/jit/x64/assembler.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
+#include <unordered_map>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -135,13 +137,19 @@ class Compiler {
 
   std::vector<uint8_t> run() {
     find_lazy_flags();
+    find_loop_slots();
     allocate_registers();
     for (Reg r : kBlockSavedRegs) a_.push(r);
     a_.alu_imm(Alu::Sub, RSP, kFrameSize);
+    for (unsigned k = 0; k < kBlockSavedXmmCount; ++k)  // movdqu [rsp + area + 16k], xmm
+      a_.sse(0xF3, {0x7F}, kBlockSavedXmmFirst + k, Mem{RSP, kBlockXmmSaveArea + 16 * static_cast<int32_t>(k)});
     a_.mov(kState, kArg0);
     a_.mov(kScratch, kArg1);
     body_ = a_.size();
+    for (const LoopSlot& l : loop_slots_) emit(l.get, block_.insts[l.get]);  // hoisted: see find_loop_slots
+    loop_head_ = a_.size();
     for (size_t i = 0; i < block_.insts.size(); ++i) {
+      if (hoisted_[i]) continue;
       if (faults_ && ir::may_fault(block_.insts[i].op)) {
         faults_->push_back({static_cast<uint32_t>(a_.size()),
                             static_cast<uint32_t>(ir::guest_pc_of(block_, i) - block_.guest_pc)});
@@ -149,6 +157,7 @@ class Compiler {
       emit(static_cast<ValueId>(i), block_.insts[i]);
     }
     terminator();
+    emit_cold();
     return a_.code();
   }
 
@@ -170,6 +179,93 @@ class Compiler {
     return s >= INT32_MIN && s <= INT32_MAX;
   }
   int32_t imm32(ValueId v) const { return static_cast<int32_t>(static_cast<uint32_t>(const_value(v))); }
+
+  // --- loops -------------------------------------------------------------------------
+  //
+  // A block that jumps back to itself keeps the guest registers it reads in
+  // host registers across iterations: their reads (GetReg) move to the top of
+  // the block, and the back edge puts the values the block stored in them
+  // (its last SetReg; the stores to guest state still happen, so the state in
+  // memory stays exact) into those registers and jumps past the reads. This
+  // takes the store -> load round trip through memory off the loop's
+  // critical path. Registers the block only reads stay in their registers.
+
+  struct LoopSlot {
+    ValueId get;    // the GetReg (its register holds the slot at the loop head)
+    ValueId value;  // the value the block leaves in the slot (kNoValue: unchanged)
+  };
+  static constexpr size_t kMaxLoopSlots = 4;  // the back edge moves them through RAX, RCX, RDX, R8
+
+  bool self_edge() const {
+    const ir::Terminator& t = block_.term;
+    if (!chain_.link_helper) return false;
+    return (t.kind == ir::Terminator::Kind::Jump && t.target == block_.guest_pc) ||
+           (t.kind == ir::Terminator::Kind::Branch && (t.target == block_.guest_pc || t.fallthrough == block_.guest_pc));
+  }
+
+  void find_loop_slots() {
+    const size_t n = block_.insts.size();
+    hoisted_.assign(n, 0);
+    if (!self_edge()) return;
+    std::vector<std::pair<uint64_t, ValueId>> gets;           // slot, GetReg
+    std::unordered_map<uint64_t, ValueId> last_set;           // slot -> last value stored
+    std::unordered_map<uint64_t, size_t> first_set;           // slot -> index of the first store
+    std::vector<uint64_t> written;                            // slots written directly from memory
+    for (size_t i = 0; i < n; ++i) {
+      const Inst& in = block_.insts[i];
+      switch (in.op) {
+        case Opcode::LoadToState:
+          for (unsigned k = 0; k < (std::max<unsigned>(in.size, in.aux) + 7) / 8; ++k) written.push_back(in.imm + k);
+          break;
+        case Opcode::StateOp:
+        case Opcode::StateAddr:
+        case Opcode::AtomicCasPair:
+        case Opcode::AtomicRmwPair:
+          return;  // write guest state other than through SetReg
+        case Opcode::GetReg:
+          gets.emplace_back(in.imm, static_cast<ValueId>(i));
+          break;
+        case Opcode::SetReg:
+          last_set[in.imm] = in.args[0];
+          first_set.try_emplace(in.imm, i);
+          break;
+        default:
+          break;
+      }
+    }
+    auto dead = [&](uint64_t slot) {
+      return std::find(block_.dead_at_exit.begin(), block_.dead_at_exit.end(), slot) != block_.dead_at_exit.end();
+    };
+    // Loop-carried registers first, then the ones only read.
+    for (int pass = 0; pass < 2; ++pass) {
+      for (const auto& [slot, get] : gets) {
+        if (loop_slots_.size() == kMaxLoopSlots) return;
+        if (std::find(written.begin(), written.end(), slot) != written.end()) continue;
+        const auto set = last_set.find(slot);
+        if ((set != last_set.end()) != (pass == 0)) continue;
+        if (set != last_set.end() && (first_set[slot] < get || dead(slot))) continue;
+        loop_slots_.push_back({get, set != last_set.end() ? set->second : ir::kNoValue});
+        hoisted_[get] = 1;
+      }
+    }
+  }
+
+  // The back edge: the new values into the slots' registers, then the loop head.
+  void back_edge() {
+    a_.load(RCX, state_mem(chain_.interrupt_offset));
+    a_.test(RCX, RCX);
+    const Assembler::Label go_on = a_.jcc(Cond::E);
+    a_.mov_imm(RAX, block_.guest_pc);
+    store_pc(RAX);
+    epilogue();
+    a_.bind(go_on);
+    static constexpr Reg temps[kMaxLoopSlots] = {RAX, RCX, RDX, R8};
+    for (size_t k = 0; k < loop_slots_.size(); ++k)
+      if (loop_slots_[k].value != ir::kNoValue) get(temps[k], loop_slots_[k].value);
+    for (size_t k = 0; k < loop_slots_.size(); ++k)
+      if (loop_slots_[k].value != ir::kNoValue) put(loop_slots_[k].get, temps[k]);
+    a_.jmp_to(loop_head_);
+  }
 
   // --- register allocation -----------------------------------------------------------
   //
@@ -196,12 +292,17 @@ class Compiler {
       const Inst& in = block_.insts[i];
       if (in.op == Opcode::Nop) continue;
       for (unsigned k = 0; k < ir::arg_count(in.op); ++k) use(in.args[k], i);
+      // A select on a fused condition repeats the flag operation.
+      if (in.op == Opcode::Select && in.args[0] < n && select_cond_[in.args[0]]) {
+        const Inst& flags = block_.insts[block_.insts[in.args[0]].args[0]];
+        for (unsigned k = 0; k < ir::arg_count(flags.op); ++k) use(flags.args[k], i);
+      }
       // A condition fused with its flag operation repeats it: its operands are used here too.
       if (in.op == Opcode::CondHolds && in.args[0] < n) {
         const Inst& flags = block_.insts[in.args[0]];
         Cond x86;
         int constant;
-        if (fusable(flags.op) && fused_condition(flags.op, in.aux, x86, constant))
+        if (fusable(flags.op) && fused_condition(flags, in.aux, x86, constant))
           for (unsigned k = 0; k < ir::arg_count(flags.op); ++k) use(flags.args[k], i);
       }
     }
@@ -211,25 +312,81 @@ class Compiler {
     } else {
       use(block_.term.value, n);
     }
+    for (const LoopSlot& l : loop_slots_) {
+      if (l.value != ir::kNoValue) use(l.value, n + 1);  // read by the back edge
+      else use(l.get, n + 1);                             // read again by the next iteration
+      used[l.get] = 1;
+    }
 
     std::vector<Reg> pool;
     for (Reg r : kBlockSavedRegs)
       if (r != kState && r != kScratch) pool.push_back(r);
+    // Floating point and vector values (results of scalar FP and vector
+    // operations, and guest registers only those operations and stores read)
+    // go to XMM registers.
+    xreg_.assign(n, -1);
+    std::vector<int8_t> xpool;
+    for (unsigned k = kBlockSavedXmmCount; k-- > 0;) xpool.push_back(static_cast<int8_t>(kBlockSavedXmmFirst + k));
+    auto scalar_fp = [](const Inst& in) {
+      return in.op >= Opcode::FAdd && in.op <= Opcode::FCmp && (in.size == 4 || in.size == 8);
+    };
+    std::vector<uint8_t> fp_value(n, 0);
+    if (!xpool.empty()) {
+      std::vector<uint8_t> other_reader(n, 0);
+      for (size_t i = 0; i < n; ++i) {
+        const Inst& in = block_.insts[i];
+        if (in.op == Opcode::Nop) continue;
+        const bool fp_reader = (ir::is_vector_or_fp(in.op) && in.op != Opcode::IntToF) || in.op == Opcode::SetReg;
+        for (unsigned k = 0; k < ir::arg_count(in.op); ++k)
+          if (in.args[k] < n && !fp_reader) other_reader[in.args[k]] = 1;
+      }
+      if (block_.term.value < n) other_reader[block_.term.value] = 1;
+      for (size_t i = 0; i < n; ++i) {
+        const Inst& in = block_.insts[i];
+        const bool produces_fp = (scalar_fp(in) || ir::is_vector_or_fp(in.op)) && in.op != Opcode::FCmp &&
+                                 in.op != Opcode::FToInt;
+        const bool fp_load = in.op == Opcode::Load && (in.size == 4 || in.size == 8) && in.aux == 0;
+        fp_value[i] = produces_fp || ((in.op == Opcode::GetReg || fp_load) && !other_reader[i]);
+      }
+    }
+    // The hoisted reads are defined first, and need registers.
+    for (const LoopSlot& l : loop_slots_) {
+      if (fp_value[l.get] && !xpool.empty()) {
+        xreg_[l.get] = xpool.back();
+        xpool.pop_back();
+      } else {
+        reg_[l.get] = pool.back();
+        pool.pop_back();
+      }
+    }
     std::vector<uint8_t> freed(n, 0);
     for (size_t i = 0; i < n; ++i) {
       const Inst& in = block_.insts[i];
       if (in.op == Opcode::Nop) continue;
       if (ir::has_result(in.op) && in.op != Opcode::Const && !lazy_[i] && !(branch_cond_ && i == lazy_cond_) &&
-          used[i] && !pool.empty()) {
-        reg_[i] = pool.back();
-        pool.pop_back();
+          !hoisted_[i] && !select_cond_[i] && used[i]) {
+        if (fp_value[i] && !xpool.empty()) {
+          xreg_[i] = xpool.back();
+          xpool.pop_back();
+        } else if (!pool.empty()) {
+          reg_[i] = pool.back();
+          pool.pop_back();
+        }
       }
       auto release = [&](ValueId a) {
-        if (a == ir::kNoValue || a >= n || freed[a] || reg_[a] == kNoReg || last_use[a] != i) return;
-        freed[a] = 1;
-        pool.push_back(reg_[a]);
+        if (a == ir::kNoValue || a >= n || freed[a] || last_use[a] != i) return;
+        if (reg_[a] != kNoReg) {
+          freed[a] = 1;
+          pool.push_back(reg_[a]);
+        } else if (xreg_[a] >= 0) {
+          freed[a] = 1;
+          xpool.push_back(xreg_[a]);
+        }
       };
       for (unsigned k = 0; k < ir::arg_count(in.op); ++k) release(in.args[k]);
+      if (in.op == Opcode::Select && in.args[0] < n && select_cond_[in.args[0]])
+        for (unsigned k = 0; k < ir::arg_count(block_.insts[block_.insts[in.args[0]].args[0]].op); ++k)
+          release(block_.insts[block_.insts[in.args[0]].args[0]].args[k]);
       if (in.op == Opcode::CondHolds && in.args[0] < n)
         for (unsigned k = 0; k < ir::arg_count(block_.insts[in.args[0]].op); ++k)
           release(block_.insts[in.args[0]].args[k]);
@@ -239,14 +396,16 @@ class Compiler {
   void get(Reg r, ValueId v) {
     if (is_const(v)) a_.mov_imm(r, const_value(v));
     else if (reg_[v] != kNoReg) a_.mov(r, reg_[v]);
+    else if (xreg_[v] >= 0) a_.sse(0x66, {0x7E}, static_cast<unsigned>(xreg_[v]), r, true);  // movq r, xmm
     else a_.load(r, value_mem(v));
   }
   void put(ValueId v, Reg r) {
     if (reg_[v] != kNoReg) a_.mov(reg_[v], r);
+    else if (xreg_[v] >= 0) a_.sse(0x66, {0x6E}, static_cast<unsigned>(xreg_[v]), r, true);  // movq xmm, r
     else a_.store(value_mem(v), r, 8);
   }
   // The register holding v: its own, or `tmp` loaded with it.
-  Reg src(ValueId v, Reg tmp) {
+  Reg src(ValueId v, Reg tmp) {  // (an XMM-held value is moved to tmp)
     if (!is_const(v) && reg_[v] != kNoReg) return reg_[v];
     get(tmp, v);
     return tmp;
@@ -260,10 +419,15 @@ class Compiler {
   // The same for the low 64 bits of an XMM register.
   void get_xmm(unsigned xmm, ValueId v) {
     if (reg_[v] != kNoReg) a_.sse(0x66, {0x6E}, xmm, reg_[v], true);  // movq xmm, r64
-    else a_.movsd_load(xmm, value_mem(v));
+    else if (xreg_[v] >= 0) {
+      if (static_cast<unsigned>(xreg_[v]) != xmm) a_.sse(0, {0x28}, xmm, static_cast<unsigned>(xreg_[v]));  // movaps
+    } else {
+      a_.movsd_load(xmm, value_mem(v));
+    }
   }
   void put_xmm(ValueId v, unsigned xmm) {
     if (reg_[v] != kNoReg) a_.sse(0x66, {0x7E}, xmm, reg_[v], true);  // movq r64, xmm
+    else if (xreg_[v] >= 0) a_.sse(0xF3, {0x7E}, static_cast<unsigned>(xreg_[v]), xmm);  // movq xmm, xmm (upper half cleared)
     else a_.movsd_store(value_mem(v), xmm);
   }
 
@@ -320,16 +484,18 @@ class Compiler {
   void shift(Shift op, ValueId v, const Inst& in) {
     bool w = in.size == 8;
     unsigned width = in.size * 8u;
-    get(RAX, in.args[0]);
+    const Reg d = dst(v, RAX);
     if (is_const(in.args[1])) {
+      get(d, in.args[0]);
       uint8_t amount = static_cast<uint8_t>(const_value(in.args[1]) & (width - 1));
-      if (amount) a_.shift_imm(op, RAX, amount, w);
-      else if (!w) a_.mov(RAX, RAX, false);
+      if (amount) a_.shift_imm(op, d, amount, w);
+      else if (!w) a_.mov(d, d, false);
     } else {
       get(RCX, in.args[1]);
-      a_.shift_cl(op, RAX, w);
+      get(d, in.args[0]);
+      a_.shift_cl(op, d, w);
     }
-    put(v, RAX);
+    finish(v, d);
   }
 
   void divide(ValueId v, const Inst& in, bool sign) {
@@ -390,21 +556,49 @@ class Compiler {
   void fp_put(ValueId v, unsigned xmm, unsigned size) {
     if (size == 8) {
       put_xmm(v, xmm);
+    } else if (xreg_[v] >= 0) {  // the single, with the rest of the register clear
+      const auto x = static_cast<unsigned>(xreg_[v]);
+      a_.sse(0, {0x57}, x, x);    // xorps
+      a_.sse(0xF3, {0x10}, x, xmm);  // movss
     } else {
       a_.sse(0x66, {0x7E}, xmm, RAX, false);  // movd eax, xmm (upper half cleared)
       put(v, RAX);
     }
   }
 
-  // The result is in XMM0: keep it unless it is a NaN.
-  void fp_finish(ValueId v, const Inst& in) {
-    a_.sse(in.size == 8 ? 0x66 : 0, {0x2E}, 0, 0u);  // ucomisd/ucomiss xmm0, xmm0: PF = unordered
+  // Slow paths (the helper, for NaN results and the like) go after the
+  // block's code, so that the fast path falls through: `from` jumps there,
+  // and the slow path continues where the fast one ends (now).
+  struct ColdHelper {
+    Assembler::Label from;
+    ValueId v;
+    Inst in;
+    size_t done;
+  };
+  void cold_helper(Assembler::Label from, ValueId v, const Inst& in) { cold_.push_back({from, v, in, a_.size()}); }
+  void emit_cold() {
+    for (const ColdHelper& c : cold_) {
+      a_.bind(c.from);
+      call_helper(c.v, c.in, &evaluate_helper);
+      a_.jmp_to(c.done);
+    }
+  }
+
+  // XMM registers for an operation computing v: v's own (doubles and vector
+  // halves; singles go through XMM0 for fp_put to clear the upper bits), or XMM0.
+  unsigned xdst(ValueId v, bool direct) const { return direct && xreg_[v] >= 0 ? static_cast<unsigned>(xreg_[v]) : 0; }
+  // The register holding v for reading: its own, or `tmp` loaded with it.
+  unsigned xsrc(ValueId v, unsigned tmp) {
+    if (!is_const(v) && xreg_[v] >= 0) return static_cast<unsigned>(xreg_[v]);
+    fp_get(tmp, v);
+    return tmp;
+  }
+  // The result is in XMM `d`: keep it unless it is a NaN.
+  void fp_finish(ValueId v, const Inst& in, unsigned d = 0) {
+    a_.sse(in.size == 8 ? 0x66 : 0, {0x2E}, d, d);  // ucomisd/ucomiss: PF = unordered
     const Assembler::Label nan = a_.jcc(Cond::P);
-    fp_put(v, 0, in.size);
-    const Assembler::Label done = a_.jmp();
-    a_.bind(nan);
-    call_helper(v, in, &evaluate_helper);
-    a_.bind(done);
+    if (d == 0) fp_put(v, 0, in.size);
+    cold_helper(nan, v, in);
   }
 
   bool emit_scalar_fp(ValueId v, const Inst& in) {
@@ -417,10 +611,10 @@ class Compiler {
       case Opcode::FDiv: {
         if (size != 4 && size != 8) return false;
         const uint8_t op = in.op == Opcode::FAdd ? 0x58 : in.op == Opcode::FMul ? 0x59 : in.op == Opcode::FSub ? 0x5C : 0x5E;
-        fp_get(0, in.args[0]);
-        fp_get(1, in.args[1]);
-        a_.sse(sd, {op}, 0, 1u);
-        fp_finish(v, in);
+        const unsigned d = xdst(v, size == 8);
+        fp_get(d, in.args[0]);
+        a_.sse(sd, {op}, d, xsrc(in.args[1], 1));
+        fp_finish(v, in, d);
         return true;
       }
       case Opcode::FSqrt:
@@ -439,6 +633,7 @@ class Compiler {
         return true;
       case Opcode::FCmp: {  // packed NZCV: unordered 0011, equal 0110, less 1000, greater 0010
         if (size != 4 && size != 8) return false;
+        if (lazy_[v]) return true;  // only fused conditions use it
         fp_get(0, in.args[0]);
         fp_get(1, in.args[1]);
         a_.sse(size == 8 ? 0x66 : 0, {0x2E}, 0, 1u);  // ucomis xmm0, xmm1
@@ -464,6 +659,51 @@ class Compiler {
         }
         fp_finish(v, in);
         return true;
+      case Opcode::FRint: {  // round to integral (FRINT32/64 and half precision: the helper)
+        if ((size != 4 && size != 8) || (in.aux & 0x18) || !kHost.sse41) return false;
+        const auto mode = static_cast<ir::FpRound>(in.aux & 7);
+        const uint8_t pd = size == 8 ? 0x66 : 0;  // the packed-op prefix (andpd / andps, ...)
+        const uint8_t round = size == 8 ? 0x0B : 0x0A;  // roundsd / roundss (66 0F 3A)
+        auto round_imm = [&](unsigned dst, unsigned src_xmm, uint8_t imm) {
+          a_.sse(0x66, {0x3A, round}, dst, src_xmm);
+          a_.imm8(imm | 8);  // the given mode, inexact suppressed
+        };
+        auto fconst = [&](unsigned xmm, double d) {
+          if (size == 8) vconst(xmm, std::bit_cast<uint64_t>(d));
+          else vconst(xmm, std::bit_cast<uint32_t>(static_cast<float>(d)));
+        };
+        fp_get(0, in.args[0]);
+        switch (mode) {
+          case ir::FpRound::NearestEven: round_imm(0, 0, 0); break;
+          case ir::FpRound::MinusInf: round_imm(0, 0, 1); break;
+          case ir::FpRound::PlusInf: round_imm(0, 0, 2); break;
+          case ir::FpRound::Zero: round_imm(0, 0, 3); break;
+          case ir::FpRound::NearestAway: {
+            // t = trunc(x); t += copysign(1, x) if |x - t| >= 0.5 (x - t is exact)
+            round_imm(1, 0, 3);
+            a_.sse(0, {0x28}, 2, 0u);          // movaps xmm2, xmm0
+            a_.sse(sd, {0x5C}, 2, 1u);         // sub: x - t
+            vconst(3, size == 8 ? 0x7FFF'FFFF'FFFF'FFFFull : 0x7FFF'FFFFull);
+            a_.sse(pd, {0x54}, 2, 3u);         // and: |x - t|
+            fconst(4, 0.5);
+            a_.sse(sd, {0xC2}, 2, 4u);         // cmpnlt: >= 0.5 (all ones)
+            a_.imm8(5);
+            vconst(5, size == 8 ? 0x8000'0000'0000'0000ull : 0x8000'0000ull);
+            a_.sse(pd, {0x54}, 5, 0u);         // and: x's sign
+            fconst(3, 1.0);
+            a_.sse(pd, {0x56}, 3, 5u);         // or: copysign(1, x)
+            a_.sse(0, {0x28}, 4, 1u);          // movaps xmm4, xmm1
+            a_.sse(sd, {0x58}, 4, 3u);         // add: t + copysign(1, x)
+            a_.sse(pd, {0x54}, 4, 2u);         // and: where >= 0.5 ...
+            a_.sse(pd, {0x55}, 2, 1u);         // andn: ... else t (not t + 0, which loses -0)
+            a_.sse(pd, {0x56}, 4, 2u);         // or
+            a_.sse(0, {0x28}, 0, 4u);          // movaps xmm0, xmm4
+            break;
+          }
+        }
+        fp_finish(v, in);
+        return true;
+      }
       case Opcode::IntToF: {
         if (size != 4 && size != 8) return false;
         const bool sign = in.aux & 1, wide = (in.aux >> 1) & 1;
@@ -505,10 +745,7 @@ class Compiler {
           slow = a_.jcc(Cond::S);
         }
         put(v, RAX);
-        const Assembler::Label done = a_.jmp();
-        a_.bind(slow);
-        call_helper(v, in, &evaluate_helper);
-        a_.bind(done);
+        cold_helper(slow, v, in);
         return true;
       }
       default:
@@ -587,10 +824,10 @@ class Compiler {
       case Opcode::VAdd:
       case Opcode::VSub: {
         static constexpr uint8_t add[4] = {0xFC, 0xFD, 0xFE, 0xD4}, sub[4] = {0xF8, 0xF9, 0xFA, 0xFB};
-        fp_get(0, in.args[0]);
-        fp_get(1, in.args[1]);
-        pop66({*by_size(in.op == Opcode::VAdd ? add : sub, esize)}, 0, 1);
-        vput(v, 0);
+        const unsigned d = xdst(v, true);
+        fp_get(d, in.args[0]);
+        pop66({*by_size(in.op == Opcode::VAdd ? add : sub, esize)}, d, xsrc(in.args[1], 1));
+        if (d == 0) vput(v, 0);
         return true;
       }
       case Opcode::VMul:
@@ -668,6 +905,21 @@ class Compiler {
     }
   }
 
+  // A jump taken if a floating point lane of the low 64 bits of XMM `x` is a
+  // NaN (the upper half may hold NaNs of its own, from 0 / 0).
+  Assembler::Label lanes_nan(unsigned x, unsigned esize) {
+    if (esize == 8) {
+      a_.sse(0x66, {0x2E}, x, x);  // ucomisd
+      return a_.jcc(Cond::P);
+    }
+    a_.sse(0xF3, {0x7E}, 3, x);    // movq xmm3, x
+    a_.sse(0, {0xC2}, 3, 3u);      // cmpunordps xmm3, xmm3
+    a_.imm8(3);
+    a_.sse(0, {0x50}, RAX, 3u);    // movmskps eax, xmm3
+    a_.alu_imm(Alu::And, RAX, 3, false);
+    return a_.jcc(Cond::NE);
+  }
+
   bool emit_vlane(ValueId v, const Inst& in) {
     const auto op = static_cast<ir::VecOp>(in.imm);
     const unsigned esize = in.aux & 0xF;
@@ -713,25 +965,19 @@ class Compiler {
           fp_get(1, in.args[0]);
           fp_get(2, in.args[1]);
           a_.vex_0f38(op == ir::VecOp::FMla ? 0xB8 : 0xBC, esize == 8, 0, 1, 2);
-        } else {
-          const uint8_t code = op == ir::VecOp::FAdd ? 0x58 : op == ir::VecOp::FMul ? 0x59 : op == ir::VecOp::FSub ? 0x5C : 0x5E;
-          fp_get(0, in.args[0]);
-          fp_get(1, in.args[1]);
-          a_.sse(pd, {code}, 0, 1u);
+          // NaN in a lane of the half: the helper (ARM's NaN rules).
+          const Assembler::Label nan = lanes_nan(0, esize);
+          vput(v, 0);
+          cold_helper(nan, v, in);
+          return true;
         }
-        // NaN in a lane of the half: the helper (ARM's NaN rules). The upper
-        // half of XMM0 may hold NaNs of its own (0 / 0): only the low lanes count.
-        a_.sse(0xF3, {0x7E}, 3, 0u);  // movq xmm3, xmm0
-        a_.sse(pd, {0xC2}, 3, 3u);    // cmpunordps/pd xmm3, xmm3
-        a_.imm8(3);
-        a_.sse(pd, {0x50}, RAX, 3u);  // movmskps/pd eax, xmm3
-        a_.alu_imm(Alu::And, RAX, esize == 8 ? 1 : 3, false);
-        const Assembler::Label nan = a_.jcc(Cond::NE);
-        vput(v, 0);
-        const Assembler::Label done = a_.jmp();
-        a_.bind(nan);
-        call_helper(v, in, &evaluate_helper);
-        a_.bind(done);
+        const uint8_t code = op == ir::VecOp::FAdd ? 0x58 : op == ir::VecOp::FMul ? 0x59 : op == ir::VecOp::FSub ? 0x5C : 0x5E;
+        const unsigned d = xdst(v, true);
+        fp_get(d, in.args[0]);
+        a_.sse(pd, {code}, d, xsrc(in.args[1], 1));
+        const Assembler::Label nan = lanes_nan(d, esize);
+        if (d == 0) vput(v, 0);
+        cold_helper(nan, v, in);
         return true;
       }
       case ir::VecOp::FCmEq:
@@ -769,6 +1015,10 @@ class Compiler {
         return;  // constants are materialized at their uses
 
       case Opcode::GetReg: {
+        if (xreg_[v] >= 0) {
+          a_.movsd_load(static_cast<unsigned>(xreg_[v]), slot_mem(in.imm));
+          return;
+        }
         const Reg d = dst(v, RAX);
         a_.load(d, slot_mem(in.imm));
         finish(v, d);
@@ -798,12 +1048,20 @@ class Compiler {
       case Opcode::SetReg:
         if (imm32_ok(in.args[0], 8)) {
           a_.store_imm32(slot_mem(in.imm), imm32(in.args[0]), true);
+        } else if (!is_const(in.args[0]) && xreg_[in.args[0]] >= 0) {
+          a_.movsd_store(slot_mem(in.imm), static_cast<unsigned>(xreg_[in.args[0]]));
         } else {
           a_.store(slot_mem(in.imm), src(in.args[0], RAX), 8);
         }
         return;
 
       case Opcode::Load: {
+        if (xreg_[v] >= 0) {  // straight into an XMM register (movd / movq, the rest cleared)
+          const Mem m{src(in.args[0], RAX), 0};
+          if (in.size == 8) a_.sse(0xF3, {0x7E}, static_cast<unsigned>(xreg_[v]), m);
+          else a_.sse(0x66, {0x6E}, static_cast<unsigned>(xreg_[v]), m);
+          return;
+        }
         const Mem m{src(in.args[0], RAX), 0};
         const Reg d = dst(v, RAX);
         bool sign = in.aux != 0;
@@ -928,15 +1186,34 @@ class Compiler {
         a_.movzx8(RAX, RAX);
         put(v, RAX);
         return;
-      case Opcode::Select:
-        get(RAX, in.args[1]);
-        get(RCX, in.args[2]);
-        get(RDX, in.args[0]);
-        a_.test(RDX, RDX, true);
-        a_.cmov(Cond::E, RAX, RCX, w);
-        if (!w) a_.mov(RAX, RAX, false);
-        put(v, RAX);
+      case Opcode::Select: {
+        if (select_cond_[in.args[0]]) {  // on the x86 flags of the condition's flag operation
+          const Inst& cond = block_.insts[in.args[0]];
+          const Inst& flags = block_.insts[cond.args[0]];
+          Cond x86;
+          int constant;
+          fused_condition(flags, cond.aux, x86, constant);
+          // The values first (loading 0 may clear flags), away from RAX and RCX
+          // (the flag operation's temporaries).
+          const Reg d = dst(v, RDX);
+          get(d, in.args[1]);
+          const Reg f = src(in.args[2], R8);
+          redo_flags(flags, cond.aux);
+          a_.cmov(static_cast<Cond>(static_cast<uint8_t>(x86) ^ 1), d, f, w);
+          if (!w) a_.mov(d, d, false);
+          finish(v, d);
+          return;
+        }
+        const Reg d = dst(v, RAX);
+        get(d, in.args[1]);
+        const Reg f = src(in.args[2], RCX);
+        const Reg c = src(in.args[0], RDX);
+        a_.test(c, c, true);
+        a_.cmov(Cond::E, d, f, w);
+        if (!w) a_.mov(d, d, false);
+        finish(v, d);
         return;
+      }
       case Opcode::Adc:
       case Opcode::Sbc:
       case Opcode::FlagsAdc:
@@ -972,6 +1249,7 @@ class Compiler {
         return;
       case Opcode::CondHolds:
         if (branch_cond_ && v == lazy_cond_) return;  // the terminator branches on the flags
+        if (select_cond_[v]) return;                   // the selects use the flags
         if (fused_cond_holds(v, in)) return;
         get(RAX, in.args[0]);
         a_.shift_imm(Shift::Shr, RAX, 28, false);
@@ -989,6 +1267,8 @@ class Compiler {
   void store_pc(Reg r) { a_.store(slot_mem(layout_.pc_slot), r, 8); }
 
   void epilogue() {
+    for (unsigned k = 0; k < kBlockSavedXmmCount; ++k)  // movdqu xmm, [rsp + area + 16k]
+      a_.sse(0xF3, {0x6F}, kBlockSavedXmmFirst + k, Mem{RSP, kBlockXmmSaveArea + 16 * static_cast<int32_t>(k)});
     a_.alu_imm(Alu::Add, RSP, kFrameSize);
     for (size_t k = std::size(kBlockSavedRegs); k-- > 0;) a_.pop(kBlockSavedRegs[k]);
     a_.ret();
@@ -1003,11 +1283,34 @@ class Compiler {
 
   // The x86 condition after the flag operation `flags` for ARM condition
   // `cond`; or a constant (0 / 1) in `constant`; false if there is none.
-  static bool fused_condition(Opcode flags, unsigned cond, Cond& x86, int& constant) {
+  // FCMP sets N for less, Z and C for equal, C for greater, C and V for
+  // unordered; after ucomisd a, b x86 has ZF, PF and CF for unordered, CF for
+  // less, ZF for equal. Some conditions take the compare with the operands
+  // swapped (ucomisd b, a); EQ and NE (two x86 flags) are not fused.
+  static bool fcmp_swapped(unsigned cond) { return cond == 2 || cond == 3 || cond == 4 || cond == 5 || cond == 8 || cond == 9; }
+
+  static bool fused_condition(const Inst& flags_inst, unsigned cond, Cond& x86, int& constant) {
+    const Opcode flags = flags_inst.op;
     constant = -1;
     if (cond >= 14) {  // AL, NV
       constant = 1;
       return true;
+    }
+    if (flags == Opcode::FCmp) {
+      if (flags_inst.size != 4 && flags_inst.size != 8) return false;
+      switch (cond) {
+        case 12: x86 = Cond::A; return true;   // GT: greater
+        case 10: x86 = Cond::AE; return true;  // GE: greater or equal
+        case 11: x86 = Cond::B; return true;   // LT: less or unordered
+        case 13: x86 = Cond::BE; return true;  // LE: less, equal or unordered
+        case 6: x86 = Cond::P; return true;    // VS: unordered
+        case 7: x86 = Cond::NP; return true;   // VC
+        case 3: case 4: x86 = Cond::A; return true;   // CC, MI: less (swapped: b > a)
+        case 2: case 5: x86 = Cond::BE; return true;  // CS, PL: not less (swapped)
+        case 8: x86 = Cond::B; return true;    // HI: greater or unordered (swapped)
+        case 9: x86 = Cond::AE; return true;   // LS: less or equal (swapped)
+        default: return false;                 // EQ, NE
+      }
     }
     static constexpr Cond common[8] = {Cond::E, Cond::NE, Cond::B, Cond::B, Cond::S, Cond::NS, Cond::O, Cond::NO};
     switch (cond) {
@@ -1039,7 +1342,7 @@ class Compiler {
   }
 
   static bool fusable(Opcode op) {
-    return op == Opcode::FlagsSub || op == Opcode::FlagsAdd || op == Opcode::FlagsLogic;
+    return op == Opcode::FlagsSub || op == Opcode::FlagsAdd || op == Opcode::FlagsLogic || op == Opcode::FCmp;
   }
 
   // A branch condition that is a fused condition used by nothing else: the
@@ -1050,7 +1353,7 @@ class Compiler {
     const Inst& cond = block_.insts[t.value];
     if (cond.op != Opcode::CondHolds || cond_uses_[t.value] != 0) return false;
     flags = &block_.insts[cond.args[0]];
-    return fusable(flags->op) && fused_condition(flags->op, cond.aux, x86, constant);
+    return fusable(flags->op) && fused_condition(*flags, cond.aux, x86, constant);
   }
 
   // Flag operations whose only users are conditions it fuses with: they emit nothing.
@@ -1078,9 +1381,26 @@ class Compiler {
         Cond x86;
         int constant;
         if (in.op == Opcode::CondHolds && k == 0 && fusable(block_.insts[a].op) &&
-            fused_condition(block_.insts[a].op, in.aux, x86, constant))
+            fused_condition(block_.insts[a], in.aux, x86, constant))
           continue;
         other_use(a);
+      }
+    }
+    // Fused conditions only selects use: they emit nothing (see Select).
+    select_cond_.assign(n, 0);
+    {
+      std::vector<uint32_t> select_uses(n, 0);
+      for (size_t i = 0; i < n; ++i)
+        if (block_.insts[i].op == Opcode::Select && block_.insts[i].args[0] < n) ++select_uses[block_.insts[i].args[0]];
+      for (size_t i = 0; i < n; ++i) {
+        const Inst& in = block_.insts[i];
+        if (in.op != Opcode::CondHolds || !select_uses[i] || select_uses[i] != cond_uses_[i] ||
+            block_.term.value == i)
+          continue;
+        const Inst& f = block_.insts[in.args[0]];
+        Cond x86;
+        int constant;
+        if (fusable(f.op) && fused_condition(f, in.aux, x86, constant) && constant < 0) select_cond_[i] = 1;
       }
     }
     const Inst* flags;
@@ -1096,8 +1416,13 @@ class Compiler {
   }
 
   // Repeat the x86 flag operation of `flags`.
-  void redo_flags(const Inst& flags) {
-    if (flags.op == Opcode::FlagsLogic) {
+  void redo_flags(const Inst& flags, unsigned cond) {
+    if (flags.op == Opcode::FCmp) {
+      const bool swap = fcmp_swapped(cond);
+      fp_get(0, flags.args[swap ? 1 : 0]);
+      fp_get(1, flags.args[swap ? 0 : 1]);
+      a_.sse(flags.size == 8 ? 0x66 : 0, {0x2E}, 0, 1u);  // ucomisd/ucomiss
+    } else if (flags.op == Opcode::FlagsLogic) {
       get(RAX, flags.args[0]);
       a_.test(RAX, RAX, flags.size == 8);
     } else {
@@ -1110,11 +1435,11 @@ class Compiler {
     const Inst& flags = block_.insts[in.args[0]];
     Cond x86;
     int constant;
-    if (!fusable(flags.op) || !fused_condition(flags.op, in.aux, x86, constant)) return false;
+    if (!fusable(flags.op) || !fused_condition(flags, in.aux, x86, constant)) return false;
     if (constant >= 0) {
       a_.mov_imm(RAX, static_cast<uint64_t>(constant));
     } else {
-      redo_flags(flags);
+      redo_flags(flags, in.aux);
       a_.setcc(x86, RAX);
       a_.movzx8(RAX, RAX);
     }
@@ -1206,9 +1531,13 @@ class Compiler {
 
   void terminator() {
     const ir::Terminator& t = block_.term;
+    auto edge = [&](uint64_t target, std::vector<PendingLink>& pending) {
+      if (target == block_.guest_pc && !loop_slots_.empty()) back_edge();
+      else link_to(target, pending);
+    };
     if (chain_.link_helper && t.kind == ir::Terminator::Kind::Jump) {
       std::vector<PendingLink> pending;
-      link_to(t.target, pending);
+      edge(t.target, pending);
       link_stubs(pending);
       return;
     }
@@ -1219,16 +1548,16 @@ class Compiler {
       Cond x86;
       int constant;
       if (branch_cond_ && branch_on_flags(flags, x86, constant) && constant < 0) {
-        redo_flags(*flags);
+        redo_flags(*flags, block_.insts[t.value].aux);
         not_taken = a_.jcc(static_cast<Cond>(static_cast<uint8_t>(x86) ^ 1));
       } else {
         get(RDX, t.value);
         a_.test(RDX, RDX, true);
         not_taken = a_.jcc(Cond::E);
       }
-      link_to(t.target, pending);
+      edge(t.target, pending);
       a_.bind(not_taken);
-      link_to(t.fallthrough, pending);
+      edge(t.fallthrough, pending);
       link_stubs(pending);
       return;
     }
@@ -1273,7 +1602,13 @@ class Compiler {
   size_t body_ = 0;
   std::vector<uint8_t> lazy_;  // flag operations not emitted (see find_lazy_flags)
   std::vector<Reg> reg_;       // each value's register, or kNoReg (see allocate_registers)
+  std::vector<int8_t> xreg_;   // or its XMM register, or -1
+  std::vector<ColdHelper> cold_;  // slow paths emitted after the block (see cold_helper)
   std::vector<uint32_t> cond_uses_;  // uses of each value by instructions
+  std::vector<LoopSlot> loop_slots_;  // see find_loop_slots
+  std::vector<uint8_t> select_cond_;  // fused conditions only selects use (not emitted)
+  std::vector<uint8_t> hoisted_;      // GetRegs emitted at the top of the block
+  size_t loop_head_ = 0;
   bool branch_cond_ = false;   // the branch condition is not emitted (see branch_on_flags)
   ValueId lazy_cond_ = ir::kNoValue;
   Assembler a_;

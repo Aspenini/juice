@@ -109,6 +109,12 @@ class Optimizer {
         if (is_const(b) && (const_value(b) & ones) == 0) make_const(i, 0);
         else if (is_const(b) && (const_value(b) & ones) == ones && passthrough_ok(in, a)) make_alias(i, a);
         else if (a == b && passthrough_ok(in, a)) make_alias(i, a);
+        else if (is_const(b) && insts_[a].op == Opcode::LShr && insts_[a].size == in.size &&
+                 is_const(insts_[a].args[1])) {
+          // A mask keeping every bit a logical right shift can leave set changes nothing.
+          const unsigned k = static_cast<unsigned>(const_value(insts_[a].args[1]) & (in.size * 8 - 1));
+          if (((const_value(b) | ~(ones >> k)) & ones) == ones && passthrough_ok(in, a)) make_alias(i, a);
+        }
         break;
       case Opcode::Mul:
         if (is_const(b) && (const_value(b) & ones) == 0) make_const(i, 0);
