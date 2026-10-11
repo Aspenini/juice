@@ -72,6 +72,7 @@ void usage() {
       "options:\n"
       "  --trace          log every translated block with its disassembly\n"
       "  --dump-ir        log the IR of every translated block\n"
+      "  --dump-x64       log the x86-64 code of every translated block (assembler .byte lines)\n"
       "  --trace-calls    log every Windows API call made by the program\n"
       "  --trace-imports  log how each import was resolved\n"
       "  --stats          print translation statistics at exit\n"
@@ -117,6 +118,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (arg == L"--trace") options.engine.trace = true;
     else if (arg == L"--dump-ir") options.engine.dump_ir = true;
+    else if (arg == L"--dump-x64") options.engine.dump_code = true;
     else if (arg == L"--trace-calls") options.trace_calls = true;
     else if (arg == L"--trace-imports") options.trace_imports = true;
     else if (arg == L"--stats") options.stats = options.engine.profile = true;

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <format>
 #include <functional>
 #include <random>
 
@@ -707,6 +708,70 @@ TEST(translate_ic_ivau) {
     engine.run(s);
     CHECK_EQ(s.x[0], 2u);
   }
+}
+
+// Conditional branches on the flags of CMP, CMN and TST, for every condition
+// and operands around the signed and unsigned boundaries: the JIT (branching
+// on the x86 flags, linked directly) agrees with the interpreter.
+TEST(translate_conditional_branches) {
+  static constexpr uint64_t values[] = {0, 1, 2, 0x7FFFFFFFFFFFFFFFull, 0x8000000000000000ull, ~0ull, 0x80000000u,
+                                        0x7FFFFFFFu, 0xFFFFFFFFu};
+  // cmp x0, x1 / cmn x0, x1 / tst x0, x1 / cmp w0, w1
+  static constexpr uint32_t compares[] = {0xeb01001f, 0xab01001f, 0xea01001f, 0x6b01001f};
+  for (uint32_t compare : compares) {
+    for (uint32_t cond = 0; cond < 16; ++cond) {
+      // compare; b.cond +12; movz x2, #1; b +8; movz x2, #2; brk — in a loop
+      // so that the blocks get linked
+      const std::vector<uint32_t> code = {compare, 0x54000060u | cond, 0xd2800022, 0x14000002, 0xd2800042, kBrk0};
+      for (uint64_t a : values) {
+        for (uint64_t b : values) {
+          uint64_t results[3] = {};
+          size_t k = 0;
+          for (const Config& cfg : configs()) {
+            TestEnv env(code);
+            runtime::Engine engine(env, cfg.options);
+            for (int round = 0; round < 3; ++round) {
+              CpuState s{};
+              s.x[0] = a;
+              s.x[1] = b;
+              s.pc = kCodeBase;
+              engine.run(s);
+              results[k] = s.x[2];
+            }
+            ++k;
+          }
+          if (results[0] != results[2] || results[1] != results[2]) {
+            test::fail(__FILE__, __LINE__,
+                       std::format("compare {:08x} cond {} a 0x{:x} b 0x{:x}: jit {} noopt {} interp {}", compare, cond,
+                                   a, b, results[0], results[1], results[2]));
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+// The flags lookahead: dead only if straight-line code sets them before
+// anything reads them or leaves the straight line.
+TEST(flags_liveness_lookahead) {
+  auto dead = [](std::vector<uint32_t> code) {
+    const arm64::CodeReader read = [&](uint64_t addr, uint32_t& word) {
+      const uint64_t i = (addr - kCodeBase) / 4;
+      if (addr < kCodeBase || i >= code.size()) return false;
+      word = code[i];
+      return true;
+    };
+    return arm64::flags_dead_at(kCodeBase, read);
+  };
+  CHECK(dead({0xeb01001f /* cmp x0, x1 */}));
+  CHECK(dead({0xf9400002 /* ldr x2, [x0] */, 0x91000421 /* add x1, x1, #1 */, 0xeb01001f}));
+  CHECK(!dead({0x54000040 /* b.eq +8 */}));
+  CHECK(!dead({0x9a9f17e0 /* cset x0, eq */, 0xeb01001f}));
+  CHECK(!dead({0xba010000 /* adcs x0, x0, x1 */}));
+  CHECK(!dead({0x91000421, 0x14000002 /* b +8 */}));
+  CHECK(!dead({0x91000421, kBrk0}));
+  CHECK(!dead({0x91000421}));  // runs off the readable code
 }
 
 // A block linked directly to its successor is unlinked when the successor's

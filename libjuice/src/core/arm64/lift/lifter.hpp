@@ -30,6 +30,13 @@ ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& opt
 // block (a terminator was set).
 bool lift_instruction(const Instruction& insn, ir::Builder& builder);
 
+// Whether the code at `pc` sets the flags (NZCV) before reading them, looking
+// at most `max_insns` ahead through straight-line code. Memory accesses are
+// allowed in between (a fault there reports the flags of before the block's
+// end; code continuing after it still sets them first). Anything that leaves
+// the straight line (a branch, a call, SVC, BRK, ...) counts as reading them.
+bool flags_dead_at(uint64_t pc, const CodeReader& read, unsigned max_insns = 16);
+
 // Description of CpuState for IR backends.
 ir::StateLayout state_layout();
 

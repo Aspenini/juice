@@ -205,6 +205,8 @@ class Optimizer {
 
   void dead_stores() {
     std::vector<uint8_t> overwritten(slot_count_, 0);
+    for (uint16_t slot : block_.dead_at_exit)
+      if (slot < slot_count_) overwritten[slot] = 1;
     for (size_t i = insts_.size(); i-- > 0;) {
       Inst& in = insts_[i];
       switch (in.op) {

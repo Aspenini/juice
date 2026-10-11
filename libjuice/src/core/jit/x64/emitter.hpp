@@ -12,20 +12,29 @@
 // copied anywhere.
 
 #include <cstdint>
+#include <iterator>
 #include <vector>
 
 #include "core/ir/ir.hpp"
+#include "core/jit/x64/assembler.hpp"
 
 namespace juice::x64 {
 
 using BlockFn = void (*)(void* state, uint64_t* scratch);
 
-// The frame of a block: the prologue pushes RBX (the guest state pointer) and
-// RBP and reserves kBlockFrameSize bytes, which the body never changes. At a
-// fault in the body, [RSP + kBlockFrameSize] holds the caller's RBP,
-// [RSP + kBlockFrameSize + 8] its RBX and [RSP + kBlockFrameSize + 16] the
-// return address: a fault handler can return from the block by restoring them.
+// The frame of a block: the prologue pushes kBlockSavedRegs in order (RBX,
+// the guest state pointer; RBP, the scratch array; the callee-saved registers
+// that hold IR values) and reserves kBlockFrameSize bytes, which the body never
+// changes. At a fault in the body, [RSP + kBlockFrameSize + 8 * k] holds the
+// caller's value of kBlockSavedRegs[N - 1 - k], and the return address follows
+// them: a fault handler can return from the block by restoring them.
+#if defined(_WIN32)
+inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, RSI, RDI, R12, R13, R14, R15};
+#else
+inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, R12, R13, R14, R15};
+#endif
 inline constexpr int32_t kBlockFrameSize = 40;
+static_assert((8 + 8 * std::size(kBlockSavedRegs) + kBlockFrameSize) % 16 == 0, "RSP aligned for calls");
 
 // A host instruction of a block that may fault: code from host_offset on (up
 // to the next site) belongs to the guest instruction at block pc + guest_offset.

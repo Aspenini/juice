@@ -31,6 +31,7 @@ void usage() {
       "  --strace           log every system call\n"
       "  --trace            log every translated block with its disassembly\n"
       "  --dump-ir          log the IR of every translated block\n"
+      "  --dump-x64         log the x86-64 code of every translated block (assembler .byte lines)\n"
       "  --stats            print translation statistics at exit\n"
       "  --interp           execute IR with the reference interpreter instead of the JIT\n"
       "  --no-opt           disable IR optimizations\n"
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
     else if (arg == "--strace") options.trace_syscalls = true;
     else if (arg == "--trace") options.engine.trace = true;
     else if (arg == "--dump-ir") options.engine.dump_ir = true;
+    else if (arg == "--dump-x64") options.engine.dump_code = true;
     else if (arg == "--stats") options.stats = options.engine.profile = true;
     else if (arg == "--interp") options.engine.interpret = true;
     else if (arg == "--no-opt") options.engine.optimize = false;

@@ -73,6 +73,7 @@ struct EngineOptions {
   bool interpret = false;       // execute IR with the reference interpreter instead of the JIT
   bool trace = false;           // log each translated block
   bool dump_ir = false;         // log the IR of each translated block
+  bool dump_code = false;       // log the x86-64 code of each translated block (as assembler .byte lines)
   bool profile = false;         // count dispatches and block executions
   uint32_t max_block_insns = 64;
   uint32_t tls_vector_offset = 0;  // see arm64::LiftOptions

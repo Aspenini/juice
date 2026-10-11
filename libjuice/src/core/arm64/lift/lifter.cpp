@@ -1998,6 +1998,25 @@ ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& opt
   return block;
 }
 
+bool flags_dead_at(uint64_t pc, const CodeReader& read, unsigned max_insns) {
+  for (unsigned n = 0; n < max_insns; ++n, pc += 4) {
+    uint32_t word = 0;
+    if ((pc & 3) != 0 || !read(pc, word)) return false;
+    const Instruction insn = decode(word, pc);
+    ir::Block block;
+    ir::Builder builder(block);
+    Lifter lifter(builder, {});
+    const bool ends = lifter.lift(insn);
+    for (const ir::Inst& in : block.insts) {
+      if (in.op == ir::Opcode::GetReg && in.imm == slot::NZCV) return false;
+      if (in.op == ir::Opcode::SetReg && in.imm == slot::NZCV) return true;
+      if (in.op == ir::Opcode::StateOp) return false;  // may read any state
+    }
+    if (ends) return false;  // leaves the straight line: conservatively live
+  }
+  return false;
+}
+
 ir::StateLayout state_layout() {
   ir::StateLayout layout;
   layout.pc_slot = slot::PC;

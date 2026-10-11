@@ -121,6 +121,8 @@ juice [options] program.exe [arguments...]
   --dump-ir        log the IR of every translated block
   --trace-calls    log every Windows API call (and callback) made by the program
   --trace-imports  log how each import was resolved
+  --dump-x64       log the x86-64 code of every translated block (as assembler .byte lines:
+                   clang -c dump.s && llvm-objdump -d dump.o disassembles them)
   --stats          print translation statistics, hot blocks and API call counts at exit
   --interp         execute IR with the reference interpreter instead of the JIT
   --no-opt         disable IR optimizations
@@ -208,15 +210,19 @@ exits, calls to host code and asynchronous interrupts.
   dead guest-register store elimination and dead value elimination, all within a block.
   Stores are not eliminated across an instruction that may fault, and loads are never removed,
   so the guest state is exact at every memory access.
-* **x86-64 backend.** Guest state lives behind RBX and IR values in a scratch array behind RBP.
-  Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
+* **x86-64 backend.** Guest state lives behind RBX. IR values get the callee-saved registers
+  (RSI, RDI, R12–R15 on Windows) for their live ranges within the block, and the rest a
+  scratch array behind RBP; operations work on those registers directly. Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
   the common vector operations on 64-bit halves (integer add, subtract, multiply, compares,
   min/max, abs, shifts, widening, `TBL`, floating point lanes) are SSE instructions. A NaN
   result takes the slow path, where ARM's NaN rules differ from x86's. The slow path and the
   remaining vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter
   share one definition of their semantics: ARM NaN propagation, the default NaN and saturating
   conversions. A condition on the flags of a compare, `CMN` or test repeats the x86 compare
-  and reads the x86 flags; the packed NZCV value is only computed if something else uses it.
+  and reads the x86 flags (a conditional branch becomes `cmp` + `jcc`); the packed NZCV value
+  is only computed if something else uses it. NZCV is not stored at a block's end when the
+  code it continues to (looking ahead up to 16 straight-line instructions) sets the flags
+  before reading them, so most compares never compute it.
   Unit tests compare every inline path with the evaluator, NaNs and boundaries included.
 * **Atomics.** LSE atomics (`CAS`, `SWP`, `LDADD`, ...) become single atomic host operations.
   Exclusives are emulated by value: `LDXR`/`LDXP` record the loaded value, and `STXR`/`STXP` store
@@ -477,10 +483,10 @@ These are next, roughly in the plan's order:
      type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
-5. **Performance.** Programs run about 2 to 13 times slower than native (4.3x geometric mean on
-   `tests/bench`). Next: register allocation instead of keeping every IR value in memory, more
-   vector operations inline (pairwise, saturating, zip/unzip), inline atomics, and W^X code
-   memory.
+5. **Performance.** Programs run about 1.5 to 10 times slower than native (3.5x geometric mean
+   on `tests/bench`). Next: keeping guest registers in host registers across a block (each
+   is still loaded from and stored to guest state), more vector operations inline (pairwise,
+   saturating, zip/unzip), inline atomics, and W^X code memory.
 
 Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are
 the host thread's, not the guest stack's (`GetCurrentThreadStackLimits` is right), and

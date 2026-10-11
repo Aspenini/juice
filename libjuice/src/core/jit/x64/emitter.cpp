@@ -2,6 +2,7 @@
 
 #include "core/jit/x64/assembler.hpp"
 
+#include <algorithm>
 #include <cstddef>
 
 #if defined(_MSC_VER)
@@ -134,8 +135,8 @@ class Compiler {
 
   std::vector<uint8_t> run() {
     find_lazy_flags();
-    a_.push(kState);
-    a_.push(kScratch);
+    allocate_registers();
+    for (Reg r : kBlockSavedRegs) a_.push(r);
     a_.alu_imm(Alu::Sub, RSP, kFrameSize);
     a_.mov(kState, kArg0);
     a_.mov(kScratch, kArg1);
@@ -170,11 +171,101 @@ class Compiler {
   }
   int32_t imm32(ValueId v) const { return static_cast<int32_t>(static_cast<uint32_t>(const_value(v))); }
 
+  // --- register allocation -----------------------------------------------------------
+  //
+  // IR values live in callee-saved host registers (kBlockSavedRegs after RBX
+  // and RBP) from their definition to their last use, as many as there are
+  // registers for; the rest in the scratch array. Helper calls preserve them,
+  // and every other register the code uses is a temporary within one IR
+  // instruction. A value's register is only reused after the instruction that
+  // last uses it (so its operands stay readable on every path).
+
+  static constexpr Reg kNoReg = RSP;  // never allocated
+
+  void allocate_registers() {
+    const size_t n = block_.insts.size();
+    reg_.assign(n, kNoReg);
+    std::vector<size_t> last_use(n, 0);
+    std::vector<uint8_t> used(n, 0);
+    auto use = [&](ValueId a, size_t at) {
+      if (a == ir::kNoValue || a >= n) return;
+      last_use[a] = std::max(last_use[a], at);
+      used[a] = 1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+      const Inst& in = block_.insts[i];
+      if (in.op == Opcode::Nop) continue;
+      for (unsigned k = 0; k < ir::arg_count(in.op); ++k) use(in.args[k], i);
+      // A condition fused with its flag operation repeats it: its operands are used here too.
+      if (in.op == Opcode::CondHolds && in.args[0] < n) {
+        const Inst& flags = block_.insts[in.args[0]];
+        Cond x86;
+        int constant;
+        if (fusable(flags.op) && fused_condition(flags.op, in.aux, x86, constant))
+          for (unsigned k = 0; k < ir::arg_count(flags.op); ++k) use(flags.args[k], i);
+      }
+    }
+    if (branch_cond_) {
+      const Inst& flags = block_.insts[block_.insts[block_.term.value].args[0]];
+      for (unsigned k = 0; k < ir::arg_count(flags.op); ++k) use(flags.args[k], n);
+    } else {
+      use(block_.term.value, n);
+    }
+
+    std::vector<Reg> pool;
+    for (Reg r : kBlockSavedRegs)
+      if (r != kState && r != kScratch) pool.push_back(r);
+    std::vector<uint8_t> freed(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      const Inst& in = block_.insts[i];
+      if (in.op == Opcode::Nop) continue;
+      if (ir::has_result(in.op) && in.op != Opcode::Const && !lazy_[i] && !(branch_cond_ && i == lazy_cond_) &&
+          used[i] && !pool.empty()) {
+        reg_[i] = pool.back();
+        pool.pop_back();
+      }
+      auto release = [&](ValueId a) {
+        if (a == ir::kNoValue || a >= n || freed[a] || reg_[a] == kNoReg || last_use[a] != i) return;
+        freed[a] = 1;
+        pool.push_back(reg_[a]);
+      };
+      for (unsigned k = 0; k < ir::arg_count(in.op); ++k) release(in.args[k]);
+      if (in.op == Opcode::CondHolds && in.args[0] < n)
+        for (unsigned k = 0; k < ir::arg_count(block_.insts[in.args[0]].op); ++k)
+          release(block_.insts[in.args[0]].args[k]);
+    }
+  }
+
   void get(Reg r, ValueId v) {
     if (is_const(v)) a_.mov_imm(r, const_value(v));
+    else if (reg_[v] != kNoReg) a_.mov(r, reg_[v]);
     else a_.load(r, value_mem(v));
   }
-  void put(ValueId v, Reg r) { a_.store(value_mem(v), r, 8); }
+  void put(ValueId v, Reg r) {
+    if (reg_[v] != kNoReg) a_.mov(reg_[v], r);
+    else a_.store(value_mem(v), r, 8);
+  }
+  // The register holding v: its own, or `tmp` loaded with it.
+  Reg src(ValueId v, Reg tmp) {
+    if (!is_const(v) && reg_[v] != kNoReg) return reg_[v];
+    get(tmp, v);
+    return tmp;
+  }
+  // Where to compute v: its own register, or `tmp` (then put(v, tmp)).
+  Reg dst(ValueId v, Reg tmp) const { return reg_[v] != kNoReg ? reg_[v] : tmp; }
+  void finish(ValueId v, Reg r) {
+    if (r != reg_[v]) put(v, r);
+  }
+
+  // The same for the low 64 bits of an XMM register.
+  void get_xmm(unsigned xmm, ValueId v) {
+    if (reg_[v] != kNoReg) a_.sse(0x66, {0x6E}, xmm, reg_[v], true);  // movq xmm, r64
+    else a_.movsd_load(xmm, value_mem(v));
+  }
+  void put_xmm(ValueId v, unsigned xmm) {
+    if (reg_[v] != kNoReg) a_.sse(0x66, {0x7E}, xmm, reg_[v], true);  // movq r64, xmm
+    else a_.movsd_store(value_mem(v), xmm);
+  }
 
   // Pack EFLAGS (after an arithmetic op) into NZCV format in RAX.
   void pack_flags(bool invert_carry) {
@@ -196,15 +287,27 @@ class Compiler {
   }
 
   // RAX = a <op> b, flags set by the x86 instruction.
-  void alu_op(Alu op, const Inst& in) {
+  void alu_op(Alu op, const Inst& in, Reg d = RAX) {
     bool w = in.size == 8;
-    get(RAX, in.args[0]);
-    if (imm32_ok(in.args[1], in.size)) {
-      a_.alu_imm(op, RAX, imm32(in.args[1]), w);
+    if (op == Alu::Cmp && d == RAX && !is_const(in.args[0]) && reg_[in.args[0]] != kNoReg) {
+      d = reg_[in.args[0]];  // a compare changes nothing: use a's register as it is
     } else {
-      get(RCX, in.args[1]);
-      a_.alu(op, RAX, RCX, w);
+      get(d, in.args[0]);
     }
+    if (imm32_ok(in.args[1], in.size)) {
+      a_.alu_imm(op, d, imm32(in.args[1]), w);
+    } else {
+      a_.alu(op, d, src(in.args[1], RCX), w);
+    }
+  }
+
+  // An ALU operation whose result is v, computed in v's register if it has one.
+  // (No operand shares that register: operands' registers are released only
+  // after the instruction that last uses them.)
+  void alu_value(ValueId v, Alu op, const Inst& in) {
+    const Reg d = dst(v, RAX);
+    alu_op(op, in, d);
+    finish(v, d);
   }
 
   // Load the carry flag of packed flags `flags` into CF (inverted for SBC).
@@ -280,13 +383,13 @@ class Compiler {
       a_.mov_imm(RAX, const_value(v));
       a_.sse(0x66, {0x6E}, xmm, RAX, true);  // movq xmm, rax
     } else {
-      a_.movsd_load(xmm, value_mem(v));
+      get_xmm(xmm, v);
     }
   }
 
   void fp_put(ValueId v, unsigned xmm, unsigned size) {
     if (size == 8) {
-      a_.movsd_store(value_mem(v), xmm);
+      put_xmm(v, xmm);
     } else {
       a_.sse(0x66, {0x7E}, xmm, RAX, false);  // movd eax, xmm (upper half cleared)
       put(v, RAX);
@@ -423,7 +526,7 @@ class Compiler {
     a_.mov_imm(RAX, k);
     a_.sse(0x66, {0x6E}, xmm, RAX, true);  // movq xmm, rax
   }
-  void vput(ValueId v, unsigned xmm) { a_.movsd_store(value_mem(v), xmm); }
+  void vput(ValueId v, unsigned xmm) { put_xmm(v, xmm); }
   void pop66(std::initializer_list<uint8_t> opcode, unsigned dst, unsigned src) { a_.sse(0x66, opcode, dst, src); }
 
   // packed-int opcode for element size `esize` from {b, w, d, q} (0 = none).
@@ -572,7 +675,7 @@ class Compiler {
       case ir::VecOp::TblPart: {  // bytes of b in [8k, 8k + 8) select a byte of c, others keep a's
         if (!kHost.ssse3) return false;
         if (in.aux * 8u >= 256) {  // no byte index reaches this part: a unchanged
-          a_.load(RAX, value_mem(in.args[0]));
+          get(RAX, in.args[0]);
           put(v, RAX);
           return true;
         }
@@ -665,10 +768,12 @@ class Compiler {
       case Opcode::Const:
         return;  // constants are materialized at their uses
 
-      case Opcode::GetReg:
-        a_.load(RAX, slot_mem(in.imm));
-        put(v, RAX);
+      case Opcode::GetReg: {
+        const Reg d = dst(v, RAX);
+        a_.load(d, slot_mem(in.imm));
+        finish(v, d);
         return;
+      }
       case Opcode::StateAddr:
         a_.lea(RAX, slot_mem(in.imm));
         put(v, RAX);
@@ -694,69 +799,68 @@ class Compiler {
         if (imm32_ok(in.args[0], 8)) {
           a_.store_imm32(slot_mem(in.imm), imm32(in.args[0]), true);
         } else {
-          get(RAX, in.args[0]);
-          a_.store(slot_mem(in.imm), RAX, 8);
+          a_.store(slot_mem(in.imm), src(in.args[0], RAX), 8);
         }
         return;
 
       case Opcode::Load: {
-        get(RAX, in.args[0]);
-        Mem m{RAX, 0};
+        const Mem m{src(in.args[0], RAX), 0};
+        const Reg d = dst(v, RAX);
         bool sign = in.aux != 0;
         switch (in.size) {
-          case 1: sign ? a_.movsx8(RAX, m) : a_.movzx8(RAX, m); break;
-          case 2: sign ? a_.movsx16(RAX, m) : a_.movzx16(RAX, m); break;
-          case 4: sign ? a_.movsxd(RAX, m) : a_.load(RAX, m, false); break;
-          default: a_.load(RAX, m, true); break;
+          case 1: sign ? a_.movsx8(d, m) : a_.movzx8(d, m); break;
+          case 2: sign ? a_.movsx16(d, m) : a_.movzx16(d, m); break;
+          case 4: sign ? a_.movsxd(d, m) : a_.load(d, m, false); break;
+          default: a_.load(d, m, true); break;
         }
-        put(v, RAX);
+        finish(v, d);
         return;
       }
-      case Opcode::Store:
-        get(RAX, in.args[0]);
-        get(RCX, in.args[1]);
-        a_.store(Mem{RAX, 0}, RCX, in.size);
+      case Opcode::Store: {
+        const Reg base = src(in.args[0], RAX);
+        a_.store(Mem{base, 0}, src(in.args[1], RCX), in.size);
         return;
+      }
       case Opcode::LoadToState: {
-        get(RAX, in.args[0]);
+        const Reg base = src(in.args[0], RAX);
         const uint64_t off = 8 * in.imm;
         unsigned written = 8;
         switch (in.size) {
           case 16:
-            a_.load(RCX, Mem{RAX, 0});
+            a_.load(RCX, Mem{base, 0});
             a_.store(state_mem(off), RCX, 8);
-            a_.load(RCX, Mem{RAX, 8});
+            a_.load(RCX, Mem{base, 8});
             a_.store(state_mem(off + 8), RCX, 8);
             written = 16;
             break;
-          case 8: a_.load(RCX, Mem{RAX, 0}); a_.store(state_mem(off), RCX, 8); break;
-          case 4: a_.load(RCX, Mem{RAX, 0}, false); a_.store(state_mem(off), RCX, 8); break;
-          case 2: a_.movzx16(RCX, Mem{RAX, 0}); a_.store(state_mem(off), RCX, 8); break;
-          default: a_.movzx8(RCX, Mem{RAX, 0}); a_.store(state_mem(off), RCX, 8); break;
+          case 8: a_.load(RCX, Mem{base, 0}); a_.store(state_mem(off), RCX, 8); break;
+          case 4: a_.load(RCX, Mem{base, 0}, false); a_.store(state_mem(off), RCX, 8); break;
+          case 2: a_.movzx16(RCX, Mem{base, 0}); a_.store(state_mem(off), RCX, 8); break;
+          default: a_.movzx8(RCX, Mem{base, 0}); a_.store(state_mem(off), RCX, 8); break;
         }
         for (unsigned k = written; k < in.aux; k += 8) a_.store_imm32(state_mem(off + k), 0, true);
         return;
       }
       case Opcode::StoreFromState: {
-        get(RAX, in.args[0]);
+        const Reg base = src(in.args[0], RAX);
         const uint64_t off = 8 * in.imm;
         if (in.size == 16) {
           a_.load(RCX, state_mem(off));
-          a_.store(Mem{RAX, 0}, RCX, 8);
+          a_.store(Mem{base, 0}, RCX, 8);
           a_.load(RCX, state_mem(off + 8));
-          a_.store(Mem{RAX, 8}, RCX, 8);
+          a_.store(Mem{base, 8}, RCX, 8);
         } else {
           a_.load(RCX, state_mem(off), in.size == 8);
-          a_.store(Mem{RAX, 0}, RCX, in.size);
+          a_.store(Mem{base, 0}, RCX, in.size);
         }
         return;
       }
 
-      case Opcode::Add: alu_op(Alu::Add, in); put(v, RAX); return;
-      case Opcode::Sub: alu_op(Alu::Sub, in); put(v, RAX); return;
-      case Opcode::And: alu_op(Alu::And, in); put(v, RAX); return;
-      case Opcode::Or: alu_op(Alu::Or, in); put(v, RAX); return;
-      case Opcode::Xor: alu_op(Alu::Xor, in); put(v, RAX); return;
+      case Opcode::Add: alu_value(v, Alu::Add, in); return;
+      case Opcode::Sub: alu_value(v, Alu::Sub, in); return;
+      case Opcode::And: alu_value(v, Alu::And, in); return;
+      case Opcode::Or: alu_value(v, Alu::Or, in); return;
+      case Opcode::Xor: alu_value(v, Alu::Xor, in); return;
       case Opcode::Mul:
         get(RAX, in.args[0]);
         get(RCX, in.args[1]);
@@ -867,6 +971,7 @@ class Compiler {
         put(v, RAX);
         return;
       case Opcode::CondHolds:
+        if (branch_cond_ && v == lazy_cond_) return;  // the terminator branches on the flags
         if (fused_cond_holds(v, in)) return;
         get(RAX, in.args[0]);
         a_.shift_imm(Shift::Shr, RAX, 28, false);
@@ -885,8 +990,7 @@ class Compiler {
 
   void epilogue() {
     a_.alu_imm(Alu::Add, RSP, kFrameSize);
-    a_.pop(kScratch);
-    a_.pop(kState);
+    for (size_t k = std::size(kBlockSavedRegs); k-- > 0;) a_.pop(kBlockSavedRegs[k]);
     a_.ret();
   }
 
@@ -938,6 +1042,17 @@ class Compiler {
     return op == Opcode::FlagsSub || op == Opcode::FlagsAdd || op == Opcode::FlagsLogic;
   }
 
+  // A branch condition that is a fused condition used by nothing else: the
+  // terminator jumps on the x86 flags (the value itself is not emitted).
+  bool branch_on_flags(const Inst*& flags, Cond& x86, int& constant) const {
+    const ir::Terminator& t = block_.term;
+    if (t.kind != ir::Terminator::Kind::Branch || t.value == ir::kNoValue) return false;
+    const Inst& cond = block_.insts[t.value];
+    if (cond.op != Opcode::CondHolds || cond_uses_[t.value] != 0) return false;
+    flags = &block_.insts[cond.args[0]];
+    return fusable(flags->op) && fused_condition(flags->op, cond.aux, x86, constant);
+  }
+
   // Flag operations whose only users are conditions it fuses with: they emit nothing.
   void find_lazy_flags() {
     const size_t n = block_.insts.size();
@@ -947,6 +1062,13 @@ class Compiler {
     auto other_use = [&](ValueId v) {
       if (v != ir::kNoValue && v < n) lazy_[v] = 0;
     };
+    cond_uses_.assign(n, 0);  // uses of each value by instructions (not the terminator)
+    for (size_t i = 0; i < n; ++i) {
+      const Inst& in = block_.insts[i];
+      if (in.op == Opcode::Nop) continue;
+      for (unsigned k = 0; k < ir::arg_count(in.op); ++k)
+        if (in.args[k] != ir::kNoValue && in.args[k] < n) ++cond_uses_[in.args[k]];
+    }
     for (size_t i = 0; i < n; ++i) {
       const Inst& in = block_.insts[i];
       if (in.op == Opcode::Nop) continue;
@@ -961,7 +1083,16 @@ class Compiler {
         other_use(a);
       }
     }
-    other_use(block_.term.value);
+    const Inst* flags;
+    Cond x86;
+    int constant;
+    // (Only the linking branch terminator jumps on the flags.)
+    if (chain_.link_helper && branch_on_flags(flags, x86, constant) && constant < 0) {
+      branch_cond_ = true;  // the terminator repeats the flag operation itself
+      lazy_cond_ = block_.term.value;
+    } else {
+      other_use(block_.term.value);
+    }
   }
 
   // Repeat the x86 flag operation of `flags`.
@@ -1083,9 +1214,18 @@ class Compiler {
     }
     if (chain_.link_helper && t.kind == ir::Terminator::Kind::Branch) {
       std::vector<PendingLink> pending;
-      get(RDX, t.value);
-      a_.test(RDX, RDX, true);
-      const Assembler::Label not_taken = a_.jcc(Cond::E);
+      Assembler::Label not_taken;
+      const Inst* flags;
+      Cond x86;
+      int constant;
+      if (branch_cond_ && branch_on_flags(flags, x86, constant) && constant < 0) {
+        redo_flags(*flags);
+        not_taken = a_.jcc(static_cast<Cond>(static_cast<uint8_t>(x86) ^ 1));
+      } else {
+        get(RDX, t.value);
+        a_.test(RDX, RDX, true);
+        not_taken = a_.jcc(Cond::E);
+      }
       link_to(t.target, pending);
       a_.bind(not_taken);
       link_to(t.fallthrough, pending);
@@ -1132,6 +1272,10 @@ class Compiler {
   std::vector<LinkSite>* links_;
   size_t body_ = 0;
   std::vector<uint8_t> lazy_;  // flag operations not emitted (see find_lazy_flags)
+  std::vector<Reg> reg_;       // each value's register, or kNoReg (see allocate_registers)
+  std::vector<uint32_t> cond_uses_;  // uses of each value by instructions
+  bool branch_cond_ = false;   // the branch condition is not emitted (see branch_on_flags)
+  ValueId lazy_cond_ = ir::kNoValue;
   Assembler a_;
 };
 

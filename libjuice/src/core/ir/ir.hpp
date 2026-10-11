@@ -232,6 +232,9 @@ struct Block {
   // Index of the first IR instruction of each guest instruction (4 bytes
   // each, from guest_pc), for finding the guest instruction that faulted.
   std::vector<uint32_t> insn_starts;
+  // State slots the code after the block sets before reading: the block's
+  // stores to them are dead (the optimizer removes them).
+  std::vector<uint16_t> dead_at_exit;
 };
 
 // The guest pc of the instruction that IR instruction `inst` belongs to.

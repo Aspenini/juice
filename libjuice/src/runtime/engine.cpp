@@ -124,6 +124,14 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
   uint32_t max_insns = options_.max_block_insns;
   for (;;) {
     ir::Block block = arm64::lift_block(pc, reader, {max_insns, options_.tls_vector_offset});
+    if (options_.optimize) {
+      // The flags are dead at the block's exit if every successor sets them first.
+      const ir::Terminator& t = block.term;
+      const bool dead = (t.kind == ir::Terminator::Kind::Jump && arm64::flags_dead_at(t.target, reader)) ||
+                        (t.kind == ir::Terminator::Kind::Branch && arm64::flags_dead_at(t.target, reader) &&
+                         arm64::flags_dead_at(t.fallthrough, reader));
+      if (dead) block.dead_at_exit.push_back(arm64::slot::NZCV);
+    }
     const size_t before = block.insts.size();
     if (options_.optimize) ir::optimize(block);
     const size_t after = count_live(block);
@@ -159,6 +167,17 @@ TranslatedBlock* Engine::translate_locked(uint64_t pc) {
         continue;
       }
       void* entry = arena_.add(code);
+      if (options_.dump_code) {
+        // For an assembler and disassembler: clang -c dump.s && llvm-objdump -d dump.o
+        std::string text = std::format("# block 0x{:x} at {}: {} bytes\nblock_{:x}:\n", pc, entry, code.size(), pc);
+        for (size_t i = 0; i < code.size(); i += 16) {
+          text += "  .byte ";
+          for (size_t k = i; k < std::min(code.size(), i + 16); ++k)
+            text += std::format("{}0x{:02x}", k == i ? "" : ",", code[k]);
+          text += "\n";
+        }
+        std::fputs(text.c_str(), options_.log);
+      }
       tb->fault_sites = std::move(fault_sites);
       if (entry && !options_.profile) tb->chain_target = static_cast<uint8_t*>(entry) + body;
       for (const x64::LinkSite& l : link_sites) {

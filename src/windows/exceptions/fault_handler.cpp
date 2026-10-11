@@ -79,10 +79,23 @@ bool recover_guest_fault(CONTEXT& c, uint64_t host_pc, const EXCEPTION_RECORD* r
   s->fault_code = rec->ExceptionCode;
   // The block's epilogue (see x64::kBlockFrameSize).
   const auto* frame = reinterpret_cast<const DWORD64*>(c.Rsp + x64::kBlockFrameSize);
-  c.Rbp = frame[0];
-  c.Rbx = frame[1];
-  c.Rip = frame[2];
-  c.Rsp += x64::kBlockFrameSize + 24;
+  constexpr size_t saved = std::size(x64::kBlockSavedRegs);
+  for (size_t k = 0; k < saved; ++k) {
+    const DWORD64 value = frame[k];
+    switch (x64::kBlockSavedRegs[saved - 1 - k]) {
+      case x64::RBX: c.Rbx = value; break;
+      case x64::RBP: c.Rbp = value; break;
+      case x64::RSI: c.Rsi = value; break;
+      case x64::RDI: c.Rdi = value; break;
+      case x64::R12: c.R12 = value; break;
+      case x64::R13: c.R13 = value; break;
+      case x64::R14: c.R14 = value; break;
+      case x64::R15: c.R15 = value; break;
+      default: return false;
+    }
+  }
+  c.Rip = frame[saved];
+  c.Rsp += x64::kBlockFrameSize + 8 * (saved + 1);
   return true;
 }
 
