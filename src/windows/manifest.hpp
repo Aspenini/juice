@@ -20,6 +20,18 @@
 
 namespace juice::win {
 
+// An activation context description of the manifest (resource #1) of the
+// guest at `exe_path`: the executable itself, or, if the manifest names ARM64
+// side-by-side assemblies (which the x64 host doesn't have; it has the amd64
+// ones), a copy of it naming amd64 ones (under %TEMP%\juice\manifests).
+// False if the executable has no manifest. `storage` keeps the strings the
+// description points to.
+struct ManifestSource {
+  ACTCTXW actctx{};
+  std::wstring source, directory;
+};
+bool manifest_actctx(const std::wstring& exe_path, ManifestSource& out);
+
 struct ManifestState {
   HANDLE context = INVALID_HANDLE_VALUE;  // INVALID_HANDLE_VALUE: no manifest
   bool process_default = false;           // installed as the process default activation context

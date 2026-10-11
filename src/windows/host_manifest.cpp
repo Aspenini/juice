@@ -244,12 +244,9 @@ std::expected<int, std::string> run_elevated(const std::wstring& exe, const std:
 }  // namespace
 
 std::string host_manifest_for(const std::wstring& exe_path) {
-  ACTCTXW actctx{};
-  actctx.cbSize = sizeof(actctx);
-  actctx.dwFlags = ACTCTX_FLAG_RESOURCE_NAME_VALID;
-  actctx.lpSource = exe_path.c_str();
-  actctx.lpResourceName = MAKEINTRESOURCEW(1);
-  HANDLE context = CreateActCtxW(&actctx);
+  ManifestSource source;
+  if (!manifest_actctx(exe_path, source)) return {};
+  HANDLE context = CreateActCtxW(&source.actctx);
   if (context == INVALID_HANDLE_VALUE) return {};  // no manifest, or an invalid one (reported by apply_manifest)
 
   bool needs_new_process = false;

@@ -12,6 +12,7 @@
 #include "windows/dlls/builtins.hpp"
 #include "windows/exceptions/fault_handler.hpp"
 #include "windows/imports/import_resolver.hpp"
+#include "windows/native_hooks.hpp"
 
 namespace juice::win {
 namespace {
@@ -43,6 +44,51 @@ struct ThreadStart {
   uint64_t stack_size;
 };
 
+
+std::wstring lower(std::wstring_view s) {
+  std::wstring out(s);
+  std::transform(out.begin(), out.end(), out.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+  return out;
+}
+
+std::string narrow(const std::wstring& s) {
+  int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
+  std::string out(n > 0 ? n - 1 : 0, '\0');
+  if (n > 1) WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), n, nullptr, nullptr);
+  return out;
+}
+
+uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
+
+// The exceptions that leave a native function the guest called go to the
+// guest; JUICE's own C++ exceptions (guest exception handling continuing in
+// an outer guest call) pass through.
+int native_exception_filter(EXCEPTION_POINTERS* info, GuestProcess& process, arm64::CpuState& s) {
+  EXCEPTION_RECORD* r = info->ExceptionRecord;
+  constexpr DWORD kCxxException = 0xE06D7363;
+  static const auto juice_base = reinterpret_cast<ULONG_PTR>(GetModuleHandleW(nullptr));
+  if (r->ExceptionCode == kCxxException && r->NumberParameters >= 4 && r->ExceptionInformation[3] == juice_base)
+    return EXCEPTION_CONTINUE_SEARCH;
+  if (r->ExceptionFlags & EXCEPTION_UNWINDING) return EXCEPTION_CONTINUE_SEARCH;
+  return process.dispatch_native_exception(*r, s);
+}
+
+// call_native, offering the exceptions that leave the native function to the
+// guest's handlers (in the filter, before anything is unwound: a guest
+// handler that takes one unwinds the native frames on its way). The call
+// must be inside __try for faults to be caught, and the function can't have
+// C++ objects to unwind.
+NativeResult call_native_guarded(GuestProcess& process, void* fn, arm64::CpuState& s, const char* signature) {
+  NativeResult result{};
+  __try {
+    result = call_native(fn, s, signature);
+  } __except (native_exception_filter(GetExceptionInformation(), process, s)) {
+  }
+  return result;
+}
+
+}  // namespace
+
 // Quote one argument so that CommandLineToArgvW reproduces it.
 std::wstring quote_argument(const std::wstring& arg) {
   if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) return arg;
@@ -68,50 +114,6 @@ std::wstring quote_argument(const std::wstring& arg) {
   out.push_back(L'"');
   return out;
 }
-
-std::wstring lower(std::wstring_view s) {
-  std::wstring out(s);
-  std::transform(out.begin(), out.end(), out.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
-  return out;
-}
-
-std::string narrow(const std::wstring& s) {
-  int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, nullptr, 0, nullptr, nullptr);
-  std::string out(n > 0 ? n - 1 : 0, '\0');
-  if (n > 1) WideCharToMultiByte(CP_UTF8, 0, s.c_str(), -1, out.data(), n, nullptr, nullptr);
-  return out;
-}
-
-uint8_t* teb() { return reinterpret_cast<uint8_t*>(NtCurrentTeb()); }
-
-// The exceptions that leave a native function the guest called go to the
-// guest; JUICE's own C++ exceptions (guest exception handling continuing in
-// an outer guest call) pass through.
-int native_exception_filter(const EXCEPTION_POINTERS* info, EXCEPTION_RECORD& out) {
-  const EXCEPTION_RECORD* r = info->ExceptionRecord;
-  constexpr DWORD kCxxException = 0xE06D7363;
-  static const auto juice_base = reinterpret_cast<ULONG_PTR>(GetModuleHandleW(nullptr));
-  if (r->ExceptionCode == kCxxException && r->NumberParameters >= 4 && r->ExceptionInformation[3] == juice_base)
-    return EXCEPTION_CONTINUE_SEARCH;
-  out = *r;
-  out.ExceptionRecord = nullptr;
-  return EXCEPTION_EXECUTE_HANDLER;
-}
-
-// call_native, catching exceptions that leave the native function. (The
-// call must be inside __try for faults to be caught, and the function can't
-// have C++ objects to unwind.)
-bool call_native_guarded(void* fn, const arm64::CpuState& s, const char* signature, NativeResult& result,
-                         EXCEPTION_RECORD& exception) {
-  __try {
-    result = call_native(fn, s, signature);
-    return true;
-  } __except (native_exception_filter(GetExceptionInformation(), exception)) {
-    return false;
-  }
-}
-
-}  // namespace
 
 GuestThread* GuestProcess::t_current() { return t_thread; }
 GuestThread* GuestProcess::t_own() { return t_primary; }
@@ -342,6 +344,7 @@ int GuestProcess::run() {
     live_threads_.push_back(main);
   }
   setup_tls_for_thread();
+  install_native_hooks(*this);  // native DLLs see the guest's modules
   // DLLs first (DllMain), then the program's own TLS callbacks.
   GuestModule& program = *modules_[0].load(std::memory_order_acquire);
   if (!initialize_module(program)) fatal("a DLL failed to initialize", kStatusDllInitFailed);
@@ -380,16 +383,21 @@ NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& a
   state.x[30] = thunks_.return_sentinel();
   state.pc = fn;
 
-  t.levels.push_back({state.sp, how.native_frames, how.link, how.native_frames && t.levels.size() ? &saved : nullptr});
+  t.levels.push_back({state.sp, how.native_frames, how.link, how.native_frames && t.levels.size() ? &saved : nullptr,
+                      how.native_callback});
   const bool was_in_host = t.in_host.exchange(false, std::memory_order_acq_rel);
+  // On the way out (also when native code's exception handling unwinds the
+  // call), the caller gets its state back.
   struct LevelScope {
     GuestThread& t;
     bool in_host;
+    const arm64::CpuState& saved;
     ~LevelScope() {
       t.levels.pop_back();
       t.in_host.store(in_host, std::memory_order_release);
+      t.state = saved;
     }
-  } scope{t, was_in_host};
+  } scope{t, was_in_host, saved};
   // Exception handling continues guest execution in the call level that owns
   // the target frame (a Resume thrown by unwind/restore_context); outer
   // levels rethrow it on.
@@ -408,9 +416,7 @@ NativeCallbackTarget::Result GuestProcess::call_guest(uint64_t fn, const Args& a
       pending.emplace(r);
     }
   }
-  const Result result{state.x[0], state.v[0].lo};
-  state = saved;
-  return result;
+  return Result{state.x[0], state.v[0].lo};  // (the scope restores the caller's state)
 }
 
 bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& result) {
@@ -443,6 +449,7 @@ bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& r
         GuestCall how;
         how.extra_fpr = v + 4;
         how.stack_args = stack_words;
+        how.native_callback = true;
         result = call_guest(target, converted, how);
         return true;
       }
@@ -455,7 +462,9 @@ bool GuestProcess::call_from_native(uint64_t target, const Args& args, Result& r
                  static_cast<unsigned long long>(args.gpr[1]), static_cast<unsigned long long>(args.gpr[2]),
                  static_cast<unsigned long long>(args.gpr[3]), GetCurrentThreadId());
   }
-  result = call_guest(target, args);
+  GuestCall how;
+  how.native_callback = true;
+  result = call_guest(target, args, how);
   return true;
 }
 
@@ -540,15 +549,9 @@ runtime::Action GuestProcess::on_host_address(arm64::CpuState& s) {
   uint64_t result;
   if (thunk->kind == Thunk::Kind::Native) {
     NativeResult r;
-    EXCEPTION_RECORD exception;
-    bool returned;
     {
       HostScope host(t);
-      returned = call_native_guarded(thunk->native, s, thunk->signature, r, exception);
-    }
-    if (!returned) {  // an exception left the native function
-      raise_native_exception(s, exception);
-      return runtime::Action::Continue;
+      r = call_native_guarded(*this, thunk->native, s, thunk->signature);
     }
     if (t && t->context_set) {  // SetThreadContext from another thread: continue there
       t->context_set = false;

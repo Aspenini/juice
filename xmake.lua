@@ -89,6 +89,7 @@ if is_plat("windows") then
                   "src/windows/manifest.cpp",
                   "src/windows/guest_modules.cpp",
                   "src/windows/guest_threads.cpp",
+                  "src/windows/native_hooks.cpp",
                   "src/windows/host_manifest.cpp",
                   "src/windows/guest_process.cpp")
         add_syslinks("advapi32", {public = true})

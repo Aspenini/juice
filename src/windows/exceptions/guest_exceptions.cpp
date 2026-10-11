@@ -20,6 +20,7 @@
 #include <format>
 
 #include "core/arm64/decode/instruction.hpp"
+#include "windows/exceptions/fault_handler.hpp"
 #include "windows/guest_process.hpp"
 
 namespace juice::win {
@@ -118,6 +119,56 @@ bool GuestProcess::remove_vectored_handler(uint64_t handle) {
 }
 
 void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context) {
+  if (dispatch_frames(record, context) == Dispatched::Continued) return;
+  // Raised in a callback, not handled by its frames: the native code that
+  // made the call comes next (after the callback's termination handlers).
+  exit_unwind_level(record, context);
+  NativeRaise raise;
+  raise.record = record;
+  raise.record.ExceptionRecord = nullptr;
+  raise.record.ExceptionFlags &= ~static_cast<DWORD>(kUnwinding | kExitUnwind);
+  throw raise;
+}
+
+int GuestProcess::dispatch_native_exception(EXCEPTION_RECORD& record, arm64::CpuState& s) {
+  // At the call: the native frames are where the guest's call is.
+  Context context = capture_context(s);
+  return dispatch_frames(record, context) == Dispatched::Continued ? EXCEPTION_CONTINUE_EXECUTION
+                                                                    : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void GuestProcess::exit_unwind_level(EXCEPTION_RECORD& record, const Context& context) {
+  GuestThread& t = attach_thread();
+  const uint64_t sentinel = thunks_.return_sentinel();
+  const uint64_t stack = below(t.state.sp);
+  record.ExceptionFlags |= kUnwinding | kExitUnwind;
+  Context frame = context;
+  while (frame.pc != sentinel) {
+    const Context before = frame;
+    const bool unwound = frame.flags & arm64eh::kContextUnwoundToCall;
+    uint64_t base = 0;
+    const RuntimeFunction* f = lookup_function_entry(unwound ? frame.pc - 4 : frame.pc, &base);
+    if (!f && !module_at(frame.pc) && unwound) break;
+    const arm64eh::UnwindResult u = arm64eh::virtual_unwind(base, before.pc, f, frame);
+    if (frame.sp < before.sp) break;
+    if (!u.handler) continue;
+    Context current = before;
+    DispatcherContext dc{};
+    dc.control_pc = before.pc;
+    dc.image_base = base;
+    dc.function_entry = addr(f);
+    dc.establisher_frame = u.establisher_frame;
+    dc.context_record = addr(&current);
+    dc.language_handler = u.handler;
+    dc.handler_data = u.handler_data;
+    dc.control_pc_is_unwound = unwound;
+    dc.non_volatile_registers = addr(&current.x[19]);
+    call_guest(u.handler, {{addr(&record), u.establisher_frame, addr(&current), addr(&dc)}}, {false, &before, stack});
+  }
+  record.ExceptionFlags &= ~static_cast<DWORD>(kUnwinding | kExitUnwind);
+}
+
+GuestProcess::Dispatched GuestProcess::dispatch_frames(EXCEPTION_RECORD& record, Context& context) {
   GuestThread& t = attach_thread();
   const uint64_t sentinel = thunks_.return_sentinel();
   const uint64_t stack = below(t.state.sp);
@@ -131,7 +182,7 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
   for (const VectoredHandler& h : vectored) {
     EXCEPTION_POINTERS pointers{&record, reinterpret_cast<CONTEXT*>(&context)};
     const auto r = static_cast<int32_t>(call_guest(h.function, {{addr(&pointers)}}, {false, &context, stack}).x0);
-    if (r == EXCEPTION_CONTINUE_EXECUTION) return;
+    if (r == EXCEPTION_CONTINUE_EXECUTION) return Dispatched::Continued;
   }
 
   // Then the frame-based handlers, from the innermost frame outwards.
@@ -148,6 +199,7 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
         frame = *l.link;
         continue;
       }
+      if (l.native_callback && l.caller) return Dispatched::ToNative;  // native frames come next
       if (l.caller) {
         // Native code called this level: the guest frames that called it
         // continue at the return address of their call. (The native frames
@@ -200,7 +252,7 @@ void GuestProcess::dispatch_exception(EXCEPTION_RECORD& record, Context& context
           dispatch_exception(nested, context);
           fatal("a handler continued a noncontinuable exception", kStatusNoncontinuable);
         }
-        return;
+        return Dispatched::Continued;
       case kExceptionContinueSearch:
         break;
       case kExceptionNestedException:
@@ -240,19 +292,6 @@ void GuestProcess::raise_hardware_exception(arm64::CpuState& s, uint32_t code,
   to_state(f->context, s);  // a handler continued execution
 }
 
-void GuestProcess::raise_native_exception(arm64::CpuState& s, const EXCEPTION_RECORD& native) {
-  struct Frame {
-    Context context;
-    EXCEPTION_RECORD record;
-  };
-  const uint64_t at = (s.sp - sizeof(Frame) - 0x40) & ~uint64_t{15};
-  auto* f = reinterpret_cast<Frame*>(at);
-  f->context = capture_context(s);  // at the call: pc is its return address
-  f->record = native;
-  s.sp = at;
-  dispatch_exception(f->record, f->context);
-  to_state(f->context, s);  // a handler continued execution (after the call)
-}
 
 void GuestProcess::unhandled_exception(EXCEPTION_RECORD& record, Context& context, const char* why) {
   // Like kernelbase's UnhandledExceptionFilter: the program's top-level

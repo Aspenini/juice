@@ -37,7 +37,13 @@ struct GuestCallLevel {
   // With native frames: the guest state that called into host code, whose
   // frames continue (past the native ones) at its return address.
   const arm64::CpuState* caller = nullptr;
+  // A call native code made (a callback): exceptions the guest frames don't
+  // handle go to the native code's handlers next (see NativeRaise).
+  bool native_callback = false;
 };
+
+// Quote one argument so that CommandLineToArgvW reproduces it.
+std::wstring quote_argument(const std::wstring& arg);
 
 // A guest (ARM64) module: the program or one of its DLLs.
 struct GuestModule {
@@ -107,6 +113,7 @@ struct GuestCall {
   const uint64_t* nonvolatile = nullptr;   // x19-x28 for the callee (exception funclets share the parent's)
   const uint64_t* extra_fpr = nullptr;     // V4-V7 (converted callback arguments)
   std::span<const uint64_t> stack_args;    // arguments passed on the guest stack
+  bool native_callback = false;            // see GuestCallLevel
 };
 
 struct ProcessOptions {
@@ -227,9 +234,13 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   // the guest instruction at s.pc: dispatched to the guest's handlers; if one
   // continues execution, `s` is where it continues.
   void raise_hardware_exception(arm64::CpuState& s, uint32_t code, std::initializer_list<uint64_t> params);
-  // An exception that left a native function the guest called (state `s`, at
-  // the call): dispatched to the guest's handlers from its call site.
-  void raise_native_exception(arm64::CpuState& s, const EXCEPTION_RECORD& record);
+  // An exception in a native function the guest called (state `s`, at the
+  // call), searched for a handler while the native frames still exist (the
+  // exception filter of the call): the guest's handlers from its call site.
+  // Returns the filter's disposition: continue execution, or continue the
+  // search in native code (a guest handler that takes the exception unwinds
+  // to it, through the native frames).
+  int dispatch_native_exception(EXCEPTION_RECORD& record, arm64::CpuState& s);
   // RtlUnwindEx: unwind the guest frames from `context` to `target_frame`,
   // running termination handlers, and continue at `target_ip`.
   [[noreturn]] void unwind(uint64_t target_frame, uint64_t target_ip, EXCEPTION_RECORD* record, uint64_t return_value,
@@ -296,6 +307,12 @@ class GuestProcess final : public runtime::Environment, public NativeCallbackTar
   struct Resume;  // thrown to continue guest execution in an outer call level
   void resume(Resume& r);
   [[noreturn]] void unhandled_exception(EXCEPTION_RECORD& record, arm64eh::Context& context, const char* why);
+  // The frame-based search: Continued (a handler continued execution), or
+  // ToNative (the frames of a callback did not handle it).
+  enum class Dispatched { Continued, ToNative };
+  Dispatched dispatch_frames(EXCEPTION_RECORD& record, arm64eh::Context& context);
+  // Run the termination handlers of the current call level's frames (an exit unwind).
+  void exit_unwind_level(EXCEPTION_RECORD& record, const arm64eh::Context& context);
 
   ProcessOptions options_;
   ThunkTable thunks_;

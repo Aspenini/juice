@@ -38,6 +38,35 @@ void dump_guest(const arm64::CpuState& s) {
 
 void print_location(const char* prefix, uint64_t address);
 
+// For JUICE_TRACE_EXCEPTIONS: the type of a C++ exception (from its throw
+// information, image-relative as on x64 and ARM64) and the host call stack.
+void trace_cxx_exception(const EXCEPTION_RECORD* rec) {
+  if (rec->ExceptionCode != 0xE06D7363 || rec->NumberParameters < 4) return;
+  const auto base = rec->ExceptionInformation[3];
+  const auto* throw_info = reinterpret_cast<const int32_t*>(rec->ExceptionInformation[2]);
+  if (base && throw_info) {
+    const auto* types = reinterpret_cast<const int32_t*>(base + throw_info[3]);  // CatchableTypeArray
+    if (types[0] > 0) {
+      const auto* type = reinterpret_cast<const int32_t*>(base + types[1]);   // CatchableType
+      const auto* descriptor = reinterpret_cast<const char*>(base + type[1]);  // TypeDescriptor
+      std::fprintf(stderr, "[juice]   C++ exception of type %s\n", descriptor + 16);
+    }
+  }
+  void* frames[12];
+  const USHORT n = RtlCaptureStackBackTrace(1, 12, frames, nullptr);
+  for (USHORT k = 0; k < n; ++k) print_location("[juice]     ", reinterpret_cast<uint64_t>(frames[k]));
+}
+
+// A guest exception for the native code that called back into the guest:
+// raised again as if the guest function had raised it (see NativeRaise).
+thread_local EXCEPTION_RECORD t_reraise;
+
+[[noreturn]] void reraise_from_callback(const EXCEPTION_RECORD* r) {
+  RaiseException(r->ExceptionCode, r->ExceptionFlags & EXCEPTION_NONCONTINUABLE, r->NumberParameters,
+                 r->ExceptionInformation);
+  std::abort();
+}
+
 bool in_jit_code(uint64_t address) {
   return g_regions.jit_code && g_regions.jit_code->contains(reinterpret_cast<void*>(address));
 }
@@ -110,6 +139,7 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
   if (trace) {  // every host exception, handled or not (debugging aid)
     std::fprintf(stderr, "[juice] exception 0x%08lx on thread %lu ", code, GetCurrentThreadId());
     print_location("at ", info->ContextRecord->Rip);
+    trace_cxx_exception(rec);
   }
   if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
       code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_PRIV_INSTRUCTION &&
@@ -148,7 +178,18 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         stack + 5,
     };
     NativeCallbackTarget::Result result{};
-    if (g_regions.callbacks->call_from_native(rip, args, result)) {
+    bool called;
+    try {
+      called = g_regions.callbacks->call_from_native(rip, args, result);
+    } catch (const NativeRaise& raise) {
+      // Continue in a function raising it, entered as the native caller's call
+      // (its return address is on the stack): the caller's handlers come next.
+      t_reraise = raise.record;
+      ctx->Rip = reinterpret_cast<DWORD64>(&reraise_from_callback);
+      ctx->Rcx = reinterpret_cast<DWORD64>(&t_reraise);
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (called) {
       // The return type is unknown: provide the result in both RAX and XMM0.
       ctx->Rax = result.x0;
       ctx->Xmm0.Low = result.d0;

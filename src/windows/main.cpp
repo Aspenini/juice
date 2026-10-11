@@ -17,6 +17,25 @@
 
 namespace {
 
+// Runs a native program with `args`, waits for it and returns its exit code.
+int run_native(const std::wstring& program, const std::vector<std::wstring>& args) {
+  std::wstring command_line = juice::win::quote_argument(program);
+  for (const std::wstring& a : args) command_line += L" " + juice::win::quote_argument(a);
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(program.c_str(), command_line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+    std::fprintf(stderr, "juice: cannot start '%ls' (error %lu)\n", program.c_str(), GetLastError());
+    return 1;
+  }
+  CloseHandle(pi.hThread);
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hProcess);
+  return static_cast<int>(code);
+}
+
 // Statically decode every word of the executable sections and report the
 // encodings JUICE cannot translate. Data embedded in code (literal pools,
 // padding) shows up too, so treat the result as an upper bound.
@@ -180,6 +199,11 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   std::vector<std::wstring> guest_args(argv + i + 1, argv + argc);
+  // A program for another architecture (x86, x64) runs natively, as Windows
+  // on ARM runs those (emulated).
+  if (juice::pe::PeHeaderInfo header; juice::pe::peek_pe_header(argv[i], header) &&
+                                      header.machine != juice::pe::kMachineArm64)
+    return run_native(argv[i], guest_args);
   juice::win::GuestProcess process(options);
   if (auto loaded = process.load(argv[i], guest_args); !loaded) {
     std::fprintf(stderr, "juice: %s\n", loaded.error().c_str());

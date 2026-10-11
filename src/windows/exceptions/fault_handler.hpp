@@ -15,6 +15,8 @@
 //    Windows layer dispatches to the guest's exception handlers. Other faults
 //    in translated code are reported with the guest context.
 
+#include <windows.h>
+
 #include <cstdint>
 
 namespace juice::runtime {
@@ -23,6 +25,13 @@ class Engine;
 }
 
 namespace juice::win {
+
+// Thrown by a guest call made for native code (a callback) when the guest
+// frames of the call don't handle an exception: the fault handler raises it
+// again in the native code that made the call, whose handlers come next.
+struct NativeRaise {
+  EXCEPTION_RECORD record;
+};
 
 class NativeCallbackTarget {
  public:

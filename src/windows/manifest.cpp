@@ -3,6 +3,9 @@
 #include <cwctype>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <functional>
+#include <regex>
 #include <string_view>
 
 namespace juice::win {
@@ -59,6 +62,48 @@ DpiChoice declared_dpi_awareness(HANDLE context) {
 
 }  // namespace
 
+bool manifest_actctx(const std::wstring& exe_path, ManifestSource& out) {
+  out = {};
+  // Both absolute: with an assembly directory, a relative source is looked for in it.
+  std::error_code ec;
+  const std::filesystem::path exe = std::filesystem::absolute(exe_path, ec);
+  out.source = exe.wstring();
+  out.directory = exe.parent_path().wstring() + L"\\";
+  ACTCTXW& a = out.actctx;
+  a.cbSize = sizeof(a);
+  a.dwFlags = ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID;
+  a.lpResourceName = MAKEINTRESOURCEW(1);
+
+  HMODULE image = LoadLibraryExW(exe_path.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+  if (!image) return false;
+  std::string text;
+  if (HRSRC res = FindResourceW(image, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24) /* RT_MANIFEST */)) {
+    if (HGLOBAL data = LoadResource(image, res))
+      text.assign(static_cast<const char*>(LockResource(data)), SizeofResource(image, res));
+  }
+  FreeLibrary(image);
+  if (text.empty()) return false;
+
+  static const std::regex arm64(R"__(processorArchitecture\s*=\s*(["'])arm64\1)__", std::regex::icase);
+  if (std::regex_search(text, arm64)) {
+    text = std::regex_replace(text, arm64, "processorArchitecture=\"amd64\"");
+    wchar_t temp[MAX_PATH];
+    GetTempPathW(MAX_PATH, temp);
+    const std::filesystem::path dir = std::filesystem::path(temp) / L"juice" / L"manifests";
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path file = dir / std::format(L"{:016x}.manifest", std::hash<std::string>{}(text));
+    if (!std::filesystem::exists(file, ec)) {
+      std::ofstream(file, std::ios::binary).write(text.data(), static_cast<std::streamsize>(text.size()));
+    }
+    out.source = file.wstring();
+    a.dwFlags &= ~ACTCTX_FLAG_RESOURCE_NAME_VALID;
+    a.lpResourceName = nullptr;
+  }
+  a.lpSource = out.source.c_str();
+  a.lpAssemblyDirectory = out.directory.c_str();  // private assemblies: next to the program
+  return true;
+}
+
 std::expected<ManifestState, std::string> apply_manifest(const std::wstring& exe_path, uint64_t image_base,
                                                          std::FILE* log) {
   ManifestState state;
@@ -68,15 +113,11 @@ std::expected<ManifestState, std::string> apply_manifest(const std::wstring& exe
     return state;
   }
 
-  const std::wstring directory = std::filesystem::path(exe_path).parent_path().wstring() + L"\\";
-  ACTCTXW actctx{};
-  actctx.cbSize = sizeof(actctx);
-  actctx.dwFlags = ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_APPLICATION_NAME_VALID |
-                   ACTCTX_FLAG_SET_PROCESS_DEFAULT;
-  actctx.lpSource = exe_path.c_str();
-  actctx.lpResourceName = MAKEINTRESOURCEW(1);
-  actctx.lpAssemblyDirectory = nullptr;
-  actctx.lpApplicationName = directory.c_str();
+  ManifestSource source;
+  if (!manifest_actctx(exe_path, source)) return state;
+  ACTCTXW& actctx = source.actctx;
+  actctx.dwFlags |= ACTCTX_FLAG_APPLICATION_NAME_VALID | ACTCTX_FLAG_SET_PROCESS_DEFAULT;
+  actctx.lpApplicationName = source.directory.c_str();
   state.context = CreateActCtxW(&actctx);
   if (state.context != INVALID_HANDLE_VALUE) {
     state.process_default = true;

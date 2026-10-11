@@ -35,30 +35,6 @@ std::wstring widen(const char* s) {
   return out;
 }
 
-// Quote one argument so that CommandLineToArgvW reproduces it.
-std::wstring quote(const std::wstring& arg) {
-  if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) return arg;
-  std::wstring out = L"\"";
-  for (size_t i = 0;; ++i) {
-    size_t backslashes = 0;
-    while (i < arg.size() && arg[i] == L'\\') {
-      ++i;
-      ++backslashes;
-    }
-    if (i == arg.size()) {
-      out.append(backslashes * 2, L'\\');
-      break;
-    }
-    if (arg[i] == L'"') {
-      out.append(backslashes * 2 + 1, L'\\');
-    } else {
-      out.append(backslashes, L'\\');
-    }
-    out.push_back(arg[i]);
-  }
-  out.push_back(L'"');
-  return out;
-}
 
 // The program a command line names (its first token, as CreateProcess reads
 // it) and the rest of the command line.
@@ -122,17 +98,17 @@ std::optional<std::wstring> juice_command_line(GuestProcess& p, const std::wstri
   wchar_t juice[MAX_PATH * 4];
   GetModuleFileNameW(nullptr, juice, static_cast<DWORD>(std::size(juice)));
   const ProcessOptions& o = p.options();
-  std::wstring cmd = quote(juice);
+  std::wstring cmd = quote_argument(juice);
   if (o.engine.interpret) cmd += L" --interp";
   if (!o.engine.optimize) cmd += L" --no-opt";
   if (o.engine.max_block_insns != runtime::EngineOptions{}.max_block_insns)
     cmd += std::format(L" --block-size={}", o.engine.max_block_insns);
   // The child gets exactly this process's DLL directories (including the
   // Visual Studio runtime, if one was found).
-  for (const std::wstring& dir : o.dll_paths) cmd += L" " + quote(L"--dll-path=" + dir);
+  for (const std::wstring& dir : o.dll_paths) cmd += L" " + quote_argument(L"--dll-path=" + dir);
   cmd += L" --no-vs-runtime";
-  cmd += L" " + quote(L"--argv0=" + argv0);
-  cmd += L" -- " + quote(*program);
+  cmd += L" " + quote_argument(L"--argv0=" + argv0);
+  cmd += L" -- " + quote_argument(*program);
   if (!rest.empty()) cmd += L" " + rest;
   return cmd;
 }
