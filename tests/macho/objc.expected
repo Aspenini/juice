@@ -1,0 +1,8 @@
+load Counter
+add 105
+total 2.50
+twice 210
+describe 105 self
+returned self
+rect 1.0 2.0 3.0 4.0
+scale 3.250

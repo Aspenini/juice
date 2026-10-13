@@ -2,13 +2,16 @@
 
 **JUICE Uses Instruction Conversion Efficiently** — a portable ARM64 → x86-64 dynamic binary
 translator. Its core, **libjuice**, is a library with no operating-system dependencies beyond
-executable memory. Two front ends sit on top of it:
+executable memory. Three front ends sit on top of it:
 
 * **Windows**: runs Windows ARM64 `.exe` programs on x86-64 Windows without a virtual machine,
   forwarding Windows API calls to the native x64 DLLs.
 * **Linux** (new, untested): runs Linux AArch64 ELF programs on x86-64 Linux, statically or
   dynamically linked, forwarding system calls to the host kernel, optionally registered with
   `binfmt_misc`.
+* **macOS** (new, not yet run on a Mac): runs macOS ARM64 programs (built for Apple silicon) on
+  Intel Macs, with the system's own x86-64 libraries and Objective-C runtime serving them. Its
+  portable core runs on Windows against fake libraries in the tests.
 
 ```text
 Windows ARM64 .exe ─► PE loader ─► ARM64 decoder ─► IR ─► optimizer ─► x86-64 JIT ─► block cache
@@ -100,6 +103,13 @@ On Linux, the same `xmake` builds `build/linux/x86_64/releasedbg/juice` with GCC
 The Linux guest tests need an AArch64 cross compiler (`aarch64-linux-gnu-gcc`/`g++`, e.g. Debian's
 `gcc-aarch64-linux-gnu` and `g++-aarch64-linux-gnu`), whose C library also serves the dynamically
 linked tests.
+
+On an Intel Mac, `xmake` builds `build/macosx/x86_64/releasedbg/juice` with Apple clang (Xcode
+15 or later, for C++23). Run a program built for Apple silicon with `juice program [args...]`;
+`--library-path=DIRS` adds directories to search for its libraries, and `--trace-binds` and
+`--trace-calls` show how its imports resolve and what it calls. Programs that have an x86-64
+slice are run natively. A JIT under the hardened runtime needs the
+`com.apple.security.cs.allow-jit` entitlement; an ad-hoc signed or unsigned `juice` doesn't.
 
 To use the translator from another project, link the `libjuice` target and include
 `<juice/juice.hpp>`. It documents the `Environment` interface a front end implements.
@@ -458,6 +468,80 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
   way the kernel passes them, and takes its options from the environment (`JUICE_SYSROOT`,
   `JUICE_STRACE=1`, `JUICE_STATS=1`).
 
+### macOS layer
+
+The macOS frontend runs programs built only for Apple silicon on Intel Macs. The program and the
+libraries it brings with it (its own dylibs and frameworks) are translated. The system's
+libraries are the Mac's own x86-64 ones: libSystem, Foundation, AppKit and the Objective-C
+runtime. Everything but `src/macos/host` and `src/macos/main.cpp` is portable C++ and is tested
+on Windows (see Tests). The macOS-only part has **not yet been compiled or run on a Mac**.
+
+* **Loading** (`src/macos/macho`, `src/macos/loader`). JUICE reads Mach-O images and universal
+  files, preferring the `arm64` slice to `arm64e`. It handles both fixup encodings: dyld's
+  opcode streams and chained fixups (`DYLD_CHAINED_PTR_64`, `_64_OFFSET` and the arm64e
+  formats, whose pointer authentication is dropped). Exports come from the export trie,
+  including re-exports and resolvers.
+  * Images are mapped at a 16 KB aligned slide, readable and writable but never executable for
+    the host.
+  * A dependency becomes a guest image if `@rpath`, `@executable_path`, `@loader_path` or
+    `--library-path` leads to an ARM64 file. Otherwise the system's library is opened with
+    `dlopen`.
+  * Binds follow two-level namespace, weak and flat lookups, and run initializers (both
+    `__mod_init_func` and `__init_offsets`) dependencies first.
+  * Thread-local variables (`__thread_vars`) get per-thread blocks.
+  * Encrypted (FairPlay) images are refused.
+* **Calls into native code** (`src/macos/abi`). Binds to native functions resolve to their real
+  addresses, so native code given one back can call it. When guest execution reaches native
+  code, JUICE converts the call from Apple's ARM64 convention to x86-64 System V and back:
+  * Apple's packed stack arguments, and variadic arguments on the stack;
+  * HFAs such as `CGRect`, which are V registers on ARM64 but memory on x86-64;
+  * eightbyte-classified structures, large structures (by reference on ARM64, copied on
+    x86-64) and memory results;
+  * `long double` (double ↔ x87);
+  * Swift's `self`, error and async registers.
+
+  Without a type, arguments map register for register. Variadic C functions (the `printf`,
+  `scanf`, `err`, `syslog` and `NSLog` families, `CFStringCreateWithFormat`) are called through
+  their `va_list` forms, over an x86-64 `va_list` that points at the guest's 8-byte slots.
+  `open`, `fcntl` and `ioctl` take their variadic argument as an integer.
+* **Native code calling guest code.** Guest code isn't executable on the host, so a native call
+  into it faults. The `SIGBUS`/`SIGSEGV` handler continues the call at a System V entry
+  trampoline that runs the guest function. The arguments are converted by the function's type
+  when it's known: an Objective-C method's encoding, or the signature of a block whose
+  `invoke` it is. Otherwise registers map one to one.
+* **Objective-C** (`src/macos/objc`). The program's classes are registered with the system
+  runtime in place (`objc_readClassPair`, superclasses first), so they are real classes to
+  AppKit. Also registered:
+  * selectors, uniqued;
+  * protocols, created when the system doesn't have them;
+  * categories, with `class_replaceMethod`;
+  * `+load`, called before the image's initializers.
+
+  Every guest method's type is recorded for calls from native code. The guest's
+  `objc_msgSend`, `objc_msgSendSuper` and `objc_msgSendSuper2` look up the implementation: a
+  guest method is entered directly; a native one is called with conversion by its type
+  encoding, through `class_getMethodImplementation_stret` when x86-64 returns the result in
+  memory. Variadic methods have their own handling: `stringWithFormat:`, `initWithFormat:`,
+  `appendFormat:`, `predicateWithFormat:` and nil-terminated object lists. The ARM64-only
+  `objc_retain_xN` and `objc_release_xN` helpers are provided.
+* **JUICE's own functions.**
+  * `dlopen`, `dlsym`, `dladdr` and `dlerror`, which know the guest's images;
+  * dyld's image list (`_dyld_image_count`, `_dyld_get_image_header`,
+    `_dyld_register_func_for_add_image`, ...);
+  * `_NSGetArgv`, `_NSGetArgc`, `_NSGetProgname` and `_NSGetExecutablePath`;
+  * thread-local variable bootstrap;
+  * `setjmp`/`longjmp`.
+
+  Native libraries also see the program's `argc`, `argv` and name.
+* **Not yet:**
+  * C++ exceptions through guest frames (they need an ARM64 unwinder and personality);
+  * Swift classes (they are left to the Swift runtime, which doesn't see guest images yet);
+  * signals delivered to guest handlers;
+  * app bundles: `NSBundle` and `CFBundle` resolve the main bundle from `juice`'s own path;
+  * C functions that take structures by value, such as `CGContextFillRect`, need types that
+    don't exist yet: a table generated from the macOS SDK, as `tools/gen_signatures` does for
+    Windows.
+
 ## Tests
 
 * `tests/unit`: decoder tests against LLVM-assembled encodings; IR semantics and optimizer tests;
@@ -481,6 +565,16 @@ This layer is written against the kernel ABI but has **not yet been compiled or 
   loops), run natively and under JUICE with `xmake build juice-bench` and
   `xmake run juice-bench [--runs=N] [name...]`. Outputs must match; the table shows JUICE's
   slowdown and the change since the previous run.
+* `tests/macho` (`xmake test "juice-macho-tests/*"`, any host with LLVM): C, C++ and Objective-C
+  programs and a library, built for macOS ARM64 with clang and `ld64.lld` against stub `.tbd`
+  libraries (no macOS SDK needed), with both fixup encodings.
+  * `juice-macho-dump`'s rebases, binds and exports must match `llvm-objdump`'s.
+  * On Windows, `juice-macos-sim` runs the programs with a fake libSystem and Objective-C runtime
+    made of System V functions, exercising the macOS core end to end: loading and binding,
+    initializers, thread-local variables, variadic calls, callbacks from native code through
+    the fault path, `dlsym`, `setjmp`, a guest library found through `@rpath`, and Objective-C
+    classes, categories and `+load`, with methods called both ways. Outputs must match
+    `*.expected`.
 * `tests/sdk`: inputs for the Windows SDK tools. If the SDK's ARM64 tools are installed, each
   tool runs as ARM64 under JUICE and as x64 natively, in the same directory. The exit code,
   console output and every file written must match.

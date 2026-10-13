@@ -4,9 +4,186 @@
 target("juice-unit-tests")
     set_kind("binary")
     set_default(false)
-    add_deps("libjuice", "juice-linux-abi")
+    add_deps("libjuice", "juice-linux-abi", "juice-macos-abi")
     add_files("unit/*.cpp")
     add_tests("unit")
+
+-- ---------------------------------------------------------------------------
+-- Mach-O reading tests (any host)
+--
+-- The programs in macho/ are built for macOS ARM64 with clang and LLVM's
+-- ld64.lld (against the stub libraries there, no macOS SDK needed), linked
+-- with both fixup encodings: dyld opcodes (macOS 11) and chained fixups
+-- (macOS 13). juice-macho-dump's rebases, binds and exports must match
+-- llvm-objdump's. On Windows (clang builds), juice-macos-sim also runs
+-- programs with a fake libSystem: their output must match *.expected.
+-- ---------------------------------------------------------------------------
+target("juice-macho-tests")
+    set_kind("phony")
+    set_default(false)
+    add_deps("juice-macho-dump", "juice-macos-sim")
+
+    on_load(function (target)
+        import("lib.detect.find_program")
+        local llvm_bin = path.join(os.getenv("ProgramFiles") or "", "LLVM", "bin")
+        local function tool(name)
+            return find_program(name, {paths = {llvm_bin}})
+        end
+        local tools = {clang = tool("clang"), ld = tool("ld64.lld"), objdump = tool("llvm-objdump")}
+        if not tools.clang or not tools.ld or not tools.objdump then
+            print("juice: clang, ld64.lld or llvm-objdump not found, Mach-O tests disabled")
+            return
+        end
+        local fixtures = {
+            program_c = {source = "fixture.c", libs = {"libSystem.tbd"}},
+            program_cpp = {source = "fixture.cpp", libs = {"libSystem.tbd", "libcxx.tbd"}},
+            library = {source = "library.c", libs = {"libSystem.tbd"}, dylib = true},
+        }
+        for name, f in pairs(fixtures) do
+            for _, format in ipairs({"opcodes", "chained"}) do
+                target:add("tests", name .. "_" .. format, {fixture = f, format = format, tools = tools})
+            end
+        end
+        -- Programs juice-macos-sim runs (System V functions on Windows need clang).
+        if is_plat("windows") and (get_config("toolchain") or "clang-cl") == "clang-cl" then
+            local runs = {
+                fixture = {source = "fixture.c", expected = "fixture.expected", code = 0, args = {}},
+                program = {source = "program.c", library = "library2.c", expected = "program.expected", code = 3,
+                           args = {"hello"}},
+                objc = {source = "objc.m", expected = "objc.expected", code = 0, args = {}, libs = {"libobjc.tbd"},
+                        flags = {"-fobjc-runtime=macosx-11.0", "-fno-objc-arc",
+                                 "-fno-objc-convert-messages-to-runtime-calls"}},
+            }
+            for name, run in pairs(runs) do
+                for _, format in ipairs({"opcodes", "chained"}) do
+                    target:add("tests", "run_" .. name .. "_" .. format, {run = run, format = format, tools = tools})
+                end
+            end
+        end
+    end)
+
+    on_test(function (target, opt)
+        local dir = path.join(target:scriptdir(), "macho")
+        local work = path.join(target:autogendir(), "macho")
+        os.mkdir(work)
+        local name = path.filename(opt.name)
+        local version = opt.format == "chained" and "13.0" or "11.0"
+
+        -- Build `source` into `out` (a program, or a library with `install_name`).
+        local function build(source, out, extra, flags)
+            local object = out .. ".o"
+            os.vrunv(opt.tools.clang, table.join({"--target=arm64-apple-macos11", "-O1", "-c", path.join(dir, source),
+                                                  "-o", object}, flags or {}))
+            local args = {"-arch", "arm64", "-platform_version", "macos", version, version, "-o", out, object,
+                          path.join(dir, "libSystem.tbd")}
+            if opt.format == "chained" then table.insert(args, "-fixup_chains") end
+            os.vrunv(opt.tools.ld, table.join(args, extra or {}))
+        end
+
+        if opt.run then
+            local run = opt.run
+            local rundir = path.join(work, name)
+            os.mkdir(rundir)
+            local program = path.join(rundir, "program")
+            local extra = {}
+            if run.library then
+                local lib = path.join(rundir, "liblibrary2.dylib")
+                build(run.library, lib, {"-dylib", "-install_name", "@rpath/liblibrary2.dylib"})
+                extra = {"-rpath", "@executable_path", lib}
+            end
+            for _, lib in ipairs(run.libs or {}) do table.insert(extra, path.join(dir, lib)) end
+            build(run.source, program, extra, run.flags)
+            local out = path.join(rundir, "stdout.txt")
+            local sim = target:dep("juice-macos-sim"):targetfile()
+            local code = os.execv(sim, table.join({program}, run.args), {try = true, timeout = 60000, stdout = out})
+            local output = (io.readfile(out) or ""):gsub("\r\n", "\n")
+            local expected = (io.readfile(path.join(dir, run.expected)) or ""):gsub("\r\n", "\n")
+            if code ~= run.code then
+                opt.errors = string.format("exit code %s, expected %d\n%s", tostring(code), run.code, output)
+                return false
+            end
+            if output ~= expected then
+                opt.errors = "output differs\n--- juice ---\n" .. output .. "--- expected ---\n" .. expected
+                return false
+            end
+            return true
+        end
+        local object = path.join(work, name .. ".o")
+        local image = path.join(work, name)
+        local f = opt.fixture
+        os.vrunv(opt.tools.clang, {"--target=arm64-apple-macos11", "-O1", "-c", path.join(dir, f.source), "-o", object})
+        local version = opt.format == "chained" and "13.0" or "11.0"
+        local args = {"-arch", "arm64", "-platform_version", "macos", version, version, "-o", image, object}
+        if opt.format == "chained" then table.insert(args, "-fixup_chains") end
+        if f.dylib then table.join2(args, {"-dylib", "-install_name", "@rpath/lib" .. name .. ".dylib"}) end
+        for _, lib in ipairs(f.libs) do table.insert(args, path.join(dir, lib)) end
+        os.vrunv(opt.tools.ld, args)
+
+        -- One line per fixup or export: "rebase ADDR [TARGET]", "bind ADDR DYLIB SYMBOL ADDEND [weak-import]",
+        -- "weak-bind ADDR weak SYMBOL ADDEND", "export ADDR SYMBOL".
+        local function hex(s) return string.format("0x%x", tonumber(s)) end
+        local function words(line)
+            local w = {}
+            for word in line:gmatch("%S+") do table.insert(w, word) end
+            return w
+        end
+        local expected = {}
+        local chained = opt.format == "chained"
+        local listing = os.iorunv(opt.tools.objdump, chained and {"--macho", "--dyld-info", "--exports-trie", image}
+                                  or {"--macho", "--rebase", "--bind", "--lazy-bind", "--weak-bind", "--exports-trie", image})
+        local section
+        for line in listing:gmatch("[^\r\n]+") do
+            local weak_import = line:find("%(weak[_ ]import%)") ~= nil
+            line = line:gsub("%s*%(weak[_ ]import%)", "")
+            local w = words(line)
+            if line:find("^Rebase table") then section = "rebase"
+            elseif line:find("^Bind table") then section = "bind"
+            elseif line:find("^Lazy bind table") then section = "lazy"
+            elseif line:find("^Weak bind table") then section = "weak"
+            elseif line:find("^Exports trie") then section = "exports"
+            elseif line:find("^dyld information") then section = "dyld"
+            elseif w[1] == "segment" or #w < 2 then
+                -- headers, file names
+            elseif section == "exports" then
+                table.insert(expected, "export " .. hex(w[1]) .. " " .. w[2])
+            elseif section == "dyld" and w[5] == "rebase" then
+                table.insert(expected, "rebase " .. hex(w[3]) .. " " .. hex(w[6]))
+            elseif section == "dyld" and w[5] == "bind" then
+                table.insert(expected, string.format("bind %s %s %s %d%s", hex(w[3]), w[7], w[8], tonumber(w[6]),
+                                                     weak_import and " weak-import" or ""))
+            elseif section == "rebase" then
+                table.insert(expected, "rebase " .. hex(w[3]))
+            elseif section == "bind" then
+                table.insert(expected, string.format("bind %s %s %s %d%s", hex(w[3]), w[6], w[7], tonumber(w[5]),
+                                                     weak_import and " weak-import" or ""))
+            elseif section == "lazy" then
+                table.insert(expected, string.format("bind %s %s %s 0%s", hex(w[3]), w[4], w[5],
+                                                     weak_import and " weak-import" or ""))
+            elseif section == "weak" and #w >= 6 then
+                table.insert(expected, string.format("weak-bind %s weak %s %d", hex(w[3]), w[6], tonumber(w[5])))
+            end
+        end
+
+        local actual = {}
+        local dump = os.iorunv(target:dep("juice-macho-dump"):targetfile(), {image})
+        for line in dump:gmatch("[^\r\n]+") do
+            if line:find("^rebase ") or line:find("^bind ") or line:find("^weak%-bind ") or line:find("^export ") then
+                table.insert(actual, line)
+            end
+        end
+        table.sort(expected)
+        table.sort(actual)
+        local a, e = table.concat(actual, "\n"), table.concat(expected, "\n")
+        if #expected == 0 then
+            opt.errors = "llvm-objdump listed nothing:\n" .. listing
+            return false
+        end
+        if a ~= e then
+            opt.errors = "juice-macho-dump differs from llvm-objdump\n--- juice ---\n" .. a .. "\n--- llvm ---\n" .. e
+            return false
+        end
+        return true
+    end)
 
 -- ---------------------------------------------------------------------------
 -- Linux guest program tests

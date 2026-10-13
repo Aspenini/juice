@@ -1,0 +1,13 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos, x86_64-macos ]
+install-name:    '/usr/lib/libSystem.B.dylib'
+current-version: 1351
+exports:
+  - targets:         [ arm64-macos, x86_64-macos ]
+    symbols:         [ _printf, _puts, _malloc, _free, _exit, _strlen, _qsort, _atexit,
+                       ___stack_chk_guard, ___stack_chk_fail, __tlv_bootstrap, dyld_stub_binder,
+                       _environ, _optional_function, __Unwind_Resume, ___cxa_atexit,
+                       _snprintf, _setjmp, _longjmp, _dlopen, _dlsym, _dlclose, _dlerror, _dladdr,
+                       _vprintf, _vsnprintf, _putchar, _calloc, _realloc, _strcmp, _memcpy, _memset, _sqrt ]
+...

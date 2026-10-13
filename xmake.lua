@@ -1,5 +1,5 @@
 -- JUICE Uses Instruction Conversion Efficiently
--- ARM64 -> x86-64 dynamic binary translator: libjuice plus Windows and Linux frontends.
+-- ARM64 -> x86-64 dynamic binary translator: libjuice plus Windows, Linux and macOS frontends.
 --
 --   xmake                       build juice (Windows: juice.exe with clang-cl by default)
 --   xmake f --toolchain=msvc    build with cl.exe instead (Windows)
@@ -70,6 +70,40 @@ target("juice-linux-abi")
     add_includedirs("src", {public = true})
 
 -- ---------------------------------------------------------------------------
+-- macOS Mach-O support that does not need macOS itself (Mach-O parsing,
+-- fixups, exports): built everywhere so the unit tests and the Mach-O tests
+-- (tests/macho) cover it on any host.
+-- ---------------------------------------------------------------------------
+target("juice-macos-abi")
+    set_kind("static")
+    add_deps("libjuice")
+    add_files("src/macos/macho/*.cpp", "src/macos/abi/*.cpp")
+    add_includedirs("src", {public = true})
+
+-- The macOS frontend's core (loading, binding, calls between guest and
+-- native code): portable, with the host's libraries behind NativeSystem, so
+-- it builds (and its tests run) everywhere.
+target("juice-macos-core")
+    set_kind("static")
+    add_deps("juice-macos-abi", "libjuice")
+    add_files("src/macos/loader/*.cpp", "src/macos/process/*.cpp", "src/macos/objc/*.cpp")
+
+-- Runs macOS ARM64 command-line programs on Windows with a fake libSystem,
+-- to test the macOS core without a Mac (tests/macho).
+target("juice-macos-sim")
+    set_kind("binary")
+    set_default(false)
+    add_deps("juice-macos-core")
+    add_files("tools/macos_sim/*.cpp")
+
+-- Prints what JUICE reads from a Mach-O file (libraries, fixups, exports).
+target("juice-macho-dump")
+    set_kind("binary")
+    set_default(false)
+    add_deps("juice-macos-abi")
+    add_files("tools/macho_dump/macho_dump.cpp")
+
+-- ---------------------------------------------------------------------------
 -- Windows frontend: runs Windows ARM64 .exe programs
 -- ---------------------------------------------------------------------------
 if is_plat("windows") then
@@ -134,6 +168,17 @@ if is_plat("linux") then
         set_kind("binary")
         add_deps("juice-linux")
         add_files("src/linux/main.cpp")
+end
+
+-- ---------------------------------------------------------------------------
+-- macOS frontend: runs macOS ARM64 programs on Intel Macs (the system's own
+-- x86-64 libraries serve them; see src/macos/process/mac_process.hpp).
+-- ---------------------------------------------------------------------------
+if is_plat("macosx") then
+    target("juice")
+        set_kind("binary")
+        add_deps("juice-macos-core")
+        add_files("src/macos/host/*.cpp", "src/macos/main.cpp")
 end
 
 includes("tests")

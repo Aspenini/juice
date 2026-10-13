@@ -1,0 +1,12 @@
+--- !tapi-tbd
+tbd-version:     4
+targets:         [ arm64-macos, x86_64-macos ]
+install-name:    '/usr/lib/libobjc.A.dylib'
+current-version: 228
+exports:
+  - targets:         [ arm64-macos, x86_64-macos ]
+    symbols:         [ _objc_msgSend, _objc_msgSendSuper2, __objc_empty_cache, _objc_retain, _objc_release,
+                       _objc_autorelease, _objc_alloc, _objc_alloc_init, _objc_opt_new, _objc_opt_class,
+                       _objc_opt_self, _objc_autoreleasePoolPush, _objc_autoreleasePoolPop ]
+    objc-classes:    [ NSObject ]
+...

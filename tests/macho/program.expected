@@ -1,0 +1,7 @@
+init 42, argc 2, argv[1] hello
+library 26 11 3.125
+sorted 0.50 -1.25 2.00 3.50 -8.00
+fmt--12-6.5-z
+dlsym 14
+longjmp 7
+goodbye 101
