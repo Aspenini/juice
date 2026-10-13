@@ -85,3 +85,6 @@ __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID clsid, R
 }
 
 __declspec(dllexport) HRESULT STDAPICALLTYPE DllCanUnloadNow(void) { return S_FALSE; }
+
+/* Called through a delay-load import of the program. */
+__declspec(dllexport) int com_ping(void) { return 77; }

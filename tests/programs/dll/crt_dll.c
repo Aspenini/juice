@@ -17,6 +17,36 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+/* Found by native code (crt_dll_native.dll) through GetModuleHandle(NULL). */
+__declspec(dllexport) int exported_from_program(void) { return 99; }
+
+static int callback_value(int v) { return v * 2; }
+static int callback_raise(int v) {
+  (void)v;
+  RaiseException(0xE0000777, 0, 0, NULL);
+  return 0;
+}
+
+/* A native DLL (x64 even in the ARM64 build: native code under JUICE). */
+static void native_dll(void) {
+  HMODULE native = LoadLibraryA("crt_dll_native.dll");
+  printf("native DLL loaded: %d\n", native != NULL);
+  if (!native) return;
+  typedef int (*CatchFn)(int (*)(int), int);
+  typedef int (*MainModuleFn)(wchar_t*, int);
+  CatchFn native_catch = (CatchFn)GetProcAddress(native, "native_catch");
+  MainModuleFn native_main_module = (MainModuleFn)GetProcAddress(native, "native_main_module");
+  printf("native code calling back: %d\n", native_catch(callback_value, 21));
+  printf("exception from the callback, caught by native code: %d\n", native_catch(callback_raise, 0));
+  wchar_t name[64];
+  const int r = native_main_module(name, 64);
+  printf("native code sees the main module as %ls, and its export returns %d\n", name, r);
+}
+
+/* Delay-loaded (linked with /DELAYLOAD): an ARM64 DLL of the program's and a system DLL. */
+__declspec(dllimport) int com_ping(void);
+__declspec(dllimport) DWORD WINAPI GetFileVersionInfoSizeW(LPCWSTR file, LPDWORD handle);
+
 __declspec(dllimport) extern int lib_process_attach;
 __declspec(dllimport) extern int lib_static_load;
 __declspec(dllimport) extern volatile LONG lib_thread_attach;
@@ -285,6 +315,11 @@ int main(void) {
 
   search_paths();
   module_lists(lib);
+
+  native_dll();
+  printf("delay-loaded DLL not loaded yet: %d\n", !is_loaded("crt_dll_com.dll"));
+  printf("delay-loaded guest DLL: %d\n", com_ping());
+  printf("delay-loaded system DLL: %d\n", GetFileVersionInfoSizeW(L"kernel32.dll", NULL) > 0);
   com_server();
   fflush(stdout);
   return 0;

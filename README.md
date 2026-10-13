@@ -48,9 +48,11 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 * **DLLs**: the program's own ARM64 DLLs, imported or loaded with `LoadLibrary(Ex)`, with
   `DllMain`, exports (by name, by ordinal and forwarded), thread-local data and the module
   functions. Windows' DLL search order and its `LoadLibraryEx` flags, `FreeLibrary` that really
-  unloads, module enumeration (psapi, toolhelp), and ARM64 in-process COM servers. JUICE also
+  unloads, delay-loaded imports, module enumeration (psapi, toolhelp), and ARM64 in-process COM
+  servers. Native DLLs work alongside: native code sees the program's modules (for MFC, the
+  native C runtime, COM) and can catch exceptions from the program's callbacks. JUICE also
   loads the ARM64 C++ runtime DLLs (`vcruntime140`, `msvcp140`) as guest code when it can find
-  them.
+  them. A program that isn't ARM64 (x86, x64) runs natively, as Windows on ARM runs those.
 * **Exceptions**: structured exception handling (`__try`/`__except`/`__finally`,
   `RaiseException`, vectored handlers) and C++ exceptions, with the static and dynamic CRT.
   Hardware exceptions reach the program's handlers too: access violations (including
@@ -138,7 +140,8 @@ running before you try it.
 
 Environment variables: `JUICE_DLL_PATH` adds directories to search for ARM64 DLLs (separated
 by `;`, like `--dll-path`). `JUICE_TRACE_EXCEPTIONS=1` logs every host exception with its
-location, including the ones JUICE handles itself (calls from native code into the guest).
+location, including the ones JUICE handles itself (calls from native code into the guest), and
+for C++ exceptions the type and the host call stack.
 
 On Linux:
 
@@ -283,9 +286,10 @@ exits, calls to host code and asynchronous interrupts.
   is unmapped and its own imports are released. `DONT_RESOLVE_DLL_REFERENCES` maps a DLL without
   running `DllMain`.
 * **COM servers.** `CoCreateInstance`, `CoCreateInstanceEx` and `CoGetClassObject` look up a
-  class's `InprocServer32` in the registry. If that is an ARM64 DLL, JUICE loads it as a guest
-  module and gets the class factory from its `DllGetClassObject`. Other classes go to the native
-  COM runtime.
+  class's server: first in the active activation context (registration-free COM: a `comClass`
+  in a manifest, the DLL next to that manifest), then `InprocServer32` in the registry. If that
+  is an ARM64 DLL, JUICE loads it as a guest module and gets the class factory from its
+  `DllGetClassObject`. Other classes go to the native COM runtime.
 * **API calls.** Each import becomes a unique address in a reserved, inaccessible region. When the
   dispatcher reaches one, it calls the native function. A generated x64 trampoline converts the
   ARM64 calling convention to x64, passing X0–X7, D0–D3 and stack arguments. It returns both RAX
@@ -304,7 +308,15 @@ exits, calls to host code and asynchronous interrupts.
   activation context before its imports are bound. This applies side-by-side redirection, such as
   common controls v6 and visual styles, to its imports, the controls it creates and DLLs it
   loads later. The declared DPI awareness (`dpiAwareness`, `dpiAware`, `gdiScaling`) is applied
-  with `SetProcessDpiAwarenessContext`.
+  with `SetProcessDpiAwarenessContext`. A manifest naming ARM64 side-by-side assemblies (common
+  controls with `processorArchitecture="arm64"`) gets the host's amd64 ones instead.
+* **Native code and guest modules.** Native DLLs working for the program (MFC, COM, the shell,
+  the native C runtime) ask the native loader about modules, and it only knows `juice.exe` and
+  the native DLLs. The imports of native modules that resolve to `GetModuleFileName`,
+  `GetModuleHandle(Ex)` and `GetProcAddress` are redirected (now and as more native DLLs load,
+  through `LdrRegisterDllNotification`) to answer for the guest's modules, with NULL meaning
+  the program. `LoadLibrary` also finds native DLLs next to the program, and delay-loaded
+  imports (`ResolveDelayLoadedAPI`) resolve through JUICE.
 * **Process-creation settings.** Windows applies some manifest settings only when it creates a
   process: `activeCodePage` (UTF-8), `longPathAware`, `heapType` (segment heap), the
   `supportedOS`/`maxversiontested` compatibility entries (for example, what `GetVersionEx`
@@ -385,14 +397,15 @@ exits, calls to host code and asynchronous interrupts.
   instruction. `__fastfail` still ends the process, as it does natively, and so does a guest
   stack overflow.
 
-  Native code in between is handled at both ends. An exception that leaves a native function
-  the program called (the native call runs inside `__try`) is raised again in the guest, at
-  the call. An exception raised in a callback is dispatched past the native frames: each
-  nested run of guest code records the guest state that called into native code, and the
-  dispatcher and unwinder continue from its return address. If a handler out there takes
-  the exception, the C++ exception that resumes guest execution unwinds the native frames on
-  its way (the call trampoline has unwind information), running their cleanup. Native
-  handlers in between don't see guest exceptions.
+  Native code in between takes part in both phases, as on Windows. An exception in a native
+  function the program called is offered to the guest's handlers from the exception filter of
+  the call (the native call runs inside `__try`), before anything is unwound; a guest handler
+  that takes it unwinds through the native frames (the call trampoline has unwind
+  information), and otherwise the search goes on in native code. An exception raised in a
+  callback that its guest frames don't handle runs their termination handlers and is raised
+  again in the native code that made the call, whose handlers come next (MFC catches its own
+  exceptions thrown through the program's code this way); calls JUICE itself made into the
+  guest continue the search in the outer guest frames instead.
 * **Diagnostics.** Guest crashes, unsupported instructions, `__fastfail` and unimplemented
   APIs are reported with the guest register state. Crashes inside JUICE itself print a host
   stack trace as `module+offset` (for `llvm-symbolizer --obj=juice.exe`).
@@ -497,7 +510,8 @@ These are next, roughly in the plan's order:
 Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are
 the host thread's, not the guest stack's (`GetCurrentThreadStackLimits` is right), and
 `GetThreadContext` on a thread that never ran guest code fails. A COM server, once used, stays
-loaded.
+loaded. .NET assemblies built for ARM64 (IL-only, but marked ARM64) don't run: the x64 host's
+.NET runtime refuses them, and JUICE doesn't translate .NET code.
 
 The Linux front end comes next: compile and run it on a Linux host, then run the guest tests.
 Known gaps:

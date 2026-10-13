@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 #include "windows/dlls/builtins.hpp"
@@ -127,7 +128,48 @@ uint64_t load_library(GuestProcess& p, const std::wstring& name, DWORD flags) {
     const uint64_t handle = p.load_library(name, flags, guest);
     if (guest) return handle;
   }
+  // A native DLL next to the program: the native loader would look next to
+  // juice.exe (the process's executable) instead.
+  if (name.find_first_of(L"\\/:") == std::wstring::npos) {
+    std::filesystem::path local = std::filesystem::path(p.exe().path).parent_path() / name;
+    if (!local.has_extension()) local += L".dll";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(local, ec)) {
+      const DWORD search = flags & 0x1F00;  // LOAD_LIBRARY_SEARCH_*
+      return reinterpret_cast<uint64_t>(
+          LoadLibraryExW(local.c_str(), nullptr, search ? flags : flags | LOAD_WITH_ALTERED_SEARCH_PATH));
+    }
+  }
   return reinterpret_cast<uint64_t>(LoadLibraryExW(name.c_str(), nullptr, flags));
+}
+
+// ResolveDelayLoadedAPI(parent, descriptor, failure_dll_hook, failure_system_hook, thunk, flags):
+// the delay-load helper of the guest's image resolves an import on its first
+// call. The native function would load and look up through the native loader,
+// which doesn't know the guest image or its ARM64 DLLs.
+uint64_t ResolveDelayLoadedAPI_(GuestProcess& p, CpuState& s) {
+  struct Descriptor {  // IMAGE_DELAYLOAD_DESCRIPTOR (RVA based)
+    uint32_t attributes, dll_name, module_handle, iat, int_, bound_iat, unload_iat, time_date_stamp;
+  };
+  const uint64_t base = s.x[0];
+  const auto* d = ptr<const Descriptor>(s.x[1]);
+  auto* thunk = ptr<uint64_t>(s.x[4]);
+  const char* dll = ptr<const char>(base + d->dll_name);
+  auto* module = ptr<uint64_t>(base + d->module_handle);
+  if (!*module) {
+    *module = load_library(p, ansi_to_wide(dll), 0);
+  }
+  const size_t index = thunk - ptr<uint64_t>(base + d->iat);
+  const uint64_t entry = ptr<const uint64_t>(base + d->int_)[index];
+  const char* name = (entry >> 63) ? reinterpret_cast<const char*>(entry & 0xFFFF)  // by ordinal
+                                   : ptr<const char>(base + (entry & 0x7FFF'FFFF) + 2);  // IMAGE_IMPORT_BY_NAME
+  uint64_t address = *module ? p.get_proc_address(*module, name) : 0;
+  if (!address && s.x[3]) {
+    // The failure hook (DelayLoadFailureHook): it supplies a replacement or raises the error.
+    address = p.call_guest(s.x[3], {reinterpret_cast<uint64_t>(dll), reinterpret_cast<uint64_t>(name)});
+  }
+  if (address) *thunk = address;
+  return address;
 }
 
 uint64_t LoadLibraryA_(GuestProcess& p, CpuState& s) { return load_library(p, ansi_to_wide(ptr<const char>(s.x[0])), 0); }
@@ -301,6 +343,7 @@ constexpr BuiltinExport kKernel32[] = {
     {"GetModuleHandleExA", GetModuleHandleExA_},
     {"GetModuleHandleExW", GetModuleHandleExW_},
     {"GetProcAddress", GetProcAddress_},
+    {"ResolveDelayLoadedAPI", ResolveDelayLoadedAPI_},
     {"LoadLibraryA", LoadLibraryA_},
     {"LoadLibraryW", LoadLibraryW_},
     {"LoadLibraryExA", LoadLibraryExA_},

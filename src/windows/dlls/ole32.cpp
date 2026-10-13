@@ -16,6 +16,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "windows/dlls/builtins.hpp"
 #include "windows/guest_process.hpp"
@@ -45,6 +46,47 @@ std::wstring guid_string(const GUID& g) {
   return s;
 }
 
+// A registration-free class: the server DLL a manifest of the active
+// activation context names for it (a <comClass> of a <file>), in the
+// directory of the assembly that declares it.
+std::wstring manifest_server(const CLSID& clsid) {
+  // The COM server redirection data of the section (as Windows lays it out).
+  struct ComServerRedirection {
+    ULONG size, flags;
+    DWORD threading_model;
+    GUID reference_clsid, configured_clsid, implemented_clsid, type_library;
+    ULONG module_length, module_offset;  // offset from the section base
+  };
+  ACTCTX_SECTION_KEYED_DATA data{};
+  data.cbSize = sizeof(data);
+  if (!FindActCtxSectionGuid(FIND_ACTCTX_SECTION_KEY_RETURN_HACTCTX, nullptr,
+                             ACTIVATION_CONTEXT_SECTION_COM_SERVER_REDIRECTION, &clsid, &data))
+    return {};
+  const auto* r = static_cast<const ComServerRedirection*>(data.lpData);
+  std::wstring module(reinterpret_cast<const wchar_t*>(static_cast<const char*>(data.lpSectionBase) + r->module_offset),
+                      r->module_length / sizeof(wchar_t));
+  std::wstring directory;
+  SIZE_T needed = 0;
+  DWORD index = data.ulAssemblyRosterIndex;
+  QueryActCtxW(0, data.hActCtx, &index, AssemblyDetailedInformationInActivationContext, nullptr, 0, &needed);
+  if (needed) {
+    std::vector<char> buffer(needed);
+    auto* info = reinterpret_cast<ACTIVATION_CONTEXT_ASSEMBLY_DETAILED_INFORMATION*>(buffer.data());
+    // The directory of the assembly's manifest (lpAssemblyDirectoryName is a
+    // side-by-side store name, not a path, for private assemblies too).
+    if (QueryActCtxW(0, data.hActCtx, &index, AssemblyDetailedInformationInActivationContext, info, needed, &needed) &&
+        info->lpAssemblyManifestPath) {
+      const std::wstring manifest(info->lpAssemblyManifestPath, info->ulManifestPathLength / sizeof(wchar_t));
+      const size_t slash = manifest.find_last_of(L"\\/");
+      if (slash != std::wstring::npos) directory = manifest.substr(0, slash);
+    }
+  }
+  ReleaseActCtx(data.hActCtx);
+  if (module.empty()) return {};
+  if (!directory.empty() && directory.back() != L'\\') directory += L'\\';
+  return directory + module;  // (no directory: found on the search path, next to the program first)
+}
+
 // The class's in-process server DLL, from the registry (environment variables expanded).
 std::wstring inproc_server(const CLSID& clsid) {
   const std::wstring key = L"CLSID\\" + guid_string(clsid) + L"\\InprocServer32";
@@ -60,7 +102,9 @@ std::wstring inproc_server(const CLSID& clsid) {
 // A server stays loaded once used (as with COM, until CoFreeUnusedLibraries).
 uint64_t guest_class_object_entry(GuestProcess& p, const CLSID& clsid, uint32_t context) {
   if (!(context & (CLSCTX_INPROC_SERVER | CLSCTX_INPROC_HANDLER))) return 0;
-  const std::wstring server = inproc_server(clsid);
+  // Manifests (registration-free COM) come first, as for the native COM runtime.
+  std::wstring server = manifest_server(clsid);
+  if (server.empty()) server = inproc_server(clsid);
   if (server.empty()) return 0;
   static std::mutex mutex;
   static std::set<uint64_t> loaded;

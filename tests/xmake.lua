@@ -324,7 +324,14 @@ target("juice-guest-tests")
                                 {"/LD", "/link", deplib .. ".lib"}),
                         compile(path.join(dll_src, "crt_dll_com.c"), path.join(dir, "crt_dll_com.dll"),
                                 {"/LD", "/link", "ole32.lib", "uuid.lib"}),
-                        compile(path.join(dll_src, "crt_dll.c"), exe, {"/link", lib .. ".lib"})}})
+                        -- always x64: native code next to the ARM64 program
+                        table.join({"--target=x86_64-pc-windows-msvc"}, crt_cflags, no_exceptions,
+                                   {"/MT", path.join(dll_src, "crt_dll_native.c"),
+                                    "/Fo" .. path.join(dir, "crt_dll_native.obj"),
+                                    "/Fe" .. path.join(dir, "crt_dll_native.dll"), "/LD"}),
+                        compile(path.join(dll_src, "crt_dll.c"), exe,
+                                {"/link", lib .. ".lib", path.join(dir, "crt_dll_com.lib"), "version.lib",
+                                 "delayimp.lib", "/DELAYLOAD:crt_dll_com.dll", "/DELAYLOAD:version.dll"})}})
                 end
                 for _, mode in ipairs({"jit", "interp"}) do
                     add_guest_test("crt_dll", rt, mode, {guest = exes.arm64, reference = exes.x64})
@@ -451,6 +458,10 @@ target("juice-sdk-tests")
             makepri = {"makepri", {"createconfig", "/cf", "priconfig.xml", "/dq", "en-US", "/o"}},
             signtool = {"signtool", {"verify", "/pa", "/v", path.join(bin, "x64", "rc.exe")}},
             uuidgen_help = {"uuidgen", {"/?"}},
+            tracewpp = {"tracewpp", {"-cfgdir:" .. path.join(kits, "bin", version, "WppConfig", "Rev1"), "-odir:.",
+                                     "trace.c"}},
+            -- registration-free COM: AppxPackaging.dll and OpcServices.dll (ARM64) next to the tool
+            makeappx = {"makeappx", {"pack", "/d", "pkg", "/p", "out.msix", "/nv", "/o"}},
         }
         if winmd then
             tests.winmdidl = {"winmdidl", {"/nologo", "/outdir:.", winmd}}
