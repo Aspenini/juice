@@ -9,12 +9,15 @@
 #include <stdlib.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
+#include <unwind.h>
 
 #include <cstdio>
 #include <cstring>
 #include <format>
 #include <mutex>
 #include <unordered_map>
+
+#include "macos/abi/trampolines.hpp"
 
 namespace juice::mac {
 
@@ -81,6 +84,34 @@ bool MacNativeSystem::read_memory(uint64_t addr, void* out, size_t size) {
              KERN_SUCCESS &&
          got == size;
 }
+
+void MacNativeSystem::raise_exception(uint64_t exception) {
+  // Returns only if nothing handles it.
+  _Unwind_RaiseException(reinterpret_cast<_Unwind_Exception*>(exception));
+}
+
+namespace {
+
+// The call trampoline's personality: an exception unwinding a native call the
+// guest made lands at the trampoline (its search phase always finds this
+// "handler"); JUICE then looks through the guest's frames and raises it again
+// if they don't handle it. Forced unwinds (thread cancellation) pass.
+_Unwind_Reason_Code call_personality(int version, _Unwind_Action actions, uint64_t exception_class,
+                                     _Unwind_Exception* exception, _Unwind_Context* context) {
+  (void)version, (void)exception_class;
+  if (actions & _UA_FORCE_UNWIND) return _URC_CONTINUE_UNWIND;
+  if (actions & _UA_SEARCH_PHASE) return _URC_HANDLER_FOUND;
+  if (actions & _UA_HANDLER_FRAME) {
+    _Unwind_SetGR(context, 0 /* RAX */, reinterpret_cast<uintptr_t>(exception));
+    _Unwind_SetIP(context, reinterpret_cast<uintptr_t>(call_landing_pad()));
+    return _URC_INSTALL_CONTEXT;
+  }
+  return _URC_CONTINUE_UNWIND;
+}
+
+}  // namespace
+
+void install_exception_support() { set_call_personality(reinterpret_cast<void*>(&call_personality)); }
 
 namespace {
 

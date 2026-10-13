@@ -524,6 +524,29 @@ on Windows (see Tests). The macOS-only part has **not yet been compiled or run o
   memory. Variadic methods have their own handling: `stringWithFormat:`, `initWithFormat:`,
   `appendFormat:`, `predicateWithFormat:` and nil-terminated object lists. The ARM64-only
   `objc_retain_xN` and `objc_release_xN` helpers are provided.
+* **Swift** (`src/macos/objc/swift_bridge.cpp`). The Swift runtime only learns about images
+  from dyld, so JUICE hands it each guest image's protocols, type metadata records and
+  conformances (`swift_registerProtocols`, `swift_registerTypeMetadataRecords`,
+  `swift_registerProtocolConformances`). Swift classes that are also Objective-C classes are
+  then found through the Swift runtime's own `objc_getClass` hook. Swift's calling convention
+  maps register for register.
+* **C++ and Objective-C exceptions** (`src/macos/eh`). Throwing (`throw`, `@throw`, rethrow) is
+  the system's libc++abi and libobjc. An exception that unwinds a native call the program made
+  lands at the call trampoline: its unwind information names a JUICE personality, which claims
+  every exception. JUICE then does for the program's ARM64 frames what the native unwinder
+  can't:
+  * it reads their compact unwind information (`__unwind_info`, frame and frameless modes) or
+    DWARF CFI (`__eh_frame`);
+  * it searches their LSDAs as the C++ and Objective-C personalities do, matching catch types
+    with the type_info's own `can_catch` (`@catch` included);
+  * it enters cleanups (their `_Unwind_Resume` is JUICE's) and then the handler.
+
+  If no handler is in this call level, the exception is raised again natively from JUICE, so
+  native code further out and outer guest levels see it. If nothing handles it, it ends in
+  `std::terminate` with the exception caught, so the system prints its usual message.
+* **App bundles.** `juice Foo.app` runs the bundle's executable. CoreFoundation finds the main
+  bundle (`NSBundle.mainBundle`, resources, `Info.plist`) through `CFProcessPath`, which is set
+  to the program and removed once the main bundle is known, so child processes don't inherit it.
 * **JUICE's own functions.**
   * `dlopen`, `dlsym`, `dladdr` and `dlerror`, which know the guest's images;
   * dyld's image list (`_dyld_image_count`, `_dyld_get_image_header`,
@@ -534,10 +557,10 @@ on Windows (see Tests). The macOS-only part has **not yet been compiled or run o
 
   Native libraries also see the program's `argc`, `argv` and name.
 * **Not yet:**
-  * C++ exceptions through guest frames (they need an ARM64 unwinder and personality);
-  * Swift classes (they are left to the Swift runtime, which doesn't see guest images yet);
   * signals delivered to guest handlers;
-  * app bundles: `NSBundle` and `CFBundle` resolve the main bundle from `juice`'s own path;
+  * guest-defined personality routines (other languages' exceptions);
+  * the type names of non-unique RTTI: ARM64 code tags them with the pointer's top bit, which
+    the x86-64 runtime doesn't know about. Type identity within one image is unaffected;
   * C functions that take structures by value, such as `CGContextFillRect`, need types that
     don't exist yet: a table generated from the macOS SDK, as `tools/gen_signatures` does for
     Windows.
@@ -572,9 +595,11 @@ on Windows (see Tests). The macOS-only part has **not yet been compiled or run o
   * On Windows, `juice-macos-sim` runs the programs with a fake libSystem and Objective-C runtime
     made of System V functions, exercising the macOS core end to end: loading and binding,
     initializers, thread-local variables, variadic calls, callbacks from native code through
-    the fault path, `dlsym`, `setjmp`, a guest library found through `@rpath`, and Objective-C
-    classes, categories and `+load`, with methods called both ways. Outputs must match
-    `*.expected`.
+    the fault path, `dlsym`, `setjmp`, a guest library found through `@rpath`, Objective-C
+    classes, categories and `+load` with methods called both ways, and C++ exceptions. The
+    exception cases are: catch by value and by base class, destructors on the way, rethrow, and
+    exceptions crossing native code both ways (a fake libc++abi throws them as C++ exceptions
+    through the trampolines' Win64 unwind information). Outputs must match `*.expected`.
 * `tests/sdk`: inputs for the Windows SDK tools. If the SDK's ARM64 tools are installed, each
   tool runs as ARM64 under JUICE and as x64 natively, in the same directory. The exit code,
   console output and every file written must match.

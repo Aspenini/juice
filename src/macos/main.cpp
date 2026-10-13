@@ -1,6 +1,8 @@
 // juice - run macOS ARM64 programs on Intel Macs.
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -15,6 +17,7 @@
 #include "macos/host/native_system.hpp"
 #include "macos/macho/macho_file.hpp"
 #include "macos/objc/objc_bridge.hpp"
+#include "macos/objc/swift_bridge.hpp"
 #include "macos/process/mac_process.hpp"
 
 extern char** environ;
@@ -78,6 +81,27 @@ bool runs_natively(const std::string& path) {
   return x86_64 || !arm64;
 }
 
+// The executable of an application bundle (Foo.app), or `path` itself.
+std::string bundle_executable(const std::string& path) {
+  struct stat st{};
+  if (stat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) return path;
+  std::string result = path;
+  CFURLRef url = CFURLCreateFromFileSystemRepresentation(nullptr, reinterpret_cast<const UInt8*>(path.data()),
+                                                         static_cast<CFIndex>(path.size()), true);
+  if (!url) return path;
+  if (CFBundleRef bundle = CFBundleCreate(nullptr, url)) {
+    if (CFURLRef exe = CFBundleCopyExecutableURL(bundle)) {
+      char buffer[4096];
+      if (CFURLGetFileSystemRepresentation(exe, true, reinterpret_cast<UInt8*>(buffer), sizeof(buffer)))
+        result = buffer;
+      CFRelease(exe);
+    }
+    CFRelease(bundle);
+  }
+  CFRelease(url);
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -124,10 +148,14 @@ int main(int argc, char** argv) {
     usage();
     return 2;
   }
-  const std::string program = argv[i];
+  // An application bundle runs its executable.
+  const std::string program = bundle_executable(argv[i]);
   if (runs_natively(program)) {
     // As macOS itself would: an Intel program needs no translation.
-    execv(program.c_str(), argv + i);
+    std::vector<char*> native_argv(argv + i, argv + argc);
+    native_argv[0] = const_cast<char*>(program.c_str());
+    native_argv.push_back(nullptr);
+    execv(program.c_str(), native_argv.data());
     std::perror(("juice: " + program).c_str());
     return 1;
   }
@@ -135,8 +163,17 @@ int main(int argc, char** argv) {
   std::vector<std::string> environment;
   for (char** e = environ; e && *e; ++e) environment.emplace_back(*e);
 
+  // The system's frameworks find the main bundle (resources, Info.plist)
+  // from the process's path, which is juice's: CoreFoundation takes it from
+  // CFProcessPath instead when set. It's read once, the first time it's needed.
+  char resolved[PATH_MAX];
+  const std::string program_path = realpath(program.c_str(), resolved) ? std::string(resolved) : program;
+  setenv("CFProcessPath", program_path.c_str(), 1);
+
   static juice::mac::MacNativeSystem system;
+  juice::mac::install_exception_support();
   auto process = std::make_unique<juice::mac::MacProcess>(options, system);
+  juice::mac::install_fault_handler(*process);
   // Objective-C: the program's classes on the system's runtime.
   dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY | RTLD_GLOBAL);
   static juice::mac::ObjcRuntime objc;
@@ -145,12 +182,16 @@ int main(int argc, char** argv) {
     bridge = std::make_unique<juice::mac::ObjcBridge>(*process, objc);
     bridge->install();
   }
+  juice::mac::SwiftBridge swift(*process);
+  swift.install();
   if (auto loaded = process->load(program, std::vector<std::string>(argv + i + 1, argv + argc), environment); !loaded) {
     std::fprintf(stderr, "juice: %s\n", loaded.error().c_str());
     return 1;
   }
-  juice::mac::install_fault_handler(*process);
   juice::mac::set_native_arguments(*process);
+  // Fix the main bundle now, then keep CFProcessPath from the program's child processes.
+  CFBundleGetMainBundle();
+  unsetenv("CFProcessPath");
   const int code = process->run();
   // exit() runs the atexit handlers (the program's too: native code calls them).
   std::exit(code);

@@ -42,6 +42,7 @@
 #include "macos/abi/call_convert.hpp"
 #include "macos/abi/ctype.hpp"
 #include "macos/abi/trampolines.hpp"
+#include "macos/eh/guest_exceptions.hpp"
 #include "macos/loader/guest_image.hpp"
 #include "runtime/engine.hpp"
 
@@ -70,6 +71,9 @@ class NativeSystem {
     (void)addr, (void)out, (void)size;
     return false;
   }
+  // Raises an exception (an _Unwind_Exception) natively from here, for the
+  // native code that called the guest; returns if nothing handles it.
+  virtual void raise_exception(uint64_t exception) { (void)exception; }
 };
 
 struct MacOptions {
@@ -180,6 +184,7 @@ class MacProcess final : public runtime::Environment {
 
   const MacOptions& options() const { return options_; }
   NativeSystem& native() { return native_; }
+  GuestExceptions& exceptions() { return *exceptions_; }
   runtime::Engine& engine() { return *engine_; }
 
   // Program information
@@ -229,6 +234,7 @@ class MacProcess final : public runtime::Environment {
   MacOptions options_;
   NativeSystem& native_;
   std::unique_ptr<runtime::Engine> engine_;
+  std::unique_ptr<GuestExceptions> exceptions_;
   void* entry_ = nullptr;
 
   mutable std::shared_mutex images_mutex_;

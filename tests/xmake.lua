@@ -50,6 +50,8 @@ target("juice-macho-tests")
                 fixture = {source = "fixture.c", expected = "fixture.expected", code = 0, args = {}},
                 program = {source = "program.c", library = "library2.c", expected = "program.expected", code = 3,
                            args = {"hello"}},
+                exceptions = {source = "exceptions.cpp", expected = "exceptions.expected", code = 0, args = {},
+                              libs = {"libcxx.tbd"}},
                 objc = {source = "objc.m", expected = "objc.expected", code = 0, args = {}, libs = {"libobjc.tbd"},
                         flags = {"-fobjc-runtime=macosx-11.0", "-fno-objc-arc",
                                  "-fno-objc-convert-messages-to-runtime-calls"}},

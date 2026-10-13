@@ -278,6 +278,9 @@ void longjmp_(MacProcess&, arm64::CpuState& s) { restore_context(s); }
 
 void stub_binder(MacProcess& p, arm64::CpuState& s) { p.fatal("dyld_stub_binder called (lazy binding)", &s); }
 
+// _Unwind_Resume(exception): a cleanup is done, the unwinding goes on.
+void unwind_resume(MacProcess& p, arm64::CpuState& s) { p.exceptions().resume(s); }
+
 }  // namespace
 
 void MacProcess::add_va_builtin(std::string name, const char* va_name, unsigned fixed, bool from_va_list) {
@@ -338,6 +341,7 @@ void MacProcess::register_builtins() {
   for (const char* name : {"_setjmp", "__setjmp", "_sigsetjmp"}) add_builtin(name, setjmp_);
   for (const char* name : {"_longjmp", "__longjmp", "_siglongjmp"}) add_builtin(name, longjmp_);
   add_builtin("dyld_stub_binder", stub_binder);
+  add_builtin("__Unwind_Resume", unwind_resume);
 
   // Variadic functions: name, va_list form, fixed arguments.
   struct Va {

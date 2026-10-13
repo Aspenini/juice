@@ -77,7 +77,7 @@ target("juice-linux-abi")
 target("juice-macos-abi")
     set_kind("static")
     add_deps("libjuice")
-    add_files("src/macos/macho/*.cpp", "src/macos/abi/*.cpp")
+    add_files("src/macos/macho/*.cpp", "src/macos/abi/*.cpp", "src/macos/eh/guest_unwind.cpp")
     add_includedirs("src", {public = true})
 
 -- The macOS frontend's core (loading, binding, calls between guest and
@@ -86,7 +86,8 @@ target("juice-macos-abi")
 target("juice-macos-core")
     set_kind("static")
     add_deps("juice-macos-abi", "libjuice")
-    add_files("src/macos/loader/*.cpp", "src/macos/process/*.cpp", "src/macos/objc/*.cpp")
+    add_files("src/macos/loader/*.cpp", "src/macos/process/*.cpp", "src/macos/objc/*.cpp",
+              "src/macos/eh/guest_exceptions.cpp")
 
 -- Runs macOS ARM64 command-line programs on Windows with a fake libSystem,
 -- to test the macOS core without a Mac (tests/macho).
@@ -179,6 +180,7 @@ if is_plat("macosx") then
         set_kind("binary")
         add_deps("juice-macos-core")
         add_files("src/macos/host/*.cpp", "src/macos/main.cpp")
+        add_frameworks("CoreFoundation")
 end
 
 includes("tests")

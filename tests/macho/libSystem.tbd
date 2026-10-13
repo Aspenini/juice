@@ -9,5 +9,6 @@ exports:
                        ___stack_chk_guard, ___stack_chk_fail, __tlv_bootstrap, dyld_stub_binder,
                        _environ, _optional_function, __Unwind_Resume, ___cxa_atexit,
                        _snprintf, _setjmp, _longjmp, _dlopen, _dlsym, _dlclose, _dlerror, _dladdr,
-                       _vprintf, _vsnprintf, _putchar, _calloc, _realloc, _strcmp, _memcpy, _memset, _sqrt ]
+                       _vprintf, _vsnprintf, _putchar, _calloc, _realloc, _strcmp, _memcpy, _memset, _sqrt,
+                       _call_back, _call_catching ]
 ...

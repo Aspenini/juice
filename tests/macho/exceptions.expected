@@ -1,0 +1,22 @@
+~thrower
+int 42
+~thrower
+~middle
+base 2
+~thrower
+rethrow
+again 42
+~thrower
+double 1.5
+~thrower
+~middle
+through native 42
+~thrower
+~middle
+caught natively -1
+no throw
+~thrower
+no exception 0
+~thrower
+~outer
+after outer

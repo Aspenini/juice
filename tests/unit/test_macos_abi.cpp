@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "macos/eh/guest_unwind.hpp"
 #include "macos/macho/exports.hpp"
 #include "macos/macho/fixups.hpp"
 #include "macos/macho/macho_file.hpp"
@@ -228,4 +229,94 @@ TEST(macho_names) {
   CHECK(mac::dylib_short_name("@rpath/Sparkle.framework/Sparkle") == "Sparkle");
   CHECK(mac::version_string(0x000D0400) == "13.4");
   CHECK(mac::version_string(0x000E0201) == "14.2.1");
+}
+
+// Guest unwinding: DWARF CFI (a CIE and FDE as clang emits them for an
+// ARM64 frame) and compact unwind's frame and frameless modes, on a made-up stack.
+TEST(macos_unwind_steps) {
+  alignas(16) uint64_t stack[16] = {};
+  const auto base = reinterpret_cast<uint64_t>(stack);
+  const mac::MemoryReader read = [](uint64_t addr, void* out, size_t size) {
+    std::memcpy(out, reinterpret_cast<const void*>(addr), size);
+    return true;
+  };
+  // The callee's frame at stack[4..]: x20, x19 below {fp, lr}.
+  stack[4] = 0x2020;  // x20 (fp - 16)
+  stack[5] = 0x1919;  // x19 (fp - 8)
+  stack[6] = 0xF00D;  // saved fp
+  stack[7] = 0x1234;  // lr
+  mac::GuestFrame start;
+  start.sp = base + 4 * 8;
+  start.x[29] = base + 6 * 8;
+  start.pc = 0x1000 + 20;  // inside the function, after its prologue
+
+  // Compact unwind, frame mode with the X19/X20 pair.
+  mac::FrameUnwindInfo compact;
+  compact.encoding = 0x04000001;
+  mac::GuestFrame f = start;
+  CHECK(mac::step_frame(f, compact, read));
+  CHECK_EQ(f.x[19], 0x1919);
+  CHECK_EQ(f.x[20], 0x2020);
+  CHECK_EQ(f.x[29], 0xF00D);
+  CHECK_EQ(f.pc, 0x1234);
+  CHECK_EQ(f.sp, base + 8 * 8);
+
+  // Frameless: 32 bytes of stack with X19/X20 at its top; the return address in LR.
+  mac::FrameUnwindInfo frameless;
+  frameless.encoding = 0x02000000 | (2 << 12) | 0x001;
+  f = start;
+  f.sp = base + 2 * 8;  // the frame is stack[2..5]
+  f.x[30] = 0x5555;
+  CHECK(mac::step_frame(f, frameless, read));
+  CHECK_EQ(f.x[19], 0x1919);  // at sp + 32 - 8
+  CHECK_EQ(f.x[20], 0x2020);
+  CHECK_EQ(f.sp, base + 6 * 8);
+  CHECK_EQ(f.pc, 0x5555);
+
+  // DWARF: stp x29, x30, [sp, #-16]!; mov x29, sp; stp x20, x19, [sp, #-16]!
+  std::vector<uint8_t> eh = {
+      // CIE: length 16, id 0, version 1, "zR", code align 1, data align -8, ra x30,
+      // augmentation: absolute FDE pointers; def_cfa sp + 0.
+      16, 0, 0, 0, 0, 0, 0, 0, 1, 'z', 'R', 0, 1, 0x78, 30, 1, 0x00, 0x0C, 31, 0,
+  };
+  const size_t fde = eh.size();
+  std::vector<uint8_t> body = {static_cast<uint8_t>(fde + 4), 0, 0, 0};  // back to the CIE
+  for (int k = 0; k < 8; ++k) body.push_back(static_cast<uint8_t>(uint64_t{0x1000} >> (8 * k)));  // pc_begin
+  for (int k = 0; k < 8; ++k) body.push_back(k == 0 ? 0x40 : 0);                                // pc_range
+  body.push_back(0);  // augmentation data length
+  const uint8_t program[] = {
+      0x44, 0x0E, 16, 0x9E, 1, 0x9D, 2,  // +4: CFA = sp + 16; x30 at CFA-8, x29 at CFA-16
+      0x44, 0x0D, 29,                    // +4: CFA = x29 + 16
+      0x44, 0x93, 3, 0x94, 4,            // +4: x19 at CFA-24, x20 at CFA-32
+  };
+  body.insert(body.end(), program, program + sizeof(program));
+  while ((body.size() + 4) % 8) body.push_back(0);
+  eh.push_back(static_cast<uint8_t>(body.size()));
+  eh.insert(eh.end(), {0, 0, 0});
+  eh.insert(eh.end(), body.begin(), body.end());
+  eh.insert(eh.end(), {0, 0, 0, 0});
+
+  mac::UnwindSections sections;
+  sections.eh_frame = reinterpret_cast<uint64_t>(eh.data());
+  sections.eh_frame_size = eh.size();
+  mac::FrameUnwindInfo dwarf;
+  CHECK(mac::find_unwind_info(sections, 0x1000 + 19, dwarf, read));
+  CHECK(dwarf.dwarf);
+  CHECK_EQ(dwarf.start, 0x1000);
+  CHECK_EQ(dwarf.end, 0x1040);
+  f = start;
+  CHECK(mac::step_frame(f, dwarf, read));
+  CHECK_EQ(f.x[19], 0x1919);
+  CHECK_EQ(f.x[20], 0x2020);
+  CHECK_EQ(f.x[29], 0xF00D);
+  CHECK_EQ(f.pc, 0x1234);
+  CHECK_EQ(f.sp, base + 8 * 8);
+  // Inside the prologue (after the first store only): CFA = sp + 16, nothing else saved yet.
+  f = start;
+  f.sp = base + 6 * 8;
+  f.pc = 0x1000 + 5;  // (return addresses are looked up at pc - 1)
+  CHECK(mac::step_frame(f, dwarf, read));
+  CHECK_EQ(f.pc, 0x1234);
+  CHECK_EQ(f.sp, base + 8 * 8);
+  CHECK_EQ(f.x[19], 0);
 }

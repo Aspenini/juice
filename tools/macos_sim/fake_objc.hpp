@@ -24,4 +24,7 @@ std::vector<FakeSymbol> fake_objc_symbols();
 // The runtime functions the bridge calls.
 juice::mac::ObjcRuntime fake_objc_runtime();
 
+// The C++ ABI (fake_cxxabi.cpp): exceptions, type_info vtables, operator new.
+std::vector<FakeSymbol> fake_cxxabi_symbols();
+
 }  // namespace juice::sim

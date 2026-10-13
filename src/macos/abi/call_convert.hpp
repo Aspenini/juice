@@ -58,6 +58,7 @@ struct HostResult {
   Vec128 xmm[4];
   uint8_t st0[16] = {};  // x87 80-bit value (long double results)
   uint64_t r12 = 0;      // Swift error
+  uint64_t exception = 0;  // the exception that unwound the call instead (its _Unwind_Exception)
 };
 
 // The x86-64 arguments a native caller passed (callbacks into the guest):

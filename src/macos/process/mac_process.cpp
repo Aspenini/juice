@@ -86,6 +86,7 @@ MacProcess::MacProcess(MacOptions options, NativeSystem& native) : options_(std:
   builtins_[0].name = "<return>";
   builtin_count_.store(1, std::memory_order_release);
   engine_ = std::make_unique<runtime::Engine>(*this, options_.engine);
+  exceptions_ = std::make_unique<GuestExceptions>(*this);
   entry_ = native_entry(&entry_handler);
   register_builtins();
 }
@@ -584,6 +585,7 @@ void MacProcess::call_native_function(uint64_t fn, arm64::CpuState& s, const Fun
     generic_args_to_host(s, call);
   }
   call_native(reinterpret_cast<void*>(fn), call, result, type && type->ret.kind == CType::Kind::LongDouble);
+  if (result.exception) exceptions_->native_exception(result.exception);  // (doesn't return)
   if (type) host_result_to_guest(*type, call, result, s);
   else generic_result_to_guest(result, s);
 }
@@ -653,13 +655,20 @@ runtime::Action MacProcess::on_host_address(arm64::CpuState& s) {
     const Builtin& b = builtins_[index];
     if (b.missing) fatal(std::format("call of a missing function: {}", b.name.substr(9)), &s);
     s.pc = s.x[30];
-    if (b.native) call_va_builtin(b, s);
-    else b.fn(*this, s);
+    try {
+      if (b.native) call_va_builtin(b, s);
+      else b.fn(*this, s);
+    } catch (const GuestLanding&) {
+      // An exception continues the guest at a landing pad (the state is set).
+    }
     return runtime::Action::Continue;
   }
   // Native code: call it, then return to the guest's link register.
-  call_native_function(pc, s);
-  s.pc = s.x[30];
+  try {
+    call_native_function(pc, s);
+    s.pc = s.x[30];
+  } catch (const GuestLanding&) {
+  }
   return runtime::Action::Continue;
 }
 

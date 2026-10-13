@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "fake_objc.hpp"
+#include "macos/abi/trampolines.hpp"
 #include "macos/objc/objc_bridge.hpp"
 #include "macos/process/mac_process.hpp"
 
@@ -119,6 +120,7 @@ std::map<std::string, Symbol> make_symbols() {
       {"environ", {&g_environ, false}},
   };
   for (const juice::sim::FakeSymbol& s : juice::sim::fake_objc_symbols()) table[s.name] = {s.address, s.code};
+  for (const juice::sim::FakeSymbol& s : juice::sim::fake_cxxabi_symbols()) table[s.name] = {s.address, s.code};
   return table;
 }
 
@@ -135,6 +137,8 @@ class FakeSystem final : public juice::mac::NativeSystem {
       return &library_;
     return nullptr;
   }
+  // (in place of the host's unwinder: the fake C++ runtime's exceptions are C++ exceptions)
+  void raise_exception(uint64_t exception) override { throw juice::mac::NativeException{exception}; }
   bool read_memory(uint64_t addr, void* out, size_t size) override {
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(addr), out, size, &got) && got == size;

@@ -18,7 +18,12 @@ class MacNativeSystem final : public NativeSystem {
   bool is_native_code(uint64_t addr) override;
   std::string describe(uint64_t addr) override;
   bool read_memory(uint64_t addr, void* out, size_t size) override;
+  void raise_exception(uint64_t exception) override;
 };
+
+// Exceptions unwinding native calls the guest made come to JUICE (the call
+// trampoline's personality); call before the process makes native calls.
+void install_exception_support();
 
 // Installs the SIGBUS/SIGSEGV handler: an instruction fetch from guest code
 // (native code calling a guest function) continues at process.entry() with

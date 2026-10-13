@@ -20,8 +20,21 @@
 namespace juice::mac {
 
 // Calls `fn` (a System V function). `x87_result`: the function returns a
-// long double (in ST0).
+// long double (in ST0). If an exception unwinds the call, result.exception
+// is the exception (its _Unwind_Exception) and the other results are unset.
 void call_native(void* fn, HostCall& call, HostResult& result, bool x87_result = false);
+
+// The personality routine of the call trampoline's unwind information (the
+// host sets it before the first call): it sends exceptions unwinding a
+// native call to call_landing_pad(), with the exception in RAX.
+void set_call_personality(void* personality);
+void* call_landing_pad();
+
+// What native code throws in the Windows tests (in place of an exception
+// the host's unwinder brings to the landing pad): an _Unwind_Exception's address.
+struct NativeException {
+  uint64_t object;
+};
 
 // What native_entry() gives its handler.
 struct EntryFrame {
