@@ -24,14 +24,18 @@ int main(int argc, char** argv) {
   const char text[] = "hello, file\n";
   printf("write=%zd\n", write(fd, text, sizeof(text) - 1));
   printf("lseek=%ld\n", (long)lseek(fd, 7, SEEK_SET));
+  // (Each call before the printf that shows its results: argument evaluation order is unspecified.)
   char buf[64] = {0};
-  printf("read=%zd '%s'\n", read(fd, buf, sizeof(buf) - 1), buf);
+  const ssize_t got = read(fd, buf, sizeof(buf) - 1);
+  printf("read=%zd '%s'\n", got, buf);
 
   struct stat st;
-  printf("fstat=%d size=%ld mode=%o regular=%d\n", fstat(fd, &st), (long)st.st_size, st.st_mode & 0777,
-         S_ISREG(st.st_mode));
-  printf("stat=%d nlink=%lu\n", stat(path, &st), (unsigned long)st.st_nlink);
-  printf("lstat dir=%d isdir=%d\n", lstat(dir, &st), S_ISDIR(st.st_mode));
+  int r = fstat(fd, &st);
+  printf("fstat=%d size=%ld mode=%o regular=%d\n", r, (long)st.st_size, st.st_mode & 0777, S_ISREG(st.st_mode));
+  r = stat(path, &st);
+  printf("stat=%d nlink=%lu\n", r, (unsigned long)st.st_nlink);
+  r = lstat(dir, &st);
+  printf("lstat dir=%d isdir=%d\n", r, S_ISDIR(st.st_mode));
 
   // Flags with different values on x86-64.
   int flags = fcntl(fd, F_GETFL);
@@ -40,13 +44,15 @@ int main(int argc, char** argv) {
   close(fd);
   int dfd = open(dir, O_RDONLY | O_DIRECTORY);
   printf("O_DIRECTORY on dir=%d\n", dfd >= 0);
-  printf("O_DIRECTORY on file=%d ENOTDIR=%d\n", open(path, O_RDONLY | O_DIRECTORY), errno == ENOTDIR);
+  r = open(path, O_RDONLY | O_DIRECTORY);
+  printf("O_DIRECTORY on file=%d ENOTDIR=%d\n", r, errno == ENOTDIR);
   printf("fstatat=%d\n", fstatat(dfd, "data.txt", &st, 0) == 0 && st.st_size == 12);
   close(dfd);
   char linkpath[256];
   snprintf(linkpath, sizeof(linkpath), "%s/link", dir);
   printf("symlink=%d\n", symlink(path, linkpath));
-  printf("O_NOFOLLOW=%d ELOOP=%d\n", open(linkpath, O_RDONLY | O_NOFOLLOW), errno == ELOOP);
+  r = open(linkpath, O_RDONLY | O_NOFOLLOW);
+  printf("O_NOFOLLOW=%d ELOOP=%d\n", r, errno == ELOOP);
 
   DIR* d = opendir(dir);
   int entries = 0;

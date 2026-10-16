@@ -72,6 +72,12 @@ void interpret(const Block& block, uint64_t* state, const StateLayout& layout, v
       case Opcode::StateOp:
         execute_state_op(in, state);
         break;
+      case Opcode::ExitIf:
+        if (arg(in, 0)) {
+          state[layout.pc_slot] = in.imm;
+          return;
+        }
+        break;
       case Opcode::AtomicRmw:
       case Opcode::AtomicCas:
       case Opcode::AtomicCasPair:

@@ -752,6 +752,62 @@ TEST(translate_conditional_branches) {
   }
 }
 
+// Side exits: a loop with two forward exits and a back edge (one block, its
+// registers kept in host registers), where one exit's target reads the flags
+// the exit leaves - checked against the expected values, in every mode.
+TEST(translate_side_exits_in_loops) {
+  const std::vector<uint32_t> code = {
+      0xF1000463,  // 0: loop: subs x3, x3, #1
+      0x540000A0,  // 1:   b.eq done
+      0x8B000042,  // 2:   add x2, x2, x0
+      0xEB04005F,  // 3:   cmp x2, x4
+      0x54000088,  // 4:   b.hi big
+      0x17FFFFFB,  // 5:   b loop
+      0x9A9F17E5,  // 6: done: cset x5, eq (reads the flags of the subs)
+      kBrk0,       // 7
+      0xD28000E6,  // 8: big: movz x6, #7
+      kBrk0,       // 9
+  };
+  for (uint64_t n : {1u, 2u, 5u, 100u}) {
+    for (uint64_t step : {1u, 3u}) {
+      for (uint64_t limit : {0u, 10u, 1000u}) {
+        // The expected run.
+        uint64_t x2 = 0, x3 = n, x5 = 0, x6 = 0;
+        for (;;) {
+          --x3;
+          if (x3 == 0) {
+            x5 = 1;
+            break;
+          }
+          x2 += step;
+          if (x2 > limit) {
+            x6 = 7;
+            break;
+          }
+        }
+        for (const Config& cfg : configs()) {
+          TestEnv env(code);
+          runtime::Engine engine(env, cfg.options);
+          for (int round = 0; round < 2; ++round) {  // (the second run goes through linked blocks)
+            CpuState s{};
+            s.x[0] = step;
+            s.x[3] = n;
+            s.x[4] = limit;
+            s.pc = kCodeBase;
+            engine.run(s);
+            if (s.x[2] != x2 || s.x[3] != x3 || s.x[5] != x5 || s.x[6] != x6) {
+              test::fail(__FILE__, __LINE__,
+                         std::format("n {} step {} limit {} ({}): x2 {} x3 {} x5 {} x6 {}, expected {} {} {} {}", n,
+                                     step, limit, cfg.name, s.x[2], s.x[3], s.x[5], s.x[6], x2, x3, x5, x6));
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 // The flags lookahead: dead only if straight-line code sets them before
 // anything reads them or leaves the straight line.
 TEST(flags_liveness_lookahead) {

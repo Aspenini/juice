@@ -6,9 +6,9 @@ executable memory. Three front ends sit on top of it:
 
 * **Windows**: runs Windows ARM64 `.exe` programs on x86-64 Windows without a virtual machine,
   forwarding Windows API calls to the native x64 DLLs.
-* **Linux** (new, untested): runs Linux AArch64 ELF programs on x86-64 Linux, statically or
-  dynamically linked, forwarding system calls to the host kernel, optionally registered with
-  `binfmt_misc`.
+* **Linux**: runs Linux AArch64 ELF programs on x86-64 Linux, statically or dynamically
+  linked, forwarding system calls to the host kernel, optionally registered with
+  `binfmt_misc`. Tested on Ubuntu 26.04 (WSL2) with Ubuntu's own arm64 programs.
 * **macOS** (new, not yet run on a Mac): runs macOS ARM64 programs (built for Apple silicon) on
   Intel Macs, with the system's own x86-64 libraries and Objective-C runtime serving them. Its
   portable core runs on Windows against fake libraries in the tests.
@@ -77,10 +77,11 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 Hello, World!
 ```
 
-The Linux front end is written but has **not yet been compiled or run on Linux**. Its portable
-parts (ELF parsing, the initial stack, structure and flag translation, signal frames, the
-`binfmt_misc` rule) are unit-tested on every platform, and the rest has only been syntax-checked.
-See [Linux layer](#linux-layer).
+On Linux, JUICE runs real AArch64 distributions' programs: Ubuntu 26.04's arm64 builds of
+bash, busybox, GNU and Rust (uutils) coreutils, grep, sed, gawk, perl, Python 3.14 (threads,
+subprocesses), tar, gzip, xz, sqlite3 and file give the same output as under `qemu-aarch64`,
+and run 1.3 to 2.3 times faster than it (gzip and xz at 2.2x and 2.5x native). See
+[Linux layer](#linux-layer).
 
 ## Building
 
@@ -223,10 +224,17 @@ exits, calls to host code and asynchronous interrupts.
   dead guest-register store elimination and dead value elimination, all within a block.
   Stores are not eliminated across an instruction that may fault, and loads are never removed,
   so the guest state is exact at every memory access.
-* **x86-64 backend.** Guest state lives behind RBX. IR values get the callee-saved registers
-  for their live ranges within the block (RSI, RDI, R12–R15, and XMM6–XMM15 for floating point
-  and vector values, on Windows), and the rest a scratch array behind RBP; operations work on
-  those registers directly. Slow paths (NaN results and the like) go after the block's code.
+* **Blocks and side exits.** A block runs until an unconditional branch, a call, a return or
+  a backward conditional branch (a loop's back edge). Forward conditional branches don't end
+  it: they become side exits, which leave the block (to the branch target, linked like a
+  block's end) when taken, and translation goes on with the code after them. A loop body with
+  early exits is then one block that branches back to itself.
+* **x86-64 backend.** Guest state lives behind RBX. IR values get host registers for their live
+  ranges within the block, and the rest a scratch array behind RBP; operations work on those
+  registers directly. The registers are the callee-saved ones (RSI, RDI, R12–R15 and XMM6–XMM15
+  on Windows; R12–R15 under System V), then caller-saved ones the code doesn't otherwise use
+  (R10 and R11 on Windows; R9–R11 and XMM8–XMM15 under System V), which are saved around the
+  block's few helper calls when they hold a value that lives on. Slow paths (NaN results and the like) go after the block's code.
   A block that loops to itself keeps the guest registers it reads in host registers across
   iterations: the back edge moves the new values into them and skips the reads (the stores to
   guest state still happen, so the state in memory stays exact). Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
@@ -239,9 +247,11 @@ exits, calls to host code and asynchronous interrupts.
   conversions. A condition on the flags of a compare, `CMN`, test or `FCMP` repeats the x86
   compare and reads the x86 flags (a conditional branch becomes `cmp` + `jcc`, a select
   `cmp` + `cmov`); the packed NZCV value
-  is only computed if something else uses it. NZCV is not stored at a block's end when the
-  code it continues to (looking ahead up to 16 straight-line instructions) sets the flags
-  before reading them, so most compares never compute it.
+  is only computed if something else uses it. NZCV is not stored at a block's end or a side
+  exit when the code it continues to sets the flags before reading them. The look ahead covers
+  up to 16 instructions, following unconditional branches and both ways of `CBZ`/`TBZ`.
+  Calls and returns end it with the flags dead, since the procedure call standard doesn't
+  preserve them. So most compares never compute NZCV.
   Unit tests compare every inline path with the evaluator, NaNs and boundaries included.
 * **Atomics.** LSE atomics (`CAS`, `SWP`, `LDADD`, ...) become single atomic host operations.
   Exclusives are emulated by value: `LDXR`/`LDXP` record the loaded value, and `STXR`/`STXP` store
@@ -422,8 +432,10 @@ exits, calls to host code and asynchronous interrupts.
 
 ### Linux layer
 
-This layer is written against the kernel ABI but has **not yet been compiled or run on Linux**
-(see the status above).
+This layer runs on x86-64 Linux; it is tested on Ubuntu 26.04 under WSL2, with GCC 15. Besides
+`tests/linux`, `tests/linux/realworld.sh` runs a distribution's own programs: bash, busybox,
+coreutils, perl, Python, compressors, sqlite and more. They come from an Ubuntu arm64 sysroot
+that `tools/linux_sysroot/fetch_sysroot.py` builds, and are compared with `qemu-aarch64`.
 
 * **Loading.** `juice` maps the AArch64 program's `PT_LOAD` segments readable but never executable
   on the host. A fixed-address program goes at its addresses; a PIE goes wherever the kernel
@@ -584,6 +596,9 @@ on Windows (see Tests). The macOS-only part has **not yet been compiled or run o
 * `tests/linux` (Linux hosts with an AArch64 cross compiler): C and C++ programs that cover
   arguments and the heap, files and epoll, threads, signals, `fork`/`execve` and C++ exceptions.
   Each one is linked statically and dynamically and compared with a native x86-64 build.
+  `tests/linux/realworld.sh JUICE SYSROOT [--bench]` runs about forty commands of real arm64
+  programs from an Ubuntu sysroot (see `tools/linux_sysroot`) and compares them with
+  `qemu-aarch64`; `--bench` also times heavier workloads against it.
 * `tests/bench`: CPU-bound benchmarks (integer, floating point, calls, memory, auto-vectorized
   loops), run natively and under JUICE with `xmake build juice-bench` and
   `xmake run juice-bench [--runs=N] [name...]`. Outputs must match; the table shows JUICE's
@@ -621,10 +636,13 @@ These are next, roughly in the plan's order:
      type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
-5. **Performance.** Programs run about 1.5 to 9 times slower than native (2.7x geometric mean
-   on `tests/bench`; integer code 1.5x to 2x). Next: guest registers in host registers across
-   chained blocks (not only within one loop), more vector operations inline (pairwise,
-   saturating, zip/unzip), inline atomics, and W^X code memory.
+5. **Performance.** Programs run about 1.3 to 6 times slower than native (2.4x geometric mean
+   on `tests/bench`; integer code 1.3x to 2x). Next:
+   * guest registers in host registers across chained blocks, not only within one loop;
+   * faster translation: Python's startup translates 18,000 blocks, about 12 µs each;
+   * more vector operations inline (pairwise, saturating, zip/unzip);
+   * inline atomics;
+   * W^X code memory.
 
 Thread and module caveats: a thread's `TEB` stack bounds (`NtTib.StackBase`/`StackLimit`) are
 the host thread's, not the guest stack's (`GetCurrentThreadStackLimits` is right), and

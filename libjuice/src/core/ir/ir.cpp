@@ -75,6 +75,10 @@ void Builder::branch(ValueId cond, uint64_t target, uint64_t fallthrough) {
   block_.term.fallthrough = fallthrough;
 }
 
+void Builder::exit_if(ValueId cond, uint64_t target, int dead_slot) {
+  emit(Opcode::ExitIf, 8, cond, kNoValue, kNoValue, target, static_cast<uint8_t>(dead_slot < 0 ? 0 : dead_slot + 1));
+}
+
 void Builder::exit(uint32_t reason, uint32_t info, uint64_t pc) {
   block_.term = {};
   block_.term.kind = Terminator::Kind::Exit;
@@ -122,6 +126,7 @@ bool has_side_effects(Opcode op) {
     case Opcode::AtomicRmwPair:
     case Opcode::MemOp:
     case Opcode::StateOp:
+    case Opcode::ExitIf:
     case Opcode::Counter:  // not removable: each read must see the time it runs at
       return true;
     default:
@@ -140,6 +145,7 @@ bool is_pure(Opcode op) {
     case Opcode::AtomicRmwPair:
     case Opcode::MemOp:
     case Opcode::StateOp:
+    case Opcode::ExitIf:
     case Opcode::Nop:
     case Opcode::GetReg:
     case Opcode::SetReg:
@@ -158,6 +164,7 @@ bool has_result(Opcode op) {
   switch (op) {
     case Opcode::Fence:
     case Opcode::StateOp:
+    case Opcode::ExitIf:
     case Opcode::Nop:
     case Opcode::SetReg:
     case Opcode::Store:
@@ -187,6 +194,7 @@ unsigned arg_count(Opcode op) {
     case Opcode::Count_:
       return 0;
     case Opcode::SetReg:
+    case Opcode::ExitIf:
     case Opcode::Load:
     case Opcode::LoadToState:
     case Opcode::StoreFromState:
@@ -232,6 +240,7 @@ const char* opcode_name(Opcode op) {
     case Opcode::SetReg: return "set";
     case Opcode::Load: return "load";
     case Opcode::Store: return "store";
+    case Opcode::ExitIf: return "exit_if";
     case Opcode::LoadToState: return "load_state";
     case Opcode::StoreFromState: return "store_state";
     case Opcode::Add: return "add";
@@ -512,6 +521,10 @@ std::string to_string(const Block& block, const SlotNamer& namer) {
       case Opcode::StateOp:
         line += std::format(".{} {}, {}, {}, aux {}", in.imm & 0xFF, slot((in.imm >> 8) & 0xFF),
                             slot((in.imm >> 16) & 0xFF), slot((in.imm >> 24) & 0xFF), in.aux);
+        break;
+      case Opcode::ExitIf:
+        line += std::format(" {} -> 0x{:x}", val(in.args[0]), in.imm);
+        if (in.aux) line += " (" + slot(in.aux - 1u) + " dead)";
         break;
       default: {
         line += in.size == 4 ? "32" : "";

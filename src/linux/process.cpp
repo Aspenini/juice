@@ -368,6 +368,7 @@ int64_t LinuxProcess::sys_clone(arm64::CpuState& s, uint64_t flags, uint64_t new
   {
     auto lock = engine_->lock_for_fork();
     pid = ::fork();
+    if (pid == 0) engine_->after_fork_child(lock);
   }
   if (pid < 0) return -errno;
   if (pid == 0) {

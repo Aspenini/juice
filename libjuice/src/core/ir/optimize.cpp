@@ -3,7 +3,7 @@
 //   1. forward pass: register-read forwarding, constant folding and algebraic
 //      simplification
 //   2. backward pass: dead guest-register store elimination (not across an
-//      instruction that may fault, which must see exact guest state)
+//      instruction that may fault or a side exit, which must see exact guest state)
 //   3. backward pass: dead value elimination
 //
 // Removed instructions become Nop so that value ids stay stable.
@@ -177,6 +177,12 @@ class Optimizer {
         case Opcode::Store:
         case Opcode::StoreFromState:
           break;
+        case Opcode::ExitIf:
+          if (is_const(in.args[0]) && !const_value(in.args[0])) {  // never taken
+            in.op = Opcode::Nop;
+            ++stats_.folded;
+          }
+          break;
         default: {
           if (!is_pure(in.op)) break;
           unsigned count = arg_count(in.op);
@@ -239,6 +245,15 @@ class Optimizer {
           // Reads guest state from memory: keep every earlier store.
           std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
           break;
+        case Opcode::ExitIf: {
+          // The exit's target sees the guest state: earlier stores stay, except
+          // to a slot it sets first (if the code after the exit does too).
+          const size_t dead = in.aux ? in.aux - 1u : slot_count_;
+          const uint8_t keep = dead < slot_count_ ? overwritten[dead] : 0;
+          std::fill(overwritten.begin(), overwritten.end(), uint8_t{0});
+          if (dead < slot_count_) overwritten[dead] = keep;
+          break;
+        }
         default:
           // A fault here must find the guest registers of the instructions
           // before it in guest state: keep their stores.

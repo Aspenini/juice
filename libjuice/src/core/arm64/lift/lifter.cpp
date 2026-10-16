@@ -1970,6 +1970,9 @@ bool Lifter::lift(const Instruction& i) {
 
 bool lift_instruction(const Instruction& insn, ir::Builder& builder) { return Lifter(builder).lift(insn); }
 
+// Blocks with side exits stop growing at this many IR instructions.
+constexpr size_t kMaxSideExitBlockInsts = 2048;
+
 ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& options) {
   ir::Block block;
   block.guest_pc = pc;
@@ -1991,15 +1994,29 @@ ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& opt
     Instruction insn = decode(word, cur);
     ++block.guest_insns;
     block.insn_starts.push_back(static_cast<uint32_t>(block.insts.size()));
+    const uint64_t insn_pc = cur;
     cur += 4;
-    if (lifter.lift(insn)) break;
+    if (lifter.lift(insn)) {
+      // A forward conditional branch: a side exit, and the block goes on.
+      const ir::Terminator t = block.term;
+      if (options.side_exits && t.kind == ir::Terminator::Kind::Branch && t.target > insn_pc &&
+          t.fallthrough == cur && n + 1 < options.max_insns && block.insts.size() < kMaxSideExitBlockInsts) {
+        const bool flags_dead = flags_dead_at(t.target, read);
+        builder.exit_if(t.value, t.target, flags_dead ? slot::NZCV : -1);
+        block.term = {};
+        continue;
+      }
+      break;
+    }
   }
   block.guest_end = cur;
   return block;
 }
 
-bool flags_dead_at(uint64_t pc, const CodeReader& read, unsigned max_insns) {
-  for (unsigned n = 0; n < max_insns; ++n, pc += 4) {
+namespace {
+
+bool flags_dead_from(uint64_t pc, const CodeReader& read, unsigned& budget, unsigned depth) {
+  for (; budget > 0; --budget, pc += 4) {
     uint32_t word = 0;
     if ((pc & 3) != 0 || !read(pc, word)) return false;
     const Instruction insn = decode(word, pc);
@@ -2012,9 +2029,41 @@ bool flags_dead_at(uint64_t pc, const CodeReader& read, unsigned max_insns) {
       if (in.op == ir::Opcode::SetReg && in.imm == slot::NZCV) return true;
       if (in.op == ir::Opcode::StateOp) return false;  // may read any state
     }
-    if (ends) return false;  // leaves the straight line: conservatively live
+    if (!ends) continue;
+    switch (insn.op) {
+      // The procedure call standard doesn't keep NZCV across calls and returns:
+      // no code may read them after one before setting them.
+      case Op::Ret:
+      case Op::Bl:
+      case Op::Blr:
+        return true;
+      case Op::B:  // straight on at the target
+        if (depth > 8) return false;
+        --budget;
+        return flags_dead_from(insn.imm, read, budget, depth + 1);
+      case Op::Cbz:
+      case Op::Cbnz:
+      case Op::Tbz:
+      case Op::Tbnz:
+      case Op::CmpBranch: {  // (don't read the flags themselves) dead on both paths
+        if (depth > 8) return false;
+        --budget;
+        unsigned taken = budget;
+        if (!flags_dead_from(insn.imm, read, taken, depth + 1)) return false;
+        return flags_dead_from(pc + 4, read, budget, depth + 1);
+      }
+      default:
+        return false;  // anything else leaving the straight line: conservatively live
+    }
   }
   return false;
+}
+
+}  // namespace
+
+bool flags_dead_at(uint64_t pc, const CodeReader& read, unsigned max_insns) {
+  unsigned budget = max_insns;
+  return flags_dead_from(pc, read, budget, 0);
 }
 
 ir::StateLayout state_layout() {

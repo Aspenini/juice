@@ -71,12 +71,15 @@ uint64_t cas_pair(uint64_t addr, uint64_t operands) {
   op[0] = static_cast<uint64_t>(comparand[0]);
   op[1] = static_cast<uint64_t>(comparand[1]);
 #else
-  unsigned __int128 expected = (static_cast<unsigned __int128>(op[1]) << 64) | op[0];
-  unsigned __int128 desired = (static_cast<unsigned __int128>(op[3]) << 64) | op[2];
-  const bool swapped = __atomic_compare_exchange_n(host_ptr<unsigned __int128>(addr), &expected, desired, false,
-                                                   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-  op[0] = static_cast<uint64_t>(expected);
-  op[1] = static_cast<uint64_t>(expected >> 64);
+  // (CMPXCHG16B directly: GCC compiles 16-byte __atomic builtins to libatomic calls.)
+  uint64_t lo = op[0], hi = op[1];
+  bool swapped;
+  __asm__ __volatile__("lock cmpxchg16b %1"
+                       : "=@ccz"(swapped), "+m"(*host_ptr<unsigned __int128>(addr)), "+a"(lo), "+d"(hi)
+                       : "b"(op[2]), "c"(op[3])
+                       : "memory");
+  op[0] = lo;
+  op[1] = hi;
 #endif
   return swapped ? 0 : 1;
 }

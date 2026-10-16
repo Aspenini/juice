@@ -34,13 +34,27 @@ inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, RSI, RDI, R12, R13, R14, R15
 // prologue saves them at [RSP + kBlockXmmSaveArea + 16 * k] (XMM(first + k)).
 inline constexpr unsigned kBlockSavedXmmFirst = 6;
 inline constexpr unsigned kBlockSavedXmmCount = 10;
+// Caller-saved registers that also hold IR values (the code doesn't use them
+// otherwise): saved around the block's helper calls when they hold a value
+// that lives on, at [RSP + kBlockVolatileSaveArea + 8 * k] (GPRs, then the
+// low halves of the XMM registers).
+inline constexpr Reg kBlockVolatileRegs[] = {R10, R11};
+inline constexpr unsigned kBlockVolatileXmmFirst = 0;
+inline constexpr unsigned kBlockVolatileXmmCount = 0;
 #else
 inline constexpr Reg kBlockSavedRegs[] = {RBX, RBP, R12, R13, R14, R15};
 inline constexpr unsigned kBlockSavedXmmFirst = 0;
 inline constexpr unsigned kBlockSavedXmmCount = 0;  // SysV has no callee-saved XMM registers
+inline constexpr Reg kBlockVolatileRegs[] = {R9, R10, R11};
+inline constexpr unsigned kBlockVolatileXmmFirst = 8;  // (the code uses XMM0-4 as temporaries)
+inline constexpr unsigned kBlockVolatileXmmCount = 8;
 #endif
 inline constexpr int32_t kBlockXmmSaveArea = 40;  // above the helper calls' home space
-inline constexpr int32_t kBlockFrameSize = kBlockXmmSaveArea + 16 * kBlockSavedXmmCount;
+inline constexpr int32_t kBlockVolatileSaveArea = kBlockXmmSaveArea + 16 * kBlockSavedXmmCount;
+inline constexpr int32_t kBlockVolatileSaveEnd =
+    kBlockVolatileSaveArea + 8 * static_cast<int32_t>(std::size(kBlockVolatileRegs) + kBlockVolatileXmmCount);
+inline constexpr int32_t kBlockFrameSize =
+    kBlockVolatileSaveEnd + ((8 + 8 * std::size(kBlockSavedRegs) + kBlockVolatileSaveEnd) % 16 ? 8 : 0);
 static_assert((8 + 8 * std::size(kBlockSavedRegs) + kBlockFrameSize) % 16 == 0, "RSP aligned for calls");
 
 // A host instruction of a block that may fault: code from host_offset on (up

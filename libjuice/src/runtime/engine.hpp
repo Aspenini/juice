@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <new>
 #include <shared_mutex>
 #include <utility>
 #include <vector>
@@ -102,8 +103,14 @@ class Engine {
   void invalidate(uint64_t begin, uint64_t end);
 
   // Hold while calling fork(): the child process then never inherits the
-  // translation lock held by another (vanished) thread.
+  // translation lock held by another (vanished) thread. In the child, pass
+  // the lock to after_fork_child() instead of letting it unlock: a pthread
+  // rwlock remembers its writer's thread id, which the child doesn't have.
   std::unique_lock<std::shared_mutex> lock_for_fork() { return std::unique_lock(mutex_); }
+  void after_fork_child(std::unique_lock<std::shared_mutex>& lock) {
+    lock.release();
+    new (&mutex_) std::shared_mutex();
+  }
 
   EngineStats stats() const;
   const CodeArena& arena() const { return arena_; }

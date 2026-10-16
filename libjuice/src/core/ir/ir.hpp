@@ -68,6 +68,12 @@ enum class Opcode : uint8_t {
                    //   destination and source pairs; aux as the kind describes. Reads and
                    //   writes guest state directly (see state_ops.cpp)
 
+  // --- Control flow --------------------------------------------------------------
+  ExitIf,          // a = condition: if nonzero, the block ends here and continues at guest
+                   //   pc imm (a side exit: guest state is exact here, as at the block's
+                   //   end); aux = 1 + a state slot the target sets before reading it, so
+                   //   that the exit doesn't keep its earlier stores (0: none)
+
   // --- Vector lane operations on 64-bit vector halves --------------------------
   // Low nibble of aux = element size in bytes (1, 2, 4, 8). size is always 8.
   VAdd, VSub, VMul,
@@ -295,6 +301,9 @@ class Builder {
   void jump_indirect(ValueId target);
   void branch(ValueId cond, uint64_t target, uint64_t fallthrough);
   void exit(uint32_t reason, uint32_t info, uint64_t pc);
+  // A side exit (see Opcode::ExitIf); `dead_slot`: a slot the target sets
+  // before reading it, or -1.
+  void exit_if(ValueId cond, uint64_t target, int dead_slot = -1);
 
   Block& block() { return block_; }
 

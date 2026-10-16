@@ -154,9 +154,13 @@ class Compiler {
         faults_->push_back({static_cast<uint32_t>(a_.size()),
                             static_cast<uint32_t>(ir::guest_pc_of(block_, i) - block_.guest_pc)});
       }
+      at_ = i;
       emit(static_cast<ValueId>(i), block_.insts[i]);
     }
+    at_ = block_.insts.size();
     terminator();
+    side_exit_stubs();
+    link_stubs(pending_);
     emit_cold();
     return a_.code();
   }
@@ -293,7 +297,8 @@ class Compiler {
       if (in.op == Opcode::Nop) continue;
       for (unsigned k = 0; k < ir::arg_count(in.op); ++k) use(in.args[k], i);
       // A select on a fused condition repeats the flag operation.
-      if (in.op == Opcode::Select && in.args[0] < n && select_cond_[in.args[0]]) {
+      if ((in.op == Opcode::Select || in.op == Opcode::ExitIf) && in.args[0] < n &&
+          (select_cond_[in.args[0]] || exit_cond_[in.args[0]])) {
         const Inst& flags = block_.insts[block_.insts[in.args[0]].args[0]];
         for (unsigned k = 0; k < ir::arg_count(flags.op); ++k) use(flags.args[k], i);
       }
@@ -317,8 +322,11 @@ class Compiler {
       else use(l.get, n + 1);                             // read again by the next iteration
       used[l.get] = 1;
     }
+    last_use_ = last_use;
 
-    std::vector<Reg> pool;
+    // Callee-saved registers first (taken from the back); the volatile ones,
+    // saved around helper calls, when those run out.
+    std::vector<Reg> pool(std::begin(kBlockVolatileRegs), std::end(kBlockVolatileRegs));
     for (Reg r : kBlockSavedRegs)
       if (r != kState && r != kScratch) pool.push_back(r);
     // Floating point and vector values (results of scalar FP and vector
@@ -326,6 +334,7 @@ class Compiler {
     // go to XMM registers.
     xreg_.assign(n, -1);
     std::vector<int8_t> xpool;
+    for (unsigned k = kBlockVolatileXmmCount; k-- > 0;) xpool.push_back(static_cast<int8_t>(kBlockVolatileXmmFirst + k));
     for (unsigned k = kBlockSavedXmmCount; k-- > 0;) xpool.push_back(static_cast<int8_t>(kBlockSavedXmmFirst + k));
     auto scalar_fp = [](const Inst& in) {
       return in.op >= Opcode::FAdd && in.op <= Opcode::FCmp && (in.size == 4 || in.size == 8);
@@ -364,7 +373,7 @@ class Compiler {
       const Inst& in = block_.insts[i];
       if (in.op == Opcode::Nop) continue;
       if (ir::has_result(in.op) && in.op != Opcode::Const && !lazy_[i] && !(branch_cond_ && i == lazy_cond_) &&
-          !hoisted_[i] && !select_cond_[i] && used[i]) {
+          !hoisted_[i] && !select_cond_[i] && !exit_cond_[i] && used[i]) {
         if (fp_value[i] && !xpool.empty()) {
           xreg_[i] = xpool.back();
           xpool.pop_back();
@@ -384,7 +393,8 @@ class Compiler {
         }
       };
       for (unsigned k = 0; k < ir::arg_count(in.op); ++k) release(in.args[k]);
-      if (in.op == Opcode::Select && in.args[0] < n && select_cond_[in.args[0]])
+      if ((in.op == Opcode::Select || in.op == Opcode::ExitIf) && in.args[0] < n &&
+          (select_cond_[in.args[0]] || exit_cond_[in.args[0]]))
         for (unsigned k = 0; k < ir::arg_count(block_.insts[block_.insts[in.args[0]].args[0]].op); ++k)
           release(block_.insts[block_.insts[in.args[0]].args[0]].args[k]);
       if (in.op == Opcode::CondHolds && in.args[0] < n)
@@ -526,14 +536,46 @@ class Compiler {
     put(v, RAX);
   }
 
-  void call_helper(ValueId v, const Inst& in, uint64_t (*helper)(uint64_t, uint64_t, uint64_t, uint64_t)) {
+  void call_helper(ValueId v, const Inst& in, uint64_t (*helper)(uint64_t, uint64_t, uint64_t, uint64_t),
+                   size_t at) {
+    save_volatile(at, false);
     for (unsigned k = 0; k < 3; ++k)
       if (in.args[k] != ir::kNoValue) get(kCallArgs[k], in.args[k]);
     a_.mov_imm(kCallArgs[3], static_cast<uint64_t>(in.op) | (uint64_t{in.size} << 8) | (uint64_t{in.aux} << 16) |
                                  ((in.imm & 0xFFFF'FFFFu) << 32));
     a_.mov_imm(RAX, reinterpret_cast<uint64_t>(helper));
     a_.call(RAX);
+    save_volatile(at, true);
     put(v, RAX);
+  }
+  void call_helper(ValueId v, const Inst& in, uint64_t (*helper)(uint64_t, uint64_t, uint64_t, uint64_t)) {
+    call_helper(v, in, helper, at_);
+  }
+
+  // Saves (or restores) the volatile registers holding values that live
+  // across instruction `at`'s helper call (the call clobbers them).
+  void save_volatile(size_t at, bool restore) {
+    if (std::size(kBlockVolatileRegs) + kBlockVolatileXmmCount == 0) return;
+    const size_t n = block_.insts.size();
+    for (size_t v = 0; v < n; ++v) {
+      if (!(hoisted_[v] || v < at) || last_use_[v] <= at) continue;
+      int slot = -1;
+      if (reg_[v] != kNoReg) {
+        for (size_t k = 0; k < std::size(kBlockVolatileRegs); ++k)
+          if (kBlockVolatileRegs[k] == reg_[v]) slot = static_cast<int>(k);
+        if (slot < 0) continue;
+        const Mem m{RSP, kBlockVolatileSaveArea + 8 * slot};
+        if (restore) a_.load(reg_[v], m);
+        else a_.store(m, reg_[v], 8);
+      } else if (xreg_[v] >= static_cast<int>(kBlockVolatileXmmFirst) &&
+                 xreg_[v] < static_cast<int>(kBlockVolatileXmmFirst + kBlockVolatileXmmCount) &&
+                 kBlockVolatileXmmCount) {
+        slot = static_cast<int>(std::size(kBlockVolatileRegs)) + (xreg_[v] - static_cast<int>(kBlockVolatileXmmFirst));
+        const Mem m{RSP, kBlockVolatileSaveArea + 8 * slot};
+        if (restore) a_.movsd_load(static_cast<unsigned>(xreg_[v]), m);
+        else a_.movsd_store(m, static_cast<unsigned>(xreg_[v]));
+      }
+    }
   }
 
   // --- scalar floating point -------------------------------------------------------
@@ -574,12 +616,15 @@ class Compiler {
     ValueId v;
     Inst in;
     size_t done;
+    size_t at;  // the instruction (for the volatile registers to keep)
   };
-  void cold_helper(Assembler::Label from, ValueId v, const Inst& in) { cold_.push_back({from, v, in, a_.size()}); }
+  void cold_helper(Assembler::Label from, ValueId v, const Inst& in) {
+    cold_.push_back({from, v, in, a_.size(), at_});
+  }
   void emit_cold() {
     for (const ColdHelper& c : cold_) {
       a_.bind(c.from);
-      call_helper(c.v, c.in, &evaluate_helper);
+      call_helper(c.v, c.in, &evaluate_helper, c.at);
       a_.jmp_to(c.done);
     }
   }
@@ -1032,11 +1077,30 @@ class Compiler {
         a_.mfence();
         return;
       case Opcode::StateOp:
+        save_volatile(at_, false);
         a_.mov(kCallArgs[0], kState);
         a_.mov_imm(kCallArgs[1], (uint64_t{in.aux} << 16) | ((in.imm & 0xFFFF'FFFFu) << 32));
         a_.mov_imm(RAX, reinterpret_cast<uint64_t>(&state_helper));
         a_.call(RAX);
+        save_volatile(at_, true);
         return;
+      case Opcode::ExitIf: {
+        // A jump out to the exit's stub (after the block): the state is exact here.
+        const ValueId c = in.args[0];
+        Cond x86 = Cond::NE;
+        int constant;
+        if (exit_cond_[c]) {  // on the x86 flags of the condition's flag operation
+          const Inst& cond = block_.insts[c];
+          const Inst& flags = block_.insts[cond.args[0]];
+          fused_condition(flags, cond.aux, x86, constant);
+          redo_flags(flags, cond.aux);
+        } else {
+          get(RDX, c);
+          a_.test(RDX, RDX, true);
+        }
+        side_exits_.push_back({a_.jcc(x86), in.imm});
+        return;
+      }
       case Opcode::AtomicRmw:
       case Opcode::AtomicCas:
       case Opcode::AtomicCasPair:
@@ -1250,6 +1314,7 @@ class Compiler {
       case Opcode::CondHolds:
         if (branch_cond_ && v == lazy_cond_) return;  // the terminator branches on the flags
         if (select_cond_[v]) return;                   // the selects use the flags
+        if (exit_cond_[v]) return;                     // the side exit jumps on the flags
         if (fused_cond_holds(v, in)) return;
         get(RAX, in.args[0]);
         a_.shift_imm(Shift::Shr, RAX, 28, false);
@@ -1403,6 +1468,19 @@ class Compiler {
         if (fusable(f.op) && fused_condition(f, in.aux, x86, constant) && constant < 0) select_cond_[i] = 1;
       }
     }
+    // Fused conditions only a side exit uses: it jumps on the flags.
+    exit_cond_.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      const Inst& in = block_.insts[i];
+      if (in.op != Opcode::ExitIf || in.args[0] >= n) continue;
+      const ValueId c = in.args[0];
+      const Inst& cond = block_.insts[c];
+      if (cond.op != Opcode::CondHolds || cond_uses_[c] != 1 || block_.term.value == c) continue;
+      const Inst& f = block_.insts[cond.args[0]];
+      Cond x86;
+      int constant;
+      if (fusable(f.op) && fused_condition(f, cond.aux, x86, constant) && constant < 0) exit_cond_[c] = 1;
+    }
     const Inst* flags;
     Cond x86;
     int constant;
@@ -1536,13 +1614,10 @@ class Compiler {
       else link_to(target, pending);
     };
     if (chain_.link_helper && t.kind == ir::Terminator::Kind::Jump) {
-      std::vector<PendingLink> pending;
-      edge(t.target, pending);
-      link_stubs(pending);
+      edge(t.target, pending_);
       return;
     }
     if (chain_.link_helper && t.kind == ir::Terminator::Kind::Branch) {
-      std::vector<PendingLink> pending;
       Assembler::Label not_taken;
       const Inst* flags;
       Cond x86;
@@ -1555,10 +1630,9 @@ class Compiler {
         a_.test(RDX, RDX, true);
         not_taken = a_.jcc(Cond::E);
       }
-      edge(t.target, pending);
+      edge(t.target, pending_);
       a_.bind(not_taken);
-      edge(t.fallthrough, pending);
-      link_stubs(pending);
+      edge(t.fallthrough, pending_);
       return;
     }
     switch (t.kind) {
@@ -1594,6 +1668,33 @@ class Compiler {
     epilogue();
   }
 
+  // --- side exits ----------------------------------------------------------------------
+
+  struct SideExit {
+    Assembler::Label jump;  // the jcc from the block's body
+    uint64_t target;
+  };
+
+  // Each side exit leaves for its target like a terminator's jump: through a
+  // link site, or the chain table and the dispatcher.
+  void side_exit_stubs() {
+    for (const SideExit& e : side_exits_) {
+      a_.bind(e.jump);
+      if (chain_.link_helper) {
+        link_to(e.target, pending_);
+        continue;
+      }
+      a_.mov_imm(RAX, e.target);
+      store_pc(RAX);
+      if (chain_.table_mask) {
+        std::vector<Assembler::Label> to_dispatcher;
+        chain(to_dispatcher);
+        for (const Assembler::Label& l : to_dispatcher) a_.bind(l);
+      }
+      epilogue();
+    }
+  }
+
   const ir::Block& block_;
   const ir::StateLayout& layout_;
   const ChainLayout& chain_;
@@ -1607,8 +1708,13 @@ class Compiler {
   std::vector<uint32_t> cond_uses_;  // uses of each value by instructions
   std::vector<LoopSlot> loop_slots_;  // see find_loop_slots
   std::vector<uint8_t> select_cond_;  // fused conditions only selects use (not emitted)
+  std::vector<uint8_t> exit_cond_;    // fused conditions only a side exit uses (not emitted)
+  std::vector<size_t> last_use_;      // each value's last use (see allocate_registers)
+  size_t at_ = 0;                     // the instruction being emitted
   std::vector<uint8_t> hoisted_;      // GetRegs emitted at the top of the block
   size_t loop_head_ = 0;
+  std::vector<SideExit> side_exits_;
+  std::vector<PendingLink> pending_;  // the block's link sites (terminator and side exits)
   bool branch_cond_ = false;   // the branch condition is not emitted (see branch_on_flags)
   ValueId lazy_cond_ = ir::kNoValue;
   Assembler a_;

@@ -2,6 +2,8 @@
 
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 
 #include "juice/juice.hpp"
 #include "linux/binfmt.hpp"
+#include "linux/elf/elf_file.hpp"
 #include "linux/process.hpp"
 
 extern char** environ;
@@ -53,7 +56,25 @@ bool env_flag(const char* name) {
   return v && *v && std::strcmp(v, "0") != 0;
 }
 
+// A program for this machine runs natively (as with any other program).
+void exec_if_native(const juice::lx::Options& options, const std::string& program, const std::vector<std::string>& args) {
+  uint8_t header[20] = {};
+  FILE* f = std::fopen(program.c_str(), "rb");
+  if (!f) return;
+  const size_t got = std::fread(header, 1, sizeof(header), f);
+  std::fclose(f);
+  if (juice::lx::elf_machine(header, got) != juice::lx::kEmX86_64) return;
+  std::vector<char*> argv;
+  argv.push_back(const_cast<char*>(options.argv0.empty() ? program.c_str() : options.argv0.c_str()));
+  for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+  argv.push_back(nullptr);
+  execv(program.c_str(), argv.data());
+  std::fprintf(stderr, "juice: %s: %s\n", program.c_str(), std::strerror(errno));
+  std::exit(127);
+}
+
 int run(juice::lx::Options options, const std::string& program, const std::vector<std::string>& args) {
+  exec_if_native(options, program, args);
   // The sysroot is a prefix: no trailing slash.
   while (!options.sysroot.empty() && options.sysroot.back() == '/') options.sysroot.pop_back();
   juice::lx::LinuxProcess process(std::move(options));

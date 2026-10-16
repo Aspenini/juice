@@ -428,7 +428,7 @@ TEST(jit_fuses_conditions_with_flag_operations) {
 TEST(jit_matches_interpreter_for_vector_halves) {
   std::mt19937_64 rng(777);
   // Integer lanes: random bits, with lanes often equal or extreme.
-  auto ints = [&](int) {
+  auto ints = [&](int) -> uint64_t {
     switch (rng() % 4) {
       case 0: return 0x7F80007FFFFF8000ull ^ (rng() & 0x0101010101010101ull);
       case 1: return rng() & 0x8181818181818181ull;
