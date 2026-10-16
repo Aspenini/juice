@@ -1976,6 +1976,8 @@ constexpr size_t kMaxSideExitBlockInsts = 2048;
 ir::Block lift_block(uint64_t pc, const CodeReader& read, const LiftOptions& options) {
   ir::Block block;
   block.guest_pc = pc;
+  block.insts.reserve(256);
+  block.insn_starts.reserve(64);
   ir::Builder builder(block);
   Lifter lifter(builder, options);
 
@@ -2020,7 +2022,9 @@ bool flags_dead_from(uint64_t pc, const CodeReader& read, unsigned& budget, unsi
     uint32_t word = 0;
     if ((pc & 3) != 0 || !read(pc, word)) return false;
     const Instruction insn = decode(word, pc);
-    ir::Block block;
+    thread_local ir::Block block;  // (reused: this runs for every block's end and side exit)
+    block.insts.clear();
+    block.term = {};
     ir::Builder builder(block);
     Lifter lifter(builder, {});
     const bool ends = lifter.lift(insn);

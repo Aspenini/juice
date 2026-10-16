@@ -313,14 +313,22 @@ class Builder {
 
 // --- Semantics shared by the optimizer, interpreter and tests ----------------
 
-bool is_pure(Opcode op);           // no side effects, result depends only on args
-bool has_side_effects(Opcode op);  // must be kept even if its result is unused
+// Opcode properties, read from a table built at startup (see ir.cpp).
+struct OpcodeInfo {
+  uint8_t args = 0;
+  bool pure = false, side_effects = false, fault = false, vector_or_fp = false, result = false;
+};
+extern const std::array<OpcodeInfo, static_cast<size_t>(Opcode::Count_) + 1> kOpcodeInfo;
+inline const OpcodeInfo& opcode_info(Opcode op) { return kOpcodeInfo[static_cast<size_t>(op)]; }
+
+inline bool is_pure(Opcode op) { return opcode_info(op).pure; }  // no side effects, result depends only on args
+inline bool has_side_effects(Opcode op) { return opcode_info(op).side_effects; }  // kept even if unused
 // Accesses guest memory, so may fault: guest state must be exact before it
 // (the optimizer keeps earlier guest-register stores).
-bool may_fault(Opcode op);
-bool is_vector_or_fp(Opcode op);   // the SIMD/FP opcodes above
-bool has_result(Opcode op);
-unsigned arg_count(Opcode op);
+inline bool may_fault(Opcode op) { return opcode_info(op).fault; }
+inline bool is_vector_or_fp(Opcode op) { return opcode_info(op).vector_or_fp; }  // the SIMD/FP opcodes above
+inline bool has_result(Opcode op) { return opcode_info(op).result; }
+inline unsigned arg_count(Opcode op) { return opcode_info(op).args; }
 const char* opcode_name(Opcode op);
 
 // Evaluate a pure instruction given its argument values.

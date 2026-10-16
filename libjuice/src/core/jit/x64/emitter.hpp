@@ -64,6 +64,12 @@ struct FaultSite {
   uint32_t guest_offset;
 };
 
+// Calls of the evaluator from translated code (operations the JIT doesn't
+// emit inline), counted while enabled: by opcode and, for VLane, lane
+// operation (key = opcode | lane op << 8). For --stats.
+void count_helper_calls(bool enable);
+std::vector<std::pair<uint32_t, uint64_t>> helper_call_counts();
+
 // Maximum number of IR values a compiled block may use (size of the scratch
 // array the caller must provide).
 inline constexpr size_t kMaxBlockValues = 16384;

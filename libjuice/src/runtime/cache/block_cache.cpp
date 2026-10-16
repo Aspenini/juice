@@ -22,6 +22,9 @@ const TranslatedBlock* BlockCache::find_code(uintptr_t host_pc) const {
 TranslatedBlock* BlockCache::insert(std::unique_ptr<TranslatedBlock> block) {
   TranslatedBlock* raw = block.get();
   if (raw->code) by_code_[reinterpret_cast<uintptr_t>(raw->code)] = raw;
+  const uint64_t last = raw->guest_end > raw->guest_pc ? raw->guest_end - 1 : raw->guest_pc;
+  for (uint64_t page = raw->guest_pc >> kPageShift; page <= last >> kPageShift; ++page)
+    by_page_[page].push_back(raw->guest_pc);
   auto& slot = blocks_[raw->guest_pc];
   if (slot) retired_.push_back(std::move(slot));
   slot = std::move(block);
@@ -30,15 +33,41 @@ TranslatedBlock* BlockCache::insert(std::unique_ptr<TranslatedBlock> block) {
 
 std::vector<TranslatedBlock*> BlockCache::invalidate(uint64_t begin, uint64_t end) {
   std::vector<TranslatedBlock*> removed;
-  for (auto it = blocks_.begin(); it != blocks_.end();) {
-    const TranslatedBlock& b = *it->second;
-    if (b.guest_pc < end && b.guest_end > begin) {
-      removed.push_back(it->second.get());
-      retired_.push_back(std::move(it->second));
-      it = blocks_.erase(it);
-    } else {
-      ++it;
+  if (end <= begin) return removed;
+  auto retire = [&](std::unordered_map<uint64_t, std::unique_ptr<TranslatedBlock>>::iterator it) {
+    removed.push_back(it->second.get());
+    retired_.push_back(std::move(it->second));
+    return blocks_.erase(it);
+  };
+  const uint64_t first_page = begin >> kPageShift, last_page = (end - 1) >> kPageShift;
+  if (last_page - first_page >= by_page_.size()) {
+    // A range with more pages than blocks have (an unmapped region): look at every block.
+    for (auto it = blocks_.begin(); it != blocks_.end();) {
+      const TranslatedBlock& b = *it->second;
+      if (b.guest_pc < end && b.guest_end > begin) it = retire(it);
+      else ++it;
     }
+    return removed;
+  }
+  for (uint64_t page = first_page; page <= last_page; ++page) {
+    auto entry = by_page_.find(page);
+    if (entry == by_page_.end()) continue;
+    std::vector<uint64_t>& pcs = entry->second;
+    size_t keep = 0;
+    for (uint64_t pc : pcs) {
+      auto it = blocks_.find(pc);
+      if (it == blocks_.end()) continue;  // (stale)
+      const TranslatedBlock& b = *it->second;
+      const uint64_t last = b.guest_end > b.guest_pc ? b.guest_end - 1 : b.guest_pc;
+      if (page < b.guest_pc >> kPageShift || page > last >> kPageShift) continue;  // (a newer block at that pc)
+      if (b.guest_pc < end && b.guest_end > begin) {
+        retire(it);
+        continue;
+      }
+      pcs[keep++] = pc;
+    }
+    pcs.resize(keep);
+    if (pcs.empty()) by_page_.erase(entry);
   }
   return removed;
 }

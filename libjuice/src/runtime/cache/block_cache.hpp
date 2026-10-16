@@ -54,7 +54,8 @@ class BlockCache {
   TranslatedBlock* insert(std::unique_ptr<TranslatedBlock> block);
 
   // Retire blocks overlapping guest range [begin, end) (self-modifying code);
-  // returns them.
+  // returns them. Visits only the blocks on the range's pages (code that
+  // generates code - JavaScript engines - invalidates small ranges often).
   std::vector<TranslatedBlock*> invalidate(uint64_t begin, uint64_t end);
 
   // Every block, current and retired.
@@ -71,7 +72,12 @@ class BlockCache {
   const std::unordered_map<uint64_t, std::unique_ptr<TranslatedBlock>>& blocks() const { return blocks_; }
 
  private:
+  static constexpr unsigned kPageShift = 12;
+
   std::unordered_map<uint64_t, std::unique_ptr<TranslatedBlock>> blocks_;
+  // Guest page -> the pcs of blocks covering part of it (entries may be
+  // stale: the block they named was replaced or retired).
+  std::unordered_map<uint64_t, std::vector<uint64_t>> by_page_;
   std::vector<std::unique_ptr<TranslatedBlock>> retired_;
   std::map<uintptr_t, const TranslatedBlock*> by_code_;  // host code start -> block (never removed)
 };

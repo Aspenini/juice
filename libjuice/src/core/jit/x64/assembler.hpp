@@ -38,6 +38,7 @@ class Assembler {
 
   const std::vector<uint8_t>& code() const { return code_; }
   size_t size() const { return code_.size(); }
+  void reserve(size_t bytes) { code_.reserve(bytes); }
 
   // Data movement. `w` selects 64-bit (true) or 32-bit (false) operation size.
   void mov(Reg dst, Reg src, bool w = true);

@@ -12,6 +12,8 @@ JUICE=$(realpath "$1"); ROOT=$(realpath "$2"); shift 2
 BENCH=0; [ "$1" = --bench ] && { BENCH=1; shift; }
 FILTER=$1
 command -v qemu-aarch64 >/dev/null || { echo "qemu-aarch64 is needed as the reference"; exit 2; }
+# AArch64 programs that a program under qemu starts run through binfmt_misc's qemu: their sysroot.
+export QEMU_LD_PREFIX=$ROOT
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT; cd "$W"
 B=$ROOT/usr/bin
 printf 'banana\napple\ncherry\napple\n' > fruit.txt
@@ -27,7 +29,8 @@ run() {
   timeout -k 2 60 "$JUICE" --sysroot="$ROOT" -- "$@" > j.out 2> j.err < /dev/null; local jc=$?
   local ms=$(( ($(date +%s%N) - start) / 1000000 ))
   if [ $qc -eq $jc ] && cmp -s q.out j.out; then
-    pass=$((pass + 1)); printf 'ok    %-28s %6d ms\n' "$name" "$ms"
+    pass=$((pass + 1))
+    printf 'ok    %-28s %6d ms   %s\n' "$name" "$ms" "$(head -c 50 j.out | tr '\n' ' ')"
   else
     fail=$((fail + 1)); printf 'FAIL  %-28s juice=%s qemu=%s\n' "$name" "$jc" "$qc"
     diff <(head -c 2000 q.out) <(head -c 2000 j.out) | head -8 | sed 's/^/        /'
@@ -72,6 +75,38 @@ run xz                $B/bash -c 'xz -9 -c nums.txt | xz -dc | sha256sum'
 run sqlite            $B/sqlite3 :memory: 'create table t(a,b); insert into t values (1,"x"),(2,"y"),(3,"z"); select sum(a), group_concat(b) from t;'
 run file              $B/file -m $ROOT/usr/lib/file/magic.mgc $B/bash
 run diff              $B/diff fruit.txt nums.txt
+# Bigger programs (when the sysroot has them).
+run zstd              $B/zstd -3 -q -c nums.txt  # (qemu gets -19 wrong)
+run bzip2             $B/bash -c 'bzip2 -9 -c nums.txt | bzip2 -dc | md5sum'
+printf '[{"n":1},{"n":2},{"n":3},{"n":4}]' > data.json
+run jq-file           $B/jq -c '[.[] | select(.n % 2 == 0) | .n * 10]' data.json
+run openssl-sha256    $B/openssl dgst -sha256 nums.txt
+run openssl-sha512    $B/openssl dgst -sha512 nums.txt
+run openssl-aes       $B/bash -c 'openssl enc -aes-256-cbc -K 000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f -iv 0f0e0d0c0b0a09080706050403020100 -in nums.txt | openssl dgst -sha1'
+run openssl-gcm       $B/bash -c 'openssl enc -aes-128-ctr -K 000102030405060708090a0b0c0d0e0f -iv 00000000000000000000000000000001 -in nums.txt | md5sum'
+run lua               $B/lua5.4 -e 'local t = {} for i = 1, 100000 do t[i] = i * i % 97 end local s = 0 for _, v in ipairs(t) do s = s + v end print(s, string.format("%.5f", math.pi), ("x"):rep(5))'
+run ruby              $B/ruby -e 'h = Hash.new(0); (1..50000).each { |i| h[i % 17] += i }; puts h.sort.first(3).inspect; puts [3.14 ** 2, 2 ** 100].inspect'
+run node              $B/node -e 'let s = 0; for (let i = 0; i < 5e6; i++) s += i % 7; console.log(s, JSON.stringify({a: [1, 2, 3]}), (0.1 + 0.2).toFixed(17))'
+run node-jit          $B/node -e 'function f(a) { let r = 0; for (const x of a) r = (r * 31 + x) | 0; return r } const a = Array.from({length: 1000}, (_, i) => i); let v; for (let k = 0; k < 3000; k++) v = f(a); console.log(v, Math.max(...a))'
+run git               $B/bash -c 'export HOME=$PWD GIT_AUTHOR_NAME=a GIT_AUTHOR_EMAIL=a@b GIT_COMMITTER_NAME=a GIT_COMMITTER_EMAIL=a@b GIT_AUTHOR_DATE=@1000000000 GIT_COMMITTER_DATE=@1000000000; rm -rf repo && git init -q -b main repo && cd repo && cp ../nums.txt . && git add . && git commit -q -m one && echo extra >> nums.txt && git commit -qam two && git log --oneline && git diff HEAD~1 --stat'
+printf '#include <stdio.h>\nint main(void) { double s = 0; for (int i = 1; i < 1000; i++) s += 1.0 / i; printf("%%.6f\\n", s); return 3; }\n' > prog.c
+run gcc               $B/bash -c 'gcc -O2 -o prog prog.c && ./prog; echo exit=$?'
+printf 'all: out.txt\nout.txt: in.txt\n\tsort in.txt > out.txt\n\techo built\n' > Makefile
+cp fruit.txt in.txt
+run make              $B/bash -c 'rm -f out.txt; make -s && cat out.txt && make -s'
+# SIMD-heavy code: NumPy (and its BLAS) and FFmpeg's NEON assembly. Single
+# threaded, so that the results don't depend on scheduling.
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+run numpy-basic       $PY -c 'import numpy as np; a = np.arange(1, 100001, dtype=np.float64); print(a.sum(), (a * a).mean(), np.sqrt(a).max(), a.astype(np.int32)[-5:], np.sort(-a)[:3])'
+run numpy-linalg      $PY -c 'import numpy as np; r = np.random.default_rng(42); m = r.standard_normal((80, 80)); v = r.standard_normal(80); x = np.linalg.solve(m, v); print(np.allclose(m @ x, v), round(float(np.linalg.det(m)), 3), np.round((m @ m.T)[:2, :2], 4))'
+run numpy-fft         $PY -c 'import numpy as np; t = np.linspace(0, 1, 1024, endpoint=False); s = np.sin(2 * np.pi * 50 * t) + 0.5 * np.sin(2 * np.pi * 120 * t); f = np.abs(np.fft.rfft(s)); print(np.argsort(f)[-2:], np.round(f.max(), 3))'
+run numpy-int         $PY -c 'import numpy as np; a = np.arange(1000, dtype=np.int64); print((a * 7919 % 1009).sum(), np.bincount(a % 7).tolist(), np.cumsum(a)[-1], (a.astype(np.uint8) ^ 0x5A).sum())'
+run numpy-float32     $PY -c 'import numpy as np; a = np.linspace(-4, 4, 4097, dtype=np.float32); print(np.round(np.tanh(a).sum(), 3), np.round(np.exp(a).mean(), 3), np.float32(1) / np.float32(3), np.minimum(a, 0.5).max())'
+FF="$B/ffmpeg -nostdin -hide_banner -loglevel error -threads 1"
+run ffmpeg-x264       $FF -f lavfi -i testsrc=duration=1:size=320x240:rate=10 -c:v libx264 -preset fast -threads 1 -f md5 -
+run ffmpeg-scale      $FF -f lavfi -i testsrc2=duration=1:size=640x480:rate=5 -vf scale=160:120:flags=bicubic,format=yuv420p -f framemd5 -
+run ffmpeg-aac        $FF -f lavfi -i sine=frequency=440:duration=1 -c:a aac -b:a 64k -f md5 -
+run ffmpeg-roundtrip  $B/bash -c "$B/ffmpeg -nostdin -loglevel error -threads 1 -f lavfi -i testsrc=duration=1:size=176x144:rate=5 -c:v mpeg4 -threads 1 -y v.mkv && $B/ffmpeg -nostdin -loglevel error -threads 1 -i v.mkv -f framemd5 -"
 echo "passed $pass, failed $fail"
 
 if [ $BENCH = 1 ]; then

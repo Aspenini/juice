@@ -95,7 +95,7 @@ uint64_t guest_pc_of(const Block& block, size_t inst) {
   return block.guest_pc + 4 * index;
 }
 
-bool may_fault(Opcode op) {
+static bool compute_may_fault(Opcode op) {
   switch (op) {
     case Opcode::Load:
     case Opcode::Store:
@@ -112,7 +112,7 @@ bool may_fault(Opcode op) {
   }
 }
 
-bool has_side_effects(Opcode op) {
+static bool compute_has_side_effects(Opcode op) {
   switch (op) {
     case Opcode::Load:  // it may fault (a load whose value is unused can be a deliberate probe)
     case Opcode::SetReg:
@@ -134,7 +134,7 @@ bool has_side_effects(Opcode op) {
   }
 }
 
-bool is_pure(Opcode op) {
+static bool compute_is_pure(Opcode op) {
   switch (op) {
     case Opcode::Counter:
     case Opcode::StateAddr:
@@ -160,7 +160,7 @@ bool is_pure(Opcode op) {
   }
 }
 
-bool has_result(Opcode op) {
+static bool compute_has_result(Opcode op) {
   switch (op) {
     case Opcode::Fence:
     case Opcode::StateOp:
@@ -177,12 +177,12 @@ bool has_result(Opcode op) {
   }
 }
 
-bool is_vector_or_fp(Opcode op) {
+static bool compute_is_vector_or_fp(Opcode op) {
   return static_cast<unsigned>(op) >= static_cast<unsigned>(Opcode::VAdd) &&
          static_cast<unsigned>(op) < static_cast<unsigned>(Opcode::Count_);
 }
 
-unsigned arg_count(Opcode op) {
+static unsigned compute_arg_count(Opcode op) {
   switch (op) {
     case Opcode::Nop:
     case Opcode::Const:
@@ -231,6 +231,16 @@ unsigned arg_count(Opcode op) {
       return 2;
   }
 }
+
+const std::array<OpcodeInfo, static_cast<size_t>(Opcode::Count_) + 1> kOpcodeInfo = [] {
+  std::array<OpcodeInfo, static_cast<size_t>(Opcode::Count_) + 1> table{};
+  for (size_t k = 0; k < table.size(); ++k) {
+    const auto op = static_cast<Opcode>(k);
+    table[k] = {static_cast<uint8_t>(compute_arg_count(op)), compute_is_pure(op), compute_has_side_effects(op),
+                compute_may_fault(op), compute_is_vector_or_fp(op), compute_has_result(op)};
+  }
+  return table;
+}();
 
 const char* opcode_name(Opcode op) {
   switch (op) {

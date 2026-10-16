@@ -3,6 +3,8 @@
 #include "core/jit/x64/assembler.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <unordered_map>
@@ -83,7 +85,12 @@ constexpr int32_t kFrameSize = kBlockFrameSize;
 // Out-of-line implementation of the vector and floating point opcodes: the
 // generated code calls the IR evaluator, so the JIT and the interpreter share
 // one definition of these semantics.
+std::atomic<bool> g_count_helpers{false};
+std::array<std::atomic<uint64_t>, 1 << 16> g_helper_counts;
+
 uint64_t evaluate_helper(uint64_t a, uint64_t b, uint64_t c, uint64_t packed) {
+  if (g_count_helpers.load(std::memory_order_relaxed))
+    g_helper_counts[(packed & 0xFF) | ((packed >> 32) & 0xFF) << 8].fetch_add(1, std::memory_order_relaxed);
   ir::Inst in;
   in.op = static_cast<Opcode>(packed & 0xFF);
   in.size = static_cast<uint8_t>(packed >> 8);
@@ -136,6 +143,7 @@ class Compiler {
   size_t body() const { return body_; }
 
   std::vector<uint8_t> run() {
+    a_.reserve(256 + 24 * block_.insts.size());
     find_lazy_flags();
     find_loop_slots();
     allocate_registers();
@@ -943,8 +951,204 @@ class Compiler {
         vput(v, 0);
         return true;
       }
+      case Opcode::VUnzip:
+      case Opcode::VZip:
+      case Opcode::VTrn: {
+        // A fixed byte permutation of the 16 bytes a:b (a low): one pshufb.
+        // (64-bit lanes: one per half, which the evaluator's definitions cover, not these masks)
+        if (!kHost.ssse3 || (esize != 1 && esize != 2 && esize != 4)) return false;
+        const unsigned count = 8 / esize, odd = (in.aux >> 4) & 1;
+        uint64_t mask = 0;
+        for (unsigned i = 0; i < count; ++i) {
+          unsigned src;  // the source lane, of a (0 .. count-1) or b (count ..)
+          if (in.op == Opcode::VUnzip) src = 2 * i + odd;
+          else if (in.op == Opcode::VZip) src = (i & 1 ? count : 0) + (odd ? count / 2 : 0) + i / 2;
+          else src = (i & 1 ? count : 0) + (i & ~1u) + odd;
+          for (unsigned k = 0; k < esize; ++k) mask |= uint64_t{src * esize + k} << (8 * (i * esize + k));
+        }
+        fp_get(0, in.args[0]);
+        fp_get(1, in.args[1]);
+        pop66({0x6C}, 0, 1);         // punpcklqdq: xmm0 = b:a
+        vconst(2, mask);
+        pop66({0x38, 0x00}, 0, 2);   // pshufb
+        vput(v, 0);
+        return true;
+      }
+      case Opcode::VReduce: {
+        const auto kind = static_cast<ir::VecReduce>(in.aux >> 4);
+        if (esize != 1 || (kind != ir::VecReduce::Add && kind != ir::VecReduce::UAddLong)) return false;
+        fp_get(0, in.args[0]);
+        pop66({0xEF}, 1, 1);         // pxor xmm1, xmm1
+        pop66({0xF6}, 0, 1);         // psadbw: the sum of the 8 bytes
+        a_.sse(0x66, {0x7E}, 0, RAX, true);  // movq rax, xmm0
+        if (kind == ir::VecReduce::Add) a_.movzx8(RAX, RAX);
+        put(v, RAX);
+        return true;
+      }
       case Opcode::VLane:
         return emit_vlane(v, in);
+      default:
+        return false;
+    }
+  }
+
+  // Integer lane operations of VLane that SSE has close equivalents for (the
+  // rest go to the evaluator). XMM0 = a and XMM1 = b on entry where noted.
+  bool emit_int_vlane(ValueId v, const Inst& in) {
+    const auto op = static_cast<ir::VecOp>(in.imm);
+    const unsigned esize = in.aux & 0xF;
+    const bool sign = (in.aux >> 4) & 1;
+    auto bias = [&](unsigned xmm) {  // flip the lanes' sign bits (signed <-> unsigned order)
+      vconst(3, lane_sign_bits(esize));
+      pop66({0xEF}, xmm, 3);
+    };
+    switch (op) {
+      case ir::VecOp::Abd: {  // |a - b|
+        fp_get(0, in.args[0]);
+        fp_get(1, in.args[1]);
+        if (!sign && esize <= 2) {  // the two saturating differences, one of them 0
+          const uint8_t subus = esize == 1 ? 0xD8 : 0xD9;
+          a_.sse(0xF3, {0x7E}, 2, 0u);  // movq xmm2, xmm0
+          pop66({subus}, 0, 1);         // a - b (or 0)
+          pop66({subus}, 1, 2);         // b - a (or 0)
+          pop66({0xEB}, 0, 1);          // por
+          vput(v, 0);
+          return true;
+        }
+        // max - min, in the lanes' order
+        uint8_t mx, mn;
+        if (esize == 1) { mx = sign ? 0x3C : 0; mn = sign ? 0x38 : 0; }
+        else if (esize == 2) { mx = sign ? 0xEE : 0x3E; mn = sign ? 0xEA : 0x3A; }
+        else if (esize == 4) { mx = sign ? 0x3D : 0x3F; mn = sign ? 0x39 : 0x3B; }
+        else return false;
+        const bool legacy = esize == 2 && sign;  // pmaxsw / pminsw: SSE2
+        if (!legacy && !kHost.sse41) return false;
+        a_.sse(0xF3, {0x7E}, 2, 0u);  // movq xmm2, xmm0
+        if (legacy) {
+          pop66({mx}, 0, 1);
+          pop66({mn}, 1, 2);
+        } else {
+          pop66({0x38, mx}, 0, 1);
+          pop66({0x38, mn}, 1, 2);
+        }
+        static constexpr uint8_t sub[4] = {0xF8, 0xF9, 0xFA, 0xFB};
+        pop66({*by_size(sub, esize)}, 0, 1);
+        vput(v, 0);
+        return true;
+      }
+      case ir::VecOp::HAdd:
+      case ir::VecOp::RHAdd: {  // (a + b [+ 1]) >> 1: pavg rounds up; signed lanes biased into unsigned order
+        if (esize != 1 && esize != 2) return false;
+        const uint8_t avg = esize == 1 ? 0xE0 : 0xE3;
+        fp_get(0, in.args[0]);
+        fp_get(1, in.args[1]);
+        if (sign) {
+          bias(0);
+          pop66({0xEF}, 1, 3);
+        }
+        if (op == ir::VecOp::HAdd) {
+          a_.sse(0xF3, {0x7E}, 2, 0u);  // movq xmm2, xmm0
+          pop66({0xEF}, 2, 1);          // a ^ b: its low bit is the sum's
+          vconst(4, esize == 1 ? 0x0101010101010101ull : 0x0001000100010001ull);
+          pop66({0xDB}, 2, 4);          // & 1
+          pop66({avg}, 0, 1);
+          pop66({static_cast<uint8_t>(esize == 1 ? 0xF8 : 0xF9)}, 0, 2);  // minus the rounding
+        } else {
+          pop66({avg}, 0, 1);
+        }
+        if (sign) pop66({0xEF}, 0, 3);
+        vput(v, 0);
+        return true;
+      }
+      case ir::VecOp::RShr: {  // (a >> n) + ((a >> (n - 1)) & 1): no overflow
+        if (!is_const(in.args[1]) || esize == 1 || (sign && esize == 8)) return false;
+        const auto n = static_cast<uint8_t>(const_value(in.args[1]));
+        if (n < 1 || n > esize * 8) return false;
+        const uint8_t shift = esize == 2 ? 0x71 : esize == 4 ? 0x72 : 0x73;
+        fp_get(0, in.args[0]);
+        a_.sse(0xF3, {0x7E}, 1, 0u);   // movq xmm1, xmm0
+        a_.sse(0x66, {shift}, sign ? 4 : 2, 0u);  // psra / psrl xmm0, n
+        a_.imm8(n);
+        a_.sse(0x66, {shift}, 2, 1u);  // psrl xmm1, n - 1
+        a_.imm8(static_cast<uint8_t>(n - 1));
+        vconst(2, esize == 2 ? 0x0001000100010001ull : esize == 4 ? 0x0000000100000001ull : 1);
+        pop66({0xDB}, 1, 2);           // & 1
+        static constexpr uint8_t add[4] = {0xFC, 0xFD, 0xFE, 0xD4};
+        pop66({*by_size(add, esize)}, 0, 1);
+        vput(v, 0);
+        return true;
+      }
+      case ir::VecOp::SatNarrow: {  // lanes of 2 * esize -> esize, in the low 32 bits
+        const unsigned mode = (in.aux >> 4) & 3;
+        if (esize != 1 && esize != 2) return false;
+        const bool sse41 = esize == 2 ? mode != 0 : mode == 1;
+        if (sse41 && !kHost.sse41) return false;
+        fp_get(0, in.args[0]);  // (the upper half is clear: the packed upper lanes are 0)
+        if (mode == 1) {  // unsigned -> unsigned: clamp to the narrow maximum, then pack as signed -> unsigned
+          vconst(1, esize == 1 ? 0x00FF00FF00FF00FFull : 0x0000FFFF0000FFFFull);
+          pop66({0x38, static_cast<uint8_t>(esize == 1 ? 0x3A : 0x3B)}, 0, 1);  // pminuw / pminud
+        }
+        if (esize == 1) pop66({static_cast<uint8_t>(mode == 0 ? 0x63 : 0x67)}, 0, 0);  // packsswb / packuswb
+        else if (mode == 0) pop66({0x6B}, 0, 0);                                   // packssdw
+        else pop66({0x38, 0x2B}, 0, 0);                                            // packusdw
+        vput(v, 0);  // (the packed upper lanes are 0: the low 32 bits hold the result)
+        return true;
+      }
+      case ir::VecOp::AddLongPairwise: {  // pairs of lanes -> lanes of twice the size
+        fp_get(0, in.args[0]);
+        if (esize == 1) {
+          if (!kHost.ssse3) return false;
+          vconst(1, 0x0101010101010101ull);
+          if (sign) {  // pmaddubsw: unsigned bytes (the 1s) times signed (a)
+            pop66({0x38, 0x04}, 1, 0);
+            vput(v, 1);
+          } else {     // unsigned a times signed 1s
+            pop66({0x38, 0x04}, 0, 1);
+            vput(v, 0);
+          }
+          return true;
+        }
+        if (esize == 2 && sign) {
+          vconst(1, 0x0001000100010001ull);
+          pop66({0xF5}, 0, 1);  // pmaddwd
+          vput(v, 0);
+          return true;
+        }
+        if (esize == 2 || (esize == 4 && !sign)) {  // low lane + high lane of each pair, zero-extended
+          a_.sse(0xF3, {0x7E}, 1, 0u);  // movq xmm1, xmm0
+          vconst(2, esize == 2 ? 0x0000FFFF0000FFFFull : 0x00000000FFFFFFFFull);
+          pop66({0xDB}, 0, 2);          // pand: the low lanes
+          a_.sse(0x66, {static_cast<uint8_t>(esize == 2 ? 0x72 : 0x73)}, 2, 1u);  // psrld / psrlq xmm1
+          a_.imm8(static_cast<uint8_t>(esize * 8));
+          pop66({static_cast<uint8_t>(esize == 2 ? 0xFE : 0xD4)}, 0, 1);         // paddd / paddq
+          vput(v, 0);
+          return true;
+        }
+        if (esize == 4 && kHost.sse41) {  // signed: both lanes sign-extended to 64 bits, added
+          pop66({0x38, 0x25}, 1, 0);  // pmovsxdq xmm1, xmm0
+          a_.sse(0, {0x28}, 2, 1u);   // movaps xmm2, xmm1
+          a_.sse(0x66, {0x73}, 3, 2u);  // psrldq xmm2, 8
+          a_.imm8(8);
+          pop66({0xD4}, 1, 2);        // paddq
+          vput(v, 1);
+          return true;
+        }
+        return false;
+      }
+      case ir::VecOp::Dot: {  // c + the dot products of each 4 bytes of a and b, per 32-bit lane
+        if (!kHost.sse41) return false;
+        const bool sa = (in.aux >> 4) & 1, sb = (in.aux >> 5) & 1;
+        fp_get(1, in.args[0]);
+        fp_get(2, in.args[1]);
+        pop66({0x38, static_cast<uint8_t>(sa ? 0x20 : 0x30)}, 1, 1);  // pmovsx/zxbw: 8 words
+        pop66({0x38, static_cast<uint8_t>(sb ? 0x20 : 0x30)}, 2, 2);
+        pop66({0xF5}, 1, 2);          // pmaddwd: sums of pairs (exact)
+        pop66({0x38, 0x02}, 1, 1);    // phaddd: sums of fours in the low two dwords
+        fp_get(0, in.args[2]);
+        pop66({0xFE}, 0, 1);          // paddd
+        vput(v, 0);
+        return true;
+      }
       default:
         return false;
     }
@@ -968,6 +1172,7 @@ class Compiler {
   bool emit_vlane(ValueId v, const Inst& in) {
     const auto op = static_cast<ir::VecOp>(in.imm);
     const unsigned esize = in.aux & 0xF;
+    if (emit_int_vlane(v, in)) return true;
     switch (op) {
       case ir::VecOp::TblPart: {  // bytes of b in [8k, 8k + 8) select a byte of c, others keep a's
         if (!kHost.ssse3) return false;
@@ -1721,6 +1926,16 @@ class Compiler {
 };
 
 }  // namespace
+
+void count_helper_calls(bool enable) { g_count_helpers.store(enable); }
+
+std::vector<std::pair<uint32_t, uint64_t>> helper_call_counts() {
+  std::vector<std::pair<uint32_t, uint64_t>> out;
+  for (size_t k = 0; k < g_helper_counts.size(); ++k)
+    if (const uint64_t n = g_helper_counts[k].load(std::memory_order_relaxed)) out.emplace_back(static_cast<uint32_t>(k), n);
+  std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+  return out;
+}
 
 std::vector<uint8_t> Emitter::compile(const ir::Block& block, std::vector<FaultSite>* faults, size_t* body,
                                       std::vector<LinkSite>* links) const {

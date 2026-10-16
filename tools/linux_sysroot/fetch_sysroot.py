@@ -89,7 +89,22 @@ def main():
             print(f"  {fields['Package']} {fields['Version']}")
             urllib.request.urlretrieve(f"{MIRROR}/{filename}", deb)
         subprocess.run(["dpkg-deb", "-x", deb, root], check=True)
+    alternatives(root)
     print(f"{len(done)} packages in {root}")
+
+
+def alternatives(root):
+    """The library links update-alternatives would make (maintainer scripts don't run here):
+    BLAS and LAPACK implementations live in subdirectories, linked from the library directory."""
+    libdir = os.path.join(root, "usr/lib/aarch64-linux-gnu")
+    for sub in ("blas", "lapack", "openblas-pthread", "openblas-openmp", "atlas"):
+        d = os.path.join(libdir, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            link = os.path.join(libdir, name)
+            if ".so" in name and not os.path.lexists(link):
+                os.symlink(os.path.join(sub, name), link)
 
 
 main()

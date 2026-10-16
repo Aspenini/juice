@@ -127,7 +127,11 @@ class LinuxProcess final : public runtime::Environment {
   LinuxThread main_thread_;
   uint64_t brk_start_ = 0, brk_current_ = 0, brk_limit_ = 0;
   uint64_t sigreturn_trampoline_ = 0;
-  uint64_t last_code_page_ = ~0ull;  // last page read_code verified as readable
+  // Pages read_code verified as readable (direct-mapped by page number; ~0:
+  // none). Cleared when mappings change.
+  static constexpr size_t kCodePages = 256;
+  std::array<uint64_t, kCodePages> code_pages_;
+  void forget_code_pages() { code_pages_.fill(~0ull); }
   std::atomic<int> live_threads_{1};
   std::mutex actions_mutex_;
   std::array<GuestSigaction, 65> actions_{};

@@ -323,14 +323,14 @@ int64_t LinuxProcess::do_syscall(arm64::CpuState& s) {
       // dropped it); a fixed mapping may replace some.
       if (r >= 0 && (a3 & MAP_FIXED)) {
         engine_->invalidate(static_cast<uint64_t>(r), static_cast<uint64_t>(r) + page_up(a1));
-        last_code_page_ = ~0ull;
+        forget_code_pages();
       }
       break;
     case sys::munmap:
       r = host(SYS_munmap, a0, a1);
       if (r == 0) {
         engine_->invalidate(a0, a0 + page_up(a1));
-        last_code_page_ = ~0ull;
+        forget_code_pages();
       }
       break;
     case sys::mremap:
@@ -338,7 +338,7 @@ int64_t LinuxProcess::do_syscall(arm64::CpuState& s) {
       if (r >= 0) {
         engine_->invalidate(a0, a0 + page_up(a1));
         if (static_cast<uint64_t>(r) != a0) engine_->invalidate(static_cast<uint64_t>(r), r + page_up(a2));
-        last_code_page_ = ~0ull;
+        forget_code_pages();
       }
       break;
     case sys::mprotect:
@@ -347,7 +347,7 @@ int64_t LinuxProcess::do_syscall(arm64::CpuState& s) {
                               : host(SYS_pkey_mprotect, a0, a1, host_prot(a2), a3);
       // Made executable: a code generator finished writing (W^X).
       if (r == 0 && (a2 & PROT_EXEC)) engine_->invalidate(a0, a0 + page_up(a1));
-      if (r == 0) last_code_page_ = ~0ull;
+      if (r == 0) forget_code_pages();
       break;
     case sys::remap_file_pages:
       r = -ENOSYS;

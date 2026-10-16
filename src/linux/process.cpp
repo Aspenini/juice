@@ -50,7 +50,10 @@ struct ThreadStart {
 LinuxThread* LinuxProcess::current_thread() { return t_thread; }
 LinuxProcess* LinuxProcess::instance() { return g_process; }
 
-LinuxProcess::LinuxProcess(Options options) : options_(std::move(options)) { g_process = this; }
+LinuxProcess::LinuxProcess(Options options) : options_(std::move(options)) {
+  forget_code_pages();
+  g_process = this;
+}
 
 LinuxProcess::~LinuxProcess() {
   if (g_process == this) g_process = nullptr;
@@ -248,12 +251,13 @@ void LinuxProcess::run() {
 bool LinuxProcess::read_code(uint64_t addr, uint32_t& word) {
   // Called with the engine's translation lock held: one thread at a time.
   const uint64_t page = page_down(addr);
-  if (page != last_code_page_) {
+  uint64_t& known = code_pages_[(page / kPageSize) % kCodePages];
+  if (known != page) {
     iovec local{&word, sizeof(word)};
     iovec remote{reinterpret_cast<void*>(addr), sizeof(word)};
     const ssize_t n = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
     if (n != static_cast<ssize_t>(sizeof(word)) && !(n < 0 && errno == ENOSYS)) return false;
-    last_code_page_ = page;
+    known = page;
   }
   std::memcpy(&word, reinterpret_cast<const void*>(addr), sizeof(word));
   return true;

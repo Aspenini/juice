@@ -86,6 +86,7 @@ Engine::Engine(Environment& env, EngineOptions options)
   auto [lo, hi] = env_.host_range();
   host_lo_ = lo;
   host_size_ = hi > lo ? hi - lo : 0;
+  if (options_.profile) x64::count_helper_calls(true);
 }
 
 TranslatedBlock* Engine::lookup(uint64_t pc) {
@@ -404,6 +405,14 @@ void Engine::print_stats(std::FILE* out, size_t hot_blocks) const {
                static_cast<unsigned long long>(s.ir_insts_removed));
   std::fprintf(out, "[juice] x86-64 code: %llu bytes, dispatches: %llu\n", static_cast<unsigned long long>(s.code_bytes),
                static_cast<unsigned long long>(s.dispatches));
+  const auto helpers = x64::helper_call_counts();
+  for (size_t k = 0; k < helpers.size() && k < 12; ++k) {
+    const auto [key, count] = helpers[k];
+    const auto op = static_cast<ir::Opcode>(key & 0xFF);
+    std::fprintf(out, "[juice]   evaluator call: %s%s: %llu\n", ir::opcode_name(op),
+                 op == ir::Opcode::VLane ? std::format(".op{}", key >> 8).c_str() : "",
+                 static_cast<unsigned long long>(count));
+  }
 
   std::vector<std::pair<uint64_t, const TranslatedBlock*>> blocks;
   {

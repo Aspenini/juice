@@ -77,11 +77,18 @@ JUICE runs the first milestone (an ARM64 console Hello World) and a good deal mo
 Hello, World!
 ```
 
-On Linux, JUICE runs real AArch64 distributions' programs: Ubuntu 26.04's arm64 builds of
-bash, busybox, GNU and Rust (uutils) coreutils, grep, sed, gawk, perl, Python 3.14 (threads,
-subprocesses), tar, gzip, xz, sqlite3 and file give the same output as under `qemu-aarch64`,
-and run 1.3 to 2.3 times faster than it (gzip and xz at 2.2x and 2.5x native). See
-[Linux layer](#linux-layer).
+On Linux, JUICE runs real AArch64 distributions' programs. Ubuntu 26.04's arm64 builds of
+these give the same output as under `qemu-aarch64`:
+* shells and tools: bash, busybox, GNU and Rust (uutils) coreutils, grep, sed, gawk, tar, gzip,
+  xz, zstd, bzip2, jq, sqlite3, file;
+* languages: perl, Python 3.14 (threads, subprocesses, NumPy), Ruby, Lua and Node.js (V8's JIT
+  included);
+* larger programs: git, make, openssl (AES and SHA with the crypto instructions), and gcc
+  compiling a program that then runs;
+* FFmpeg: x264 and AAC encoding, H.264 decoding and scaling with its NEON code.
+
+They start faster than under qemu and run 1.3 to 2.3 times faster; gzip and xz run at 2.2x and
+2.5x native. See [Linux layer](#linux-layer).
 
 ## Building
 
@@ -240,7 +247,13 @@ exits, calls to host code and asynchronous interrupts.
   guest state still happen, so the state in memory stays exact). Scalar floating point (arithmetic, fused multiply-add with FMA3, compares, conversions) and
   the common vector operations on 64-bit halves (integer add, subtract, multiply, compares,
   min/max, abs, shifts, widening, `TBL`, floating point lanes) and rounding (`FRINT*`, with
-  SSE4.1) are SSE instructions. A NaN
+  SSE4.1) are SSE instructions. So are the other operations that hot NEON loops are made of,
+  such as x264's:
+  * `UZP`/`ZIP`/`TRN`, each one `pshufb` over both halves;
+  * absolute differences and halving adds (`pavg`, biased for signed lanes);
+  * rounding shifts by a constant, saturating narrows (`pack*`) and pairwise widening adds;
+  * `UDOT`/`SDOT`;
+  * byte sums (`psadbw`). A NaN
   result takes the slow path, where ARM's NaN rules differ from x86's. The slow path and the
   remaining vector and FP ops call back into `ir::evaluate`, so the JIT and the interpreter
   share one definition of their semantics: ARM NaN propagation, the default NaN and saturating
@@ -267,7 +280,9 @@ exits, calls to host code and asynchronous interrupts.
   fixed `mmap` and `mprotect` to executable.
 * **Block cache.** Each block is translated once and shared by all threads. Each thread looks
   blocks up through its own direct-mapped table, so dispatch takes no lock; the shared map is
-  locked only on a miss. Blocks and code are never freed while the process runs, so no thread
+  locked only on a miss. Blocks are also indexed by guest page, so invalidating a range visits
+  only the blocks on its pages; JavaScript engines invalidate small ranges thousands of
+  times. Blocks and code are never freed while the process runs, so no thread
   can execute code that another thread discarded.
 * **Chaining.** Blocks continue into their successors without returning to the dispatcher. A
   jump to a constant target is a patchable `jmp rel32`: it starts out at a stub in the block,
@@ -636,11 +651,12 @@ These are next, roughly in the plan's order:
      type is untested; this matters for a `/MD` program without the ARM64 `msvcp140`.
 4. **GUI applications.** Win32 GUI programs, COM, GDI+, Direct2D and manifests work. `uiAccess`
    in a manifest is not honored.
-5. **Performance.** Programs run about 1.3 to 6 times slower than native (2.4x geometric mean
-   on `tests/bench`; integer code 1.3x to 2x). Next:
+5. **Performance.** Programs run about 1.3 to 6 times slower than native (2.4x to 2.6x
+   geometric mean on `tests/bench`; integer code 1.3x to 2x). `--stats` lists the operations
+   translated code still hands to the evaluator. Next:
    * guest registers in host registers across chained blocks, not only within one loop;
-   * faster translation: Python's startup translates 18,000 blocks, about 12 µs each;
-   * more vector operations inline (pairwise, saturating, zip/unzip);
+   * faster translation: Python's startup translates 18,000 blocks, about 8 µs each;
+   * more vector operations inline: shifts by register, saturating arithmetic, 128-bit pairs;
    * inline atomics;
    * W^X code memory.
 

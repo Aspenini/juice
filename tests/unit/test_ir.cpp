@@ -425,6 +425,48 @@ TEST(jit_fuses_conditions_with_flag_operations) {
 }
 
 // The JIT's inline SSE paths for vector halves agree with the evaluator.
+// The inline SSE paths of permutes, reductions and integer lane operations
+// (absolute difference, halving adds, rounding shifts, narrowing, pairwise
+// widening adds, dot products) agree with the evaluator.
+TEST(jit_matches_interpreter_for_vector_permutes_and_lane_ops) {
+  std::mt19937_64 rng(4242);
+  auto ints = [&](int) -> uint64_t {
+    switch (rng() % 5) {
+      case 0: return 0x7F80007FFFFF8000ull ^ (rng() & 0x0101010101010101ull);
+      case 1: return rng() & 0x8181818181818181ull;
+      case 2: return ~0ull ^ (rng() & 0xFF);
+      default: return rng();
+    }
+  };
+  using ir::VecOp;
+  auto lane = [&](VecOp op, uint8_t aux, const char* name, int64_t shift_const = -1) {
+    compare_vec(std::format("{} aux 0x{:x}{}", name, aux, shift_const >= 0 ? std::format(" #{}", shift_const) : ""),
+                Opcode::VLane, aux, static_cast<uint64_t>(op), ints, 400, shift_const);
+  };
+  for (uint8_t e : {uint8_t{1}, uint8_t{2}, uint8_t{4}, uint8_t{8}}) {
+    for (uint8_t odd = 0; odd < 2; ++odd) {
+      const auto aux = static_cast<uint8_t>(e | odd << 4);
+      compare_vec(std::format("unzip {}", aux), Opcode::VUnzip, aux, 0, ints, 200);
+      compare_vec(std::format("zip {}", aux), Opcode::VZip, aux, 0, ints, 200);
+      compare_vec(std::format("trn {}", aux), Opcode::VTrn, aux, 0, ints, 200);
+    }
+    for (uint8_t kind = 0; kind < 7; ++kind)
+      compare_vec(std::format("reduce {} kind {}", e, kind), Opcode::VReduce, static_cast<uint8_t>(e | kind << 4), 0,
+                  ints, 200);
+    for (uint8_t sign = 0; sign < 2; ++sign) {
+      const auto aux = static_cast<uint8_t>(e | sign << 4);
+      lane(VecOp::Abd, aux, "abd");
+      lane(VecOp::HAdd, aux, "hadd");
+      lane(VecOp::RHAdd, aux, "rhadd");
+      lane(VecOp::AddLongPairwise, aux, "uaddlp/saddlp");
+      for (int n : {1, 2, e * 4 - 1, e * 8 - 1, e * 8}) lane(VecOp::RShr, aux, "rshr", n);
+    }
+    if (e < 8)
+      for (uint8_t mode = 0; mode < 3; ++mode) lane(VecOp::SatNarrow, static_cast<uint8_t>(e | mode << 4), "narrow");
+  }
+  for (uint8_t signs = 0; signs < 4; ++signs) lane(VecOp::Dot, static_cast<uint8_t>(1 | signs << 4), "dot");
+}
+
 TEST(jit_matches_interpreter_for_vector_halves) {
   std::mt19937_64 rng(777);
   // Integer lanes: random bits, with lanes often equal or extreme.
